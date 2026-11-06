@@ -2,14 +2,14 @@
 
 QLB ships with five built-in provider adapters (`src/adapters/`). Each one is read-only with respect to credentials and returns `AccountSnapshot`s — named buckets with a `usedPct`, a `confidence` level, a `source`, and a `fetchedAt` timestamp. Two usage-signal shapes exist:
 
-- **Polled** — the provider exposes a free GET endpoint, so QLB can refresh a reading at decision time (coalesced through the single-flight claim; see [ARCHITECTURE.md](ARCHITECTURE.md)).
+- **Polled** — the provider exposes a usage endpoint, so QLB can refresh a reading through an authorized probe (coalesced through the single-flight claim; see [ARCHITECTURE.md](ARCHITECTURE.md)).
 - **Header-observed** — the provider only reports usage on real requests, so readings come from response headers of traffic that actually went through QLB's proxy/transport.
 
 An adapter must never throw: failures become an error snapshot on the account (visible in `qlb status`), so one unavailable provider never breaks the overall status command.
 
 Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent means `true`:
 
-- **`probes?: boolean`** — `false` when the provider has no probe, so `qlb refresh --allow-probe` reports it as `no-probe` instead of calling `fetchSnapshots()`. Codex is the built-in example: it exposes no usage endpoint and only reads the local auth file, so its readings come from proxy header parsing.
+- **`probes?: boolean`** — `false` when the provider has no probe, so `qlb refresh --allow-probe` reports it as `no-probe` instead of calling `fetchSnapshots()`. The normal built-in Codex adapter is an example: its unscoped refresh only reads the local auth file, so its readings come from proxy header parsing.
 - **`persistsSnapshots?: boolean`** — `false` when the adapter does not persist snapshots; `qlb why` then labels that provider's accounts `observation: unavailable` because a pick cannot be reproduced from a persisted observation.
 
 ---
@@ -29,10 +29,10 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
-- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
+- **Usage signal:** `qlb refresh --provider openai-codex --allow-probe` calls Codex's supported usage endpoint with the locally stored authorization and persists only its provider-reported `primary` and `secondary` windows. Response headers on real requests remain a second source: `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers populate the same snapshot cache through `qlb proxy`. An unscoped refresh only reports the authenticated account with **no buckets**.
 - **Buckets:** `primary` (5-hour), `secondary` (weekly).
 - **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
-- **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
+- **Caveats:** the explicit scoped probe makes a real authorized request; unscoped refresh does not call it. Otherwise Codex data is as fresh as the last request that went through the proxy. QLB never exposes credentials, request headers, or usage response bodies in this path.
 
 ### Pi OAuth source compatibility (P3)
 

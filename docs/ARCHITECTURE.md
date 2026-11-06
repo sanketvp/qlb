@@ -14,7 +14,7 @@ QLB gives one answer to the question *"which account should serve this request?"
 │ anthropic  (poll) │   │ accounts           │   │ scoring (Rule S)     │
 │ kimi-coding(poll) │──▶│ snapshots (cache)  │──▶│ headroom → all-in    │
 │ xai      (headers)│   │ decisions (audit)  │   │  → fallback walk     │
-│ openai-codex(hdrs)│   │ poll_claims        │   │  → EXHAUSTED         │
+│ openai-codex: both│   │ poll_claims        │   │  → EXHAUSTED         │
 │ openrouter (poll) │   │ leases/migrations  │   └──────────┬───────────┘
 │ + ~/.qlb/plugins  │   │ policies/overrides │              │
 └───────────────────┘   └────────────────────┘   ┌──────────▼───────────┐
@@ -46,7 +46,7 @@ Each adapter returns `AccountSnapshot`s containing named **buckets** (`5h`, `7d`
 
 ## Live-query only: why QLB does not count your usage
 
-QLB never meters usage locally. It holds no request counters, no cost estimates, and no reservations. The only capacity data it keeps is a **cache of the last real gauge reading per `(account, bucket)`** — from a usage GET endpoint (Anthropic, Kimi, OpenRouter), from response headers of a request that actually went through (Codex, xAI), and nothing else.
+QLB never meters usage locally. It holds no request counters, no cost estimates, and no reservations. The only capacity data it keeps is a **cache of the last real gauge reading per `(account, bucket)`** — from a usage endpoint (Anthropic, Kimi, OpenRouter, and explicitly authorized scoped Codex refresh), from response headers of a request that actually went through (Codex, xAI), and nothing else.
 
 This was a deliberate simplification, made after an earlier design (local usage self-accounting plus a reservation/heartbeat system to handle request bursts) could not be made crash-safe across two review rounds. The details are in [DESIGN-HISTORY.md](DESIGN-HISTORY.md); the short version:
 

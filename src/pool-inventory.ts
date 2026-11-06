@@ -41,8 +41,11 @@ export interface PoolInventoryEntryReport {
 }
 
 export interface PoolInventoryResult {
+  recordedAt: number;
+  complete: boolean;
   entries: PoolInventoryEntryReport[];
   targets: PiExportTarget[];
+  members: Array<{ target: string; slotAccountId: string | null }>;
 }
 
 /** Typed, redaction-safe failures at this credential-classification boundary. */
@@ -121,6 +124,7 @@ export function classify(
 
   const reports: PoolInventoryEntryReport[] = [];
   const targets: PiExportTarget[] = [];
+  const members: Array<{ target: string; slotAccountId: string | null }> = [];
   const slotTargets = new Map<string, string>();
   for (const [target, value] of targetEntries) {
     // A pool target can hold several generations of one slot's chain (its
@@ -137,6 +141,7 @@ export function classify(
       lineageShared: source !== undefined,
       expiresInMs: value.expiresAt == null ? null : Math.max(0, value.expiresAt - now),
     });
+    members.push({ target, slotAccountId: source?.slotAccountId ?? null });
     if (source) {
       const priorTarget = slotTargets.get(source.slotAccountId);
       if (priorTarget !== undefined && priorTarget !== target) fail('slot-maps-to-multiple-targets');
@@ -147,7 +152,13 @@ export function classify(
       });
     }
   }
-  return { entries: reports, targets };
+  return {
+    recordedAt: now,
+    complete: reports.length > 0 && reports.every((entry) => entry.lineageShared),
+    entries: reports,
+    targets,
+    members,
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

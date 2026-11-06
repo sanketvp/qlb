@@ -39,9 +39,24 @@ export type CacheExportReading = {
   stale: boolean;
 };
 
+export type CacheExportSurfaceMember = {
+  target: string;
+  accountId: string | null;
+  readings: CacheExportReading[];
+};
+
+export type CacheExportSurface = {
+  id: 'anthropic-pi-pool';
+  source: 'pool-inventory';
+  recordedAt: number;
+  complete: boolean;
+  members: CacheExportSurfaceMember[];
+};
+
 export type CacheExport = {
   exportedAt: number;
   readings: CacheExportReading[];
+  surfaces: CacheExportSurface[];
 };
 
 function exportDbPath(): string {
@@ -58,11 +73,14 @@ function parseArgs(args: string[]): boolean {
  * is read-only and is closed before returning.
  */
 export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): CacheExport {
-  if (!existsSync(dbPath)) return { exportedAt: now, readings: [] };
+  if (!existsSync(dbPath)) return { exportedAt: now, readings: [], surfaces: [] };
 
   const db = new DatabaseSync(dbPath, { readOnly: true });
+  let reading = false;
   try {
     db.exec(`PRAGMA busy_timeout = ${CACHE_EXPORT_BUSY_TIMEOUT_MS}`);
+    db.exec('BEGIN');
+    reading = true;
     const version = readUserVersion(db);
     if (version > SCHEMA_VERSION) {
       throw new Error(`qlb export: ${newerSchemaMessage(version)}`);
@@ -74,26 +92,58 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       JOIN accounts AS a ON a.id = s.account_id
       ORDER BY a.provider, a.id, s.bucket
     `).all() as SnapshotRow[];
-    return {
-      exportedAt: now,
-      readings: rows.map((row) => ({
-        accountId: row.account_id,
-        provider: row.provider,
-        label: row.label,
-        bucket: row.bucket,
-        usedPct: row.used_pct,
-        used: row.used,
-        limit: row.limit_val,
-        remaining: row.remaining,
-        resetAt: row.reset_at,
-        fetchedAt: row.fetched_at,
-        source: row.source,
-        confidence: row.confidence,
-        status: row.status,
-        stale: now - row.fetched_at > STALE_OK_S * 1000,
+    const readings = rows.map((row) => ({
+      accountId: row.account_id,
+      provider: row.provider,
+      label: row.label,
+      bucket: row.bucket,
+      usedPct: row.used_pct,
+      used: row.used,
+      limit: row.limit_val,
+      remaining: row.remaining,
+      resetAt: row.reset_at,
+      fetchedAt: row.fetched_at,
+      source: row.source,
+      confidence: row.confidence,
+      status: row.status,
+      stale: now - row.fetched_at > STALE_OK_S * 1000,
+    }));
+    const hasInventory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventories'").get());
+    const hasMembers = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventory_members'").get());
+    const inventory = hasInventory && hasMembers
+      ? db.prepare(`SELECT recorded_at, complete FROM pi_export_inventories WHERE provider = 'anthropic'`).get() as
+        | { recorded_at: number; complete: number }
+        | undefined
+      : undefined;
+    const inventoryMembers = inventory
+      ? db.prepare(`SELECT target, slot_account_id FROM pi_export_inventory_members
+          WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string | null }>
+      : [];
+    const complete = inventory !== undefined && inventory.complete !== 0;
+    const hasLifecycle = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle'").get());
+    const lifecycle = hasLifecycle
+      ? db.prepare("SELECT state, began_at FROM lifecycle WHERE state <> 'closed' ORDER BY id DESC LIMIT 1").get() as { state: string; began_at: number } | undefined
+      : undefined;
+    const servingPool = (lifecycle?.state === 'cutting-over' || lifecycle?.state === 'cutover' || lifecycle?.state === 'retired')
+      && inventory !== undefined
+      && inventory.recorded_at >= lifecycle.began_at;
+    const surfaces: CacheExportSurface[] = servingPool && inventory ? [{
+      id: 'anthropic-pi-pool',
+      source: 'pool-inventory',
+      recordedAt: inventory.recorded_at,
+      complete,
+      members: inventoryMembers.map((member) => ({
+        target: member.target,
+        accountId: member.slot_account_id,
+        readings: member.slot_account_id === null ? [] : readings.filter((reading) =>
+          reading.provider === 'anthropic' && reading.accountId === member.slot_account_id),
       })),
-    };
+    }] : [];
+    db.exec('COMMIT');
+    reading = false;
+    return { exportedAt: now, readings, surfaces };
   } finally {
+    if (reading) db.exec('ROLLBACK');
     db.close();
   }
 }

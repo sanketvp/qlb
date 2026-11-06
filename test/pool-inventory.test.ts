@@ -17,10 +17,11 @@ import {
   type SourceLineage,
 } from '../src/pool-inventory';
 import { runPiPoolInventoryCommand } from '../src/commands/pi-pool-inventory';
+import { cacheOnlyExport } from '../src/export';
 import { beginCutover } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, type PiExportTargetInput, type PiExportTargetRow } from '../src/store';
+import { openStore, type PiExportInventoryClassified, type PiExportTargetRow } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 const FP_A = `sha256:${'a'.repeat(64)}`;
@@ -58,6 +59,8 @@ function context(output: string[]): CommandContext {
 describe('anthropic-pool inventory (P11, AC52)', () => {
   it('classifies shared source lineages and reports only safe expiry horizons', () => {
     const result = classify(entries, sources, NOW);
+
+    assert.equal(result.complete, false);
 
     assert.deepEqual(result.entries, [
       { target: 'pool-a', lineageShared: true, expiresInMs: 86_400_000 },
@@ -125,7 +128,182 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     }
   });
 
-  it('allows exactly one of two concurrent --record runs and preserves its rows', async () => {
+  it('records and refreshes the exact cache-only inventory without changing target mappings', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-export-'));
+    const dbPath = join(dir, 'qlb.db');
+    const setup = openStore(dbPath);
+    try {
+      beginCutover(setup, NOW);
+      (setup as unknown as { db: DatabaseSync }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-a', FP_A, NOW);
+    } finally {
+      setup.close();
+    }
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    const deps = {
+      openStore,
+      loadCswapLineages: () => [],
+      loadSlotLineages: (store: ReturnType<typeof openStore>) => slotInventoryLineages(store),
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW,
+      loadEntries: () => [
+        { target: 'pool-a', lineageFp: FP_A, expiresAt: null },
+        { target: 'pool-unmatched', lineageFp: FP_B, expiresAt: null },
+      ],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    assert.deepEqual(cacheOnlyExport(NOW, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW, complete: false,
+      members: [
+        { target: 'pool-a', accountId: 'slot-a', readings: [] },
+        { target: 'pool-unmatched', accountId: null, readings: [] },
+      ],
+    }]);
+    const targets = openStore(dbPath);
+    try {
+      assert.deepEqual(targets.listPiExportTargets('anthropic').map(({ target, slotAccountId }) => ({ target, slotAccountId })), [
+        { target: 'pool-a', slotAccountId: 'slot-a' },
+      ]);
+    } finally {
+      targets.close();
+    }
+    const refreshed = {
+      ...deps,
+      now: () => NOW + 1,
+      loadEntries: () => [{ target: 'pool-a', lineageFp: FP_A, expiresAt: null }],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, refreshed), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 1, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 1, complete: true,
+      members: [{ target: 'pool-a', accountId: 'slot-a', readings: [] }],
+    }]);
+    const drifted = {
+      ...deps,
+      now: () => NOW + 2,
+      loadEntries: () => [{ target: 'pool-new', lineageFp: FP_B, expiresAt: null }],
+      loadSlotLineages: () => [
+        { slotAccountId: 'slot-a', lineageFp: FP_A },
+        { slotAccountId: 'slot-b', lineageFp: FP_B },
+      ],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, drifted), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 2, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 2, complete: true,
+      members: [{ target: 'pool-new', accountId: 'slot-b', readings: [] }],
+    }]);
+    const empty = {
+      ...deps,
+      now: () => NOW + 3,
+      loadEntries: () => [],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, empty), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 3, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 3, complete: false,
+      members: [],
+    }]);
+  });
+
+  it('admits inventory records only in active and retired lifecycle phases', () => {
+    const phases = [
+      ['pre-cutover', 3], ['cutting-over', 0], ['cutover', 0], ['retired', 0],
+      ['undoing', 3], ['rolled-back', 3], ['aborted', 3],
+    ] as const;
+    for (const [state, expected] of phases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-phase-'));
+      const dbPath = join(dir, 'qlb.db');
+      const poolPath = join(dir, 'anthropic-pool.json');
+      const refresh = 'phase-refresh';
+      const fingerprint = `sha256:${createHash('sha256').update(refresh).digest('hex')}`;
+      writeFileSync(poolPath, JSON.stringify({ accounts: [{
+        id: 'pool-a', credentials: { access: 'phase-access', refresh, expires: NOW + 1 },
+      }] }));
+      const setup = openStore(dbPath);
+      try {
+        if (state !== 'pre-cutover') {
+          beginCutover(setup, NOW);
+          (setup as unknown as { db: DatabaseSync }).db.prepare('UPDATE lifecycle SET state = ?').run(state);
+        }
+        (setup as unknown as { db: DatabaseSync }).db.prepare(
+          "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+        ).run('slot-a', fingerprint, NOW);
+      } finally {
+        setup.close();
+      }
+      const commandContext = context([]);
+      commandContext.config = { ...commandContext.config, dbPath, anthropicPoolPath: poolPath };
+      const code = runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext);
+      assert.equal(code, expected, state);
+    }
+  });
+
+  it('refreshes a retired inventory after a classified membership change', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-retired-'));
+    const dbPath = join(dir, 'qlb.db');
+    const poolPath = join(dir, 'anthropic-pool.json');
+    const refreshA = 'retired-refresh-a';
+    const refreshB = 'retired-refresh-b';
+    const fingerprintA = `sha256:${createHash('sha256').update(refreshA).digest('hex')}`;
+    const fingerprintB = `sha256:${createHash('sha256').update(refreshB).digest('hex')}`;
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-a', credentials: { access: 'retired-access-a', refresh: refreshA, expires: NOW + 1 },
+    }] }));
+    const setup = openStore(dbPath);
+    try {
+      beginCutover(setup, NOW);
+      (setup as unknown as { db: DatabaseSync }).db.prepare("UPDATE lifecycle SET state = 'retired'").run();
+      const insert = (setup as unknown as { db: DatabaseSync }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      );
+      insert.run('slot-a', fingerprintA, NOW);
+      insert.run('slot-b', fingerprintB, NOW);
+    } finally {
+      setup.close();
+    }
+    const commandContext = context([]);
+    commandContext.config = { ...commandContext.config, dbPath, anthropicPoolPath: poolPath };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext), 0);
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-b', credentials: { access: 'retired-access-b', refresh: refreshB, expires: NOW + 2 },
+    }] }));
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext), 0);
+    const surface = cacheOnlyExport(Date.now(), dbPath).surfaces[0];
+    assert.deepEqual({ ...surface, recordedAt: 0 }, {
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: 0, complete: true,
+      members: [{ target: 'pool-b', accountId: 'slot-b', readings: [] }],
+    });
+  });
+
+  it('allows a later mapping after a zero-match inventory record', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-zero-match-'));
+    const dbPath = join(dir, 'qlb.db');
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    let records = 0;
+    const deps = {
+      openStore,
+      loadCswapLineages: () => [],
+      loadSlotLineages: () => records === 0 ? [] : [{ slotAccountId: 'slot-a', lineageFp: FP_A }],
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW + records++,
+      loadEntries: () => [{ target: 'pool-a', lineageFp: FP_A, expiresAt: null }],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    const store = openStore(dbPath);
+    try {
+      assert.deepEqual(store.listPiExportTargets('anthropic').map(({ target, slotAccountId }) => ({ target, slotAccountId })), [
+        { target: 'pool-a', slotAccountId: 'slot-a' },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('allows concurrent inventory refreshes while preserving the target mapping', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
     const dbPath = join(dir, 'qlb.db');
     const poolPath = join(dir, 'anthropic-pool.json');
@@ -159,13 +337,14 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       child.once('close', resolve);
     });
     const statuses = await Promise.all([run(), run()]);
-    assert.deepEqual(statuses.sort(), [0, 3]);
+    assert.deepEqual(statuses.sort(), [0, 0]);
     const check = openStore(dbPath);
     try {
       assert.deepEqual(check.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
         provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: fingerprint,
         recordedAt: check.listPiExportTargets('anthropic')[0]!.recordedAt, recordedBy: 'pool-inventory',
       }]);
+      assert.equal(cacheOnlyExport(NOW, dbPath).surfaces[0]?.complete, true);
     } finally {
       check.close();
     }
@@ -232,7 +411,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
 
       const recordingStore = Object.create(store) as typeof store;
       recordingStore.close = () => {};
-      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends { targets: PiExportTargetInput[] }>(
+      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends PiExportInventoryClassified>(
         provider: string,
         classifyInTransaction: () => T,
         admit: (db: DatabaseSync) => { ok: boolean; code?: string },
@@ -356,7 +535,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
         replacements.push(targets);
         return { ok: true };
       },
-      recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => {
+      recordPiExportTargetsIfEmptyClassified: <T extends PiExportInventoryClassified>(_provider: string, classifyInTransaction: () => T) => {
         const result = classifyInTransaction();
         replacements.push(result.targets);
         return { ok: true as const, result };
@@ -395,7 +574,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       openStore: () => ({
         ...store,
         recordPiExportTargetsIfEmpty: () => ({ ok: true }),
-        recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => ({ ok: true as const, result: classifyInTransaction() }),
+        recordPiExportTargetsIfEmptyClassified: <T extends PiExportInventoryClassified>(_provider: string, classifyInTransaction: () => T) => ({ ok: true as const, result: classifyInTransaction() }),
         close: () => {}, listPiExportTargets: () => [],
         listAnthropicSlotLineageChains: () => [],
       }),

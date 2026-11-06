@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it, mock } from 'node:test';
 
-import { createCodexAdapter } from '../src/adapters/codex';
+import { codexAdapter, createCodexAdapter } from '../src/adapters/codex';
 import { addCodexAccount, CodexAddError, type CodexAddDeps } from '../src/codex-add';
 import { parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
@@ -119,6 +119,11 @@ function stageHarness(withUser: boolean) {
 }
 
 describe('Codex S29 activation', () => {
+  it('keeps the default adapter non-probing and snapshot-capable', () => {
+    assert.equal(codexAdapter.probes, false);
+    assert.notEqual(codexAdapter.persistsSnapshots, false);
+  });
+
   it('the adapter reports the slot id and writes no accounts row', async () => {
     const adapter = createCodexAdapter({ readAuth: async () => JSON.stringify(document()) });
     assert.deepEqual(await adapter.fetchSnapshots(), [{
@@ -127,6 +132,127 @@ describe('Codex S29 activation', () => {
       label: 'fixture-user:fixture-account',
       buckets: {},
     }]);
+  });
+
+  it('persists only live provider primary and secondary quota windows', async () => {
+    const store = openStore(':memory:');
+    try {
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        now: () => 1_700_000_000_000,
+        probeUsage: async () => ({
+          status: 200,
+          source: 'wham',
+          keys: ['primary', 'secondary'],
+          windows: [
+            { bucket: 'primary', usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300 },
+            { bucket: 'secondary', usedPct: 34, resetAt: 1_700_100_000_000 },
+          ],
+        }),
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.deepEqual(snapshot?.buckets, {
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+      });
+      assert.deepEqual(store.getAllSnapshots('fixture-user:fixture-account'), {
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('does not provide rollout snapshots to the explicit quota probe', async () => {
+    const store = openStore(':memory:');
+    try {
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        probeUsage: async ({ readRollout }) => {
+          assert.deepEqual(await readRollout?.('fixture-account'), []);
+          return { status: 200, source: 'wham', keys: ['primary'], windows: [{ bucket: 'primary', usedPct: 12 }] };
+        },
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.buckets.primary?.usedPct, 12);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('applies the established long Retry-After safety margin to a 429 backoff', async () => {
+    const store = openStore(':memory:');
+    try {
+      let probes = 0;
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        now: () => 1_700_000_000_000,
+        probeUsage: async () => {
+          probes += 1;
+          return { status: 429, source: 'unknown', keys: [], retryAfterS: 900 };
+        },
+      });
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.error, 'Codex usage probe returned no live provider reading');
+      assert.deepEqual(store.listUsagePolls('openai-codex')['fixture-user:fixture-account'], {
+        accountId: 'fixture-user:fixture-account',
+        lastFetchAt: null,
+        lastAttemptAt: 1_700_000_000,
+        nextDueAt: null,
+        pollIntervalS: null,
+        lastStatus: 'http-429',
+        consecutiveFailures: 1,
+        backoffUntil: 1_700_001_800,
+        last429At: 1_700_000_000,
+        heldUntil: null,
+      });
+      const [backedOff] = await adapter.fetchSnapshots();
+      assert.equal(backedOff?.error, 'Codex usage probe is backing off');
+      assert.equal(probes, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('reports store failures without probing or mislabelling credentials', async () => {
+    let probes = 0;
+    const adapter = createCodexAdapter({
+      readAuth: async () => JSON.stringify(document()),
+      getStore: () => { throw new Error('SQLITE_BUSY'); },
+      probeUsage: async () => { probes += 1; return { status: 200, source: 'unknown', keys: [] }; },
+    });
+    const [snapshot] = await adapter.fetchSnapshots();
+    assert.equal(snapshot?.error, 'Codex usage store unavailable');
+    assert.equal(probes, 0);
+  });
+
+  it('redacts Codex probe failures and retains existing snapshots', async () => {
+    const store = openStore(':memory:');
+    const secret = 'Bearer fixture-secret-token request-body-fixture';
+    try {
+      store.upsertAccount('fixture-user:fixture-account', 'openai-codex', 'fixture');
+      store.upsertSnapshot('fixture-user:fixture-account', 'primary', {
+        usedPct: 55, fetchedAt: 1, source: 'poll', confidence: 'authoritative',
+      });
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        probeUsage: async () => { throw new Error(secret); },
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.error, 'Codex usage probe failed');
+      assert.equal(JSON.stringify(snapshot).includes(secret), false);
+      assert.equal(store.getAllSnapshots('fixture-user:fixture-account').primary?.usedPct, 55);
+    } finally {
+      store.close();
+    }
   });
 
   it('a login without chatgpt_user_id: adapter error result; import and add write nothing', async () => {

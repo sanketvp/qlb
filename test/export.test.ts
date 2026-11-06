@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { cacheOnlyExport } from '../src/export';
+import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
@@ -36,15 +37,31 @@ function hash(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-function fixtureDb(): { path: string; freshAt: number; staleAt: number } {
+function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolRecordedAt: number } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-export-'));
   const path = join(root, 'qlb.db');
   const now = Date.now();
   const freshAt = now - 300_000 + 1_000;
   const staleAt = now - 300_000 - 1_000;
+  const poolRecordedAt = now - 60_000;
   const store = openStore(path);
   try {
+    beginCutover(store, poolRecordedAt - 1);
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+    store.upsertAccount('anthropic-b', 'anthropic', 'account-b');
+    store.recordPiExportTargetsIfEmptyClassified('anthropic', () => ({
+      recordedAt: poolRecordedAt,
+      complete: false,
+      targets: [
+        { provider: 'anthropic' as const, target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
+        { provider: 'anthropic' as const, target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
+      ],
+      members: [
+        { target: 'pi-a', slotAccountId: 'anthropic-a' },
+        { target: 'pi-b', slotAccountId: 'anthropic-b' },
+        { target: 'pi-unmatched', slotAccountId: null },
+      ],
+    }), () => ({ ok: true }));
     store.upsertSnapshot('anthropic-a', 'five-hour', {
       usedPct: 12,
       remaining: 88,
@@ -61,7 +78,7 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number } {
   } finally {
     store.close();
   }
-  return { path, freshAt, staleAt };
+  return { path, freshAt, staleAt, poolRecordedAt };
 }
 
 describe('cache-only export', () => {
@@ -75,6 +92,7 @@ describe('cache-only export', () => {
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
       readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; status: string }>;
+      surfaces: Array<{ id: string; recordedAt: number; complete: boolean; members: Array<{ target: string; accountId: string | null; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
     assert.deepEqual(body.readings.map((reading) => ({
@@ -88,6 +106,123 @@ describe('cache-only export', () => {
       { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
       { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
     ]);
+    assert.deepEqual(body.surfaces, [{
+      id: 'anthropic-pi-pool',
+      source: 'pool-inventory',
+      recordedAt: fixture.poolRecordedAt,
+      complete: false,
+      members: [
+        { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings },
+        { target: 'pi-b', accountId: 'anthropic-b', readings: [] },
+        { target: 'pi-unmatched', accountId: null, readings: [] },
+      ],
+    }]);
+    assert.doesNotMatch(result.stdout, /lineage/i);
+    assert.equal(result.stdout.includes('not-exported-a'), false);
+    assert.equal(result.stdout.includes('not-exported-b'), false);
+  });
+
+  it('omits surfaces when no persisted Anthropic Pi targets exist', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-empty-'));
+    const path = join(root, 'qlb.db');
+    const store = openStore(path);
+    store.close();
+    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, []);
+  });
+
+  it('preserves ordinary readings when an older database lacks inventory tables', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-legacy-'));
+    const path = join(root, 'qlb.db');
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        CREATE TABLE accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE snapshots (account_id TEXT NOT NULL, bucket TEXT NOT NULL, used_pct REAL, used REAL, limit_val REAL, remaining REAL, reset_at INTEGER, fetched_at INTEGER NOT NULL, source TEXT NOT NULL, confidence TEXT NOT NULL);
+      `);
+      db.prepare(`INSERT INTO accounts VALUES ('legacy-anthropic', 'anthropic', 'legacy', 'active')`).run();
+      db.prepare(`INSERT INTO snapshots VALUES ('legacy-anthropic', '5h', 25, NULL, NULL, NULL, NULL, 1700000000000, 'poll', 'authoritative')`).run();
+    } finally {
+      db.close();
+    }
+    const result = runExport(path);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).surfaces, []);
+    assert.equal(JSON.parse(result.stdout).readings[0].accountId, 'legacy-anthropic');
+  });
+
+  it('omits target mappings until an inventory is recorded', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-target-only-'));
+    const path = join(root, 'qlb.db');
+    const store = openStore(path);
+    try {
+      beginCutover(store, 1);
+      store.replacePiExportTargets('anthropic', [{
+        provider: 'anthropic', target: 'legacy-target', slotAccountId: 'legacy-account', lineageFp: 'legacy-fp', recordedAt: 1,
+      }]);
+    } finally {
+      store.close();
+    }
+    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, []);
+  });
+
+  it('serves persisted pool inventory only in active lifecycle states', () => {
+    const fixture = fixtureDb();
+    const setState = (state: string | null) => {
+      const db = new DatabaseSync(fixture.path);
+      try {
+        if (state === null) db.exec('DELETE FROM lifecycle');
+        else db.prepare('UPDATE lifecycle SET state = ?').run(state);
+      } finally {
+        db.close();
+      }
+    };
+    for (const state of ['cutting-over', 'cutover', 'retired']) {
+      setState(state);
+      assert.equal(cacheOnlyExport(Date.now(), fixture.path).surfaces.length, 1, state);
+    }
+    for (const state of ['undoing', 'rolled-back', 'aborted']) {
+      setState(state);
+      assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, [], state);
+    }
+    setState(null);
+    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+    const store = openStore(fixture.path);
+    try {
+      beginCutover(store, Date.now());
+      (store as unknown as { db: DatabaseSync }).db.prepare("UPDATE lifecycle SET state = 'retired'").run();
+    } finally {
+      store.close();
+    }
+    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+  });
+
+  it('requires a new inventory after beginning a new lifecycle generation', () => {
+    const fixture = fixtureDb();
+    const store = openStore(fixture.path);
+    const beganAt = Date.now();
+    const recordedAt = beganAt + 1;
+    try {
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.prepare("UPDATE lifecycle SET state = 'closed'").run();
+      beginCutover(store, beganAt);
+      assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+
+      const recorded = store.recordPiExportTargetsIfEmptyClassified('anthropic', () => ({
+        recordedAt,
+        complete: true,
+        targets: [],
+        members: [
+          { target: 'pi-a', slotAccountId: 'anthropic-a' },
+          { target: 'pi-b', slotAccountId: 'anthropic-b' },
+        ],
+      }), () => ({ ok: true }));
+      assert.equal(recorded.ok, true);
+    } finally {
+      store.close();
+    }
+    const [surface] = cacheOnlyExport(Date.now(), fixture.path).surfaces;
+    assert.equal(surface?.recordedAt, recordedAt);
+    assert.equal(surface?.complete, true);
   });
 
   it('refuses a database schema newer than this build without output rows', () => {

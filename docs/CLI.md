@@ -162,15 +162,21 @@ Flags: `[--json]`.
 
 ## `qlb refresh`
 
-Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` — network reads go through the existing single-flight cache.
+Poll every enabled adapter for a fresh gauge reading. Without `--allow-probe` this is a no-network no-op (exit 0). Pass `--allow-probe` to invoke each adapter's `fetchSnapshots()` through its bounded provider probe. Use `--provider kimi-coding` or `--provider openai-codex` to explicitly probe only that provider; scoped refresh still requires `--allow-probe` before it makes a request.
 
-`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex has no probe (`probes: false`): it only reads the local auth file and is reported as `no-probe` (readings come from the proxy's header parsing). Invalid/missing Codex credentials are `error`, not `no-probe`.
+`--allow-probe` makes **real provider requests** with your stored credentials. For xAI that is a 1-token completion that consumes quota. Codex's explicit scoped refresh calls its supported usage endpoint and persists only provider-reported `primary` and `secondary` quota windows; it never logs request headers, tokens, or response bodies. Invalid/missing Codex credentials and unavailable usage readings are `error`.
 
 A fetch that fails inside the single-flight TTL keeps cached buckets and is classified **failed** (`probe.outcome = cached-after-failure`). Mixed ok + failed accounts on one provider are `partial` (`ok: false`).
 
 ```console
 $ qlb refresh
 refresh: no probes run (pass --allow-probe to poll providers)
+
+$ qlb refresh --provider kimi-coding --allow-probe --json
+{
+  "probed": true,
+  "results": [{ "provider": "kimi-coding", "status": "ok" }]
+}
 
 $ qlb refresh --allow-probe
 [OK]   xai (xAI): 1 account(s)
@@ -186,12 +192,12 @@ Per-provider statuses:
 | `[OK]` | `ok` | At least one account with a bucket reading and no error / cached-after-failure. |
 | `[PART]` | `partial` | Some accounts ok and some failed. `ok` is false. One line per failed account. |
 | `[NONE]` | `no-data` | Snapshots returned without `error` but none have gauge buckets. |
-| `[NONE]` | `no-probe` | Adapter declares `probes: false` (Codex, some plugins). Readings come from proxy traffic. |
+| `[NONE]` | `no-probe` | Adapter declares `probes: false` (the unscoped Codex adapter and some plugins). Readings come from proxy traffic. |
 | `[FAIL]` | `error` | The adapter threw/rejected, returned no snapshots, every snapshot had `error`, or every account was `cached-after-failure`. One failed provider never aborts the others. |
 
 `--json` prints `{ probed, results }` where each result is `{ provider, displayName, ok, status, accounts, accountsOk, accountsFailed, error?, errors, snapshots }`. `status` is one of `ok`, `partial`, `no-data`, `no-probe`, `error`. `errors` is `{accountId, error}[]`. Without `--allow-probe` that is `{"probed":false,"results":[]}`. Plugins that omit `probe` on snapshots are treated as fetched.
 
-Flags: `[--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
+Flags: `[--provider kimi-coding|openai-codex] [--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
 
 ## `qlb native-resync`
 
@@ -230,10 +236,10 @@ Emit the last persisted usage readings as JSON without loading provider adapters
 
 ```console
 $ qlb export --cache-only --json
-{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}
+{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}],"surfaces":[{"id":"anthropic-pi-pool","source":"pool-inventory","recordedAt":1788844000000,"complete":true,"members":[{"target":"pi-slot-a","accountId":"acct-a","readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}]}]}
 ```
 
-`exportedAt`, `fetchedAt`, and `resetAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. A missing database succeeds with `{"exportedAt":...,"readings":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
+`exportedAt`, `fetchedAt`, `resetAt`, and surface `recordedAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. `surfaces` is additive: `anthropic-pi-pool` records a non-secret Pi Anthropic inventory with `source: "pool-inventory"`, its `recordedAt`, and `complete` flag. `complete` means every non-empty current inventory member was classified exactly against a current slot; unmatched members and an empty pool make the surface incomplete. Re-running `qlb pi pool-inventory --against slots --record` refreshes the inventory without changing an existing non-empty target mapping. Recording is admitted only during `cutting-over`, `cutover`, or steady `retired` lifecycle states; it writes only the non-secret inventory snapshot. Export emits the pool surface only in those serving lifecycle states after an inventory has been recorded; target mappings alone emit no surface. `recordedAt` is membership-inventory time, not quota freshness. Consumers must reject a surface whose `complete` is false. The surface never includes credential data or lineage fingerprints. A missing database succeeds with `{"exportedAt":...,"readings":[],"surfaces":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
 
 The command accepts exactly `qlb export --cache-only --json` (the two flags may be ordered either way). It resolves the database through `QLB_DB_PATH`, config `dbPath`, or the default path; it does not accept per-invocation configuration flags such as `--db-path` or `--config`.
 
@@ -727,4 +733,4 @@ All three are read-only from the extension's side (they only shell out to `qlb s
 
 ## Not yet wired (honest gaps)
 
-- **Organic Codex/xAI gauges.** Codex has no probe; xAI's CLI probe is a quota-consuming 1-token completion. Otherwise those readings still come from organic traffic (proxy header parsing) until `qlb refresh --allow-probe` or `qlb status`/`qlb resolve` records an observation.
+- **Organic Codex/xAI gauges.** Codex's supported usage endpoint is called only by `qlb refresh --provider openai-codex --allow-probe`; xAI's CLI probe is a quota-consuming 1-token completion. Otherwise those readings still come from organic traffic (proxy header parsing).
