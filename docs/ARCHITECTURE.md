@@ -108,7 +108,7 @@ H is the only routable account. Fresh direct provider readings are required for 
 
 Selection then proceeds in a fixed ladder (`src/resolve.ts`):
 
-1. Score at ceiling 80. Any candidate with `score > 0` wins (ties: authoritative headroom, then least-recently-decided).
+1. Score at ceiling 80. The first candidate at the maximum authoritative score in candidate order wins. The `spread` strategy instead hashes a session over near-tied candidates.
 2. None → **all-in mode**: recompute at ceiling 100, pick the max. Logged as `mode: "all-in"`.
 3. Still none → walk the caller's fallback list (`--fallback m1,m2`), repeating per model. The served model is always reported (`servedModel` vs `requestedModel`); effort is never silently downgraded.
 4. Still none → `EXHAUSTED` only when every relevant live account has fresh direct readings; otherwise `UNAVAILABLE`.
