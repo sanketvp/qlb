@@ -53,7 +53,7 @@ export type CacheExportSurfaceDrift = {
 
 export type CacheExportSurface = {
   id: 'anthropic-pi-pool';
-  source: 'pool-inventory' | 'legacy-target-mapping';
+  source: 'pool-inventory';
   recordedAt: number;
   complete: boolean;
   drift: CacheExportSurfaceDrift;
@@ -128,11 +128,9 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       : [];
     const hasTargets = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_targets'").get());
     const targetRows = hasTargets
-      ? db.prepare(`SELECT target, slot_account_id, recorded_at FROM pi_export_targets
-          WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string; recorded_at: number }>
+      ? db.prepare(`SELECT target, slot_account_id FROM pi_export_targets
+          WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string }>
       : [];
-    const legacyTargets = inventory ? [] : targetRows;
-    const members = inventory ? inventoryMembers : legacyTargets;
     const complete = inventory !== undefined && inventory.complete !== 0;
     const targets = new Map(targetRows.map((target) => [target.target, target.slot_account_id]));
     const observed = new Map(inventoryMembers.map((member) => [member.target, member.slot_account_id]));
@@ -146,13 +144,13 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       ? db.prepare("SELECT state FROM lifecycle WHERE state <> 'closed' ORDER BY id DESC LIMIT 1").get() as { state: string } | undefined
       : undefined;
     const servingPool = lifecycle?.state === 'cutting-over' || lifecycle?.state === 'cutover' || lifecycle?.state === 'retired';
-    const surfaces: CacheExportSurface[] = servingPool && (inventory || legacyTargets.length > 0) ? [{
+    const surfaces: CacheExportSurface[] = servingPool && inventory ? [{
       id: 'anthropic-pi-pool',
-      source: inventory ? 'pool-inventory' : 'legacy-target-mapping',
-      recordedAt: inventory?.recorded_at ?? Math.max(...legacyTargets.map((target) => target.recorded_at)),
+      source: 'pool-inventory',
+      recordedAt: inventory.recorded_at,
       complete,
       drift,
-      members: members.map((member) => ({
+      members: inventoryMembers.map((member) => ({
         target: member.target,
         accountId: member.slot_account_id,
         readings: member.slot_account_id === null ? [] : readings.filter((reading) =>

@@ -149,7 +149,7 @@ describe('cache-only export', () => {
     assert.equal(JSON.parse(result.stdout).readings[0].accountId, 'legacy-anthropic');
   });
 
-  it('exports legacy target mappings as incomplete', () => {
+  it('omits target mappings until an inventory is recorded', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-export-target-only-'));
     const path = join(root, 'qlb.db');
     const store = openStore(path);
@@ -161,14 +161,7 @@ describe('cache-only export', () => {
     } finally {
       store.close();
     }
-    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, [{
-      id: 'anthropic-pi-pool',
-      source: 'legacy-target-mapping',
-      recordedAt: 1,
-      complete: false,
-      drift: { added: 0, removed: 0, remapped: 0 },
-      members: [{ target: 'legacy-target', accountId: 'legacy-account', readings: [] }],
-    }]);
+    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, []);
   });
 
   it('serves persisted pool inventory only in active lifecycle states', () => {
