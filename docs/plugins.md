@@ -66,7 +66,7 @@ qlb status --json
 
 Both fields are optional in `Adapter` (`src/types.ts`); absent means `true`.
 
-- **`probes?: boolean`** — set to `false` when your adapter has no probe at all (nothing `fetchSnapshots()` can usefully fetch on demand). `qlb refresh --allow-probe` then reports the provider as `no-probe` instead of trying to call it. Codex is the built-in example: it exposes no usage endpoint, so its readings come from proxy header parsing. Without the flag, refresh calls `fetchSnapshots()`; return snapshots without buckets and it reports `no-data` rather than `no-probe`.
+- **`probes?: boolean`** — set to `false` when your adapter has no probe at all (nothing `fetchSnapshots()` can usefully fetch on demand). `qlb refresh --allow-probe` then reports the provider as `no-probe` instead of trying to call it. The unscoped built-in Codex adapter is an example: it reads local auth state, while its authorized usage probe is available only through `qlb refresh --provider openai-codex --allow-probe`. Without the flag, refresh calls `fetchSnapshots()`; return snapshots without buckets and it reports `no-data` rather than `no-probe`.
 - **`persistsSnapshots?: boolean`** — set to `false` when your plugin cannot persist observations. `qlb why` reproduces a pick from the last persisted per-provider observation; without persisted snapshots it cannot, so the provider is excluded from the parity guarantee and labelled `observation: unavailable`.
 
 The returned `accounts` list will include `provider: "mistral"`. Syntax errors, missing exports, and invalid adapter shapes produce a warning on stderr and are skipped.

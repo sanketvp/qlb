@@ -185,7 +185,7 @@ describe('Codex S29 activation', () => {
     }
   });
 
-  it('records a provider Retry-After as a 429 backoff', async () => {
+  it('applies the established long Retry-After safety margin to a 429 backoff', async () => {
     const store = openStore(':memory:');
     try {
       let probes = 0;
@@ -208,7 +208,7 @@ describe('Codex S29 activation', () => {
         pollIntervalS: null,
         lastStatus: 'http-429',
         consecutiveFailures: 1,
-        backoffUntil: 1_700_000_900,
+        backoffUntil: 1_700_001_800,
         last429At: 1_700_000_000,
         heldUntil: null,
       });

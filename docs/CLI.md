@@ -195,7 +195,7 @@ Per-provider statuses:
 
 `--json` prints `{ probed, results }` where each result is `{ provider, displayName, ok, status, accounts, accountsOk, accountsFailed, error?, errors, snapshots }`. `status` is one of `ok`, `partial`, `no-data`, `no-probe`, `error`. `errors` is `{accountId, error}[]`. Without `--allow-probe` that is `{"probed":false,"results":[]}`. Plugins that omit `probe` on snapshots are treated as fetched.
 
-Flags: `[--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
+Flags: `[--provider kimi-coding|openai-codex] [--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
 
 ## `qlb native-resync`
 
