@@ -605,9 +605,10 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
       try {
         const { count } = healthRows.prepare('SELECT COUNT(*) AS count FROM health_log').get() as { count: number };
         assert.equal(count, 1, phase);
-        assert.notEqual(report.healthLogId, undefined, phase);
+        const healthLogId = report.healthLogId;
+        assert.ok(healthLogId !== undefined, phase);
         const row = healthRows.prepare('SELECT ts, phase, overall, dead_slots_json AS deadSlotsJson FROM health_log WHERE id = ?')
-          .get(report.healthLogId) as { ts: number; phase: string; overall: string; deadSlotsJson: string } | undefined;
+          .get(healthLogId) as { ts: number; phase: string; overall: string; deadSlotsJson: string } | undefined;
         assert.ok(row, phase);
         assert.equal(row.ts, NOW, phase);
         assert.equal(row.phase, phase, phase);
