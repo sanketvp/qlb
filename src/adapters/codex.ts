@@ -51,7 +51,6 @@ export interface CodexAdapterDeps {
   readAuth?: (path: string) => Promise<string>;
   /** Supplying this opt-in seam enables the authenticated provider usage probe. */
   probeUsage?: ProbeUsage;
-  store?: CodexStore;
   getStore?: () => CodexStore;
   now?: () => number;
 }
@@ -77,7 +76,6 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
     id: PROVIDER,
     displayName: 'Codex (ChatGPT Pro)',
     probes: deps.probeUsage !== undefined,
-    persistsSnapshots: deps.probeUsage !== undefined,
     fetchSnapshots: async () => {
       try {
         const auth = JSON.parse(await readAuth(authPath)) as unknown;
@@ -121,7 +119,7 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
 
         let store: CodexStore | undefined;
         try {
-          store = deps.store ?? deps.getStore?.();
+          store = deps.getStore?.();
           if (!store) throw new Error('store unavailable');
           store.upsertAccount(accountId, PROVIDER, label);
         } catch {

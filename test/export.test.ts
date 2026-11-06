@@ -107,7 +107,8 @@ describe('cache-only export', () => {
       id: 'anthropic-pi-pool',
       source: 'pool-inventory',
       recordedAt: fixture.poolRecordedAt,
-      complete: true,
+      complete: false,
+      drift: { added: 1, removed: 0, remapped: 0 },
       members: [
         { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings },
         { target: 'pi-b', accountId: 'anthropic-b', readings: [] },
@@ -161,6 +162,7 @@ describe('cache-only export', () => {
       source: 'legacy-target-mapping',
       recordedAt: 1,
       complete: false,
+      drift: { added: 0, removed: 0, remapped: 0 },
       members: [{ target: 'legacy-target', accountId: 'legacy-account', readings: [] }],
     }]);
   });

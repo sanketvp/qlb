@@ -45,11 +45,18 @@ export type CacheExportSurfaceMember = {
   readings: CacheExportReading[];
 };
 
+export type CacheExportSurfaceDrift = {
+  added: number;
+  removed: number;
+  remapped: number;
+};
+
 export type CacheExportSurface = {
   id: 'anthropic-pi-pool';
   source: 'pool-inventory' | 'legacy-target-mapping';
   recordedAt: number;
   complete: boolean;
+  drift: CacheExportSurfaceDrift;
   members: CacheExportSurfaceMember[];
 };
 
@@ -76,8 +83,11 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
   if (!existsSync(dbPath)) return { exportedAt: now, readings: [], surfaces: [] };
 
   const db = new DatabaseSync(dbPath, { readOnly: true });
+  let reading = false;
   try {
     db.exec(`PRAGMA busy_timeout = ${CACHE_EXPORT_BUSY_TIMEOUT_MS}`);
+    db.exec('BEGIN');
+    reading = true;
     const version = readUserVersion(db);
     if (version > SCHEMA_VERSION) {
       throw new Error(`qlb export: ${newerSchemaMessage(version)}`);
@@ -116,16 +126,28 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       ? db.prepare(`SELECT target, slot_account_id FROM pi_export_inventory_members
           WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string | null }>
       : [];
-    const legacyTargets = !inventory && Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_targets'").get())
+    const hasTargets = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_targets'").get());
+    const targetRows = hasTargets
       ? db.prepare(`SELECT target, slot_account_id, recorded_at FROM pi_export_targets
           WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string; recorded_at: number }>
       : [];
+    const legacyTargets = inventory ? [] : targetRows;
     const members = inventory ? inventoryMembers : legacyTargets;
+    const complete = inventory !== undefined && inventory.complete !== 0
+      && inventoryMembers.every((member) => member.slot_account_id !== null);
+    const targets = new Map(targetRows.map((target) => [target.target, target.slot_account_id]));
+    const observed = new Map(inventoryMembers.map((member) => [member.target, member.slot_account_id]));
+    const drift = inventory ? {
+      added: [...observed].filter(([target]) => !targets.has(target)).length,
+      removed: [...targets].filter(([target]) => !observed.has(target)).length,
+      remapped: [...observed].filter(([target, accountId]) => accountId !== null && targets.has(target) && targets.get(target) !== accountId).length,
+    } : { added: 0, removed: 0, remapped: 0 };
     const surfaces: CacheExportSurface[] = inventory || legacyTargets.length > 0 ? [{
       id: 'anthropic-pi-pool',
       source: inventory ? 'pool-inventory' : 'legacy-target-mapping',
       recordedAt: inventory?.recorded_at ?? Math.max(...legacyTargets.map((target) => target.recorded_at)),
-      complete: inventory?.complete !== 0 && inventory !== undefined,
+      complete,
+      drift,
       members: members.map((member) => ({
         target: member.target,
         accountId: member.slot_account_id,
@@ -133,8 +155,11 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
           reading.provider === 'anthropic' && reading.accountId === member.slot_account_id),
       })),
     }] : [];
+    db.exec('COMMIT');
+    reading = false;
     return { exportedAt: now, readings, surfaces };
   } finally {
+    if (reading) db.exec('ROLLBACK');
     db.close();
   }
 }

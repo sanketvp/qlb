@@ -60,6 +60,8 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
   it('classifies shared source lineages and reports only safe expiry horizons', () => {
     const result = classify(entries, sources, NOW);
 
+    assert.equal(result.complete, false);
+
     assert.deepEqual(result.entries, [
       { target: 'pool-a', lineageShared: true, expiresInMs: 86_400_000 },
       { target: 'pool-b', lineageShared: false, expiresInMs: null },
@@ -154,7 +156,8 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     };
     assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
     assert.deepEqual(cacheOnlyExport(NOW, dbPath).surfaces, [{
-      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW, complete: true,
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW, complete: false,
+      drift: { added: 1, removed: 0, remapped: 0 },
       members: [
         { target: 'pool-a', accountId: 'slot-a', readings: [] },
         { target: 'pool-unmatched', accountId: null, readings: [] },
@@ -176,6 +179,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, refreshed), 0);
     assert.deepEqual(cacheOnlyExport(NOW + 1, dbPath).surfaces, [{
       id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 1, complete: true,
+      drift: { added: 0, removed: 0, remapped: 0 },
       members: [{ target: 'pool-a', accountId: 'slot-a', readings: [] }],
     }]);
     const drifted = {
@@ -189,7 +193,8 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     };
     assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, drifted), 0);
     assert.deepEqual(cacheOnlyExport(NOW + 2, dbPath).surfaces, [{
-      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 2, complete: false,
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 2, complete: true,
+      drift: { added: 1, removed: 1, remapped: 0 },
       members: [{ target: 'pool-new', accountId: 'slot-b', readings: [] }],
     }]);
   });
@@ -221,7 +226,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     }
   });
 
-  it('allows exactly one of two concurrent --record runs and preserves its rows', async () => {
+  it('allows concurrent inventory refreshes while preserving the target mapping', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-inventory-'));
     const dbPath = join(dir, 'qlb.db');
     const poolPath = join(dir, 'anthropic-pool.json');
@@ -255,13 +260,14 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       child.once('close', resolve);
     });
     const statuses = await Promise.all([run(), run()]);
-    assert.deepEqual(statuses.sort(), [0, 3]);
+    assert.deepEqual(statuses.sort(), [0, 0]);
     const check = openStore(dbPath);
     try {
       assert.deepEqual(check.listPiExportTargets('anthropic').map((row) => ({ ...row })), [{
         provider: 'anthropic', target: 'pool-a', slotAccountId: 'slot-a', lineageFp: fingerprint,
         recordedAt: check.listPiExportTargets('anthropic')[0]!.recordedAt, recordedBy: 'pool-inventory',
       }]);
+      assert.equal(cacheOnlyExport(NOW, dbPath).surfaces[0]?.complete, true);
     } finally {
       check.close();
     }

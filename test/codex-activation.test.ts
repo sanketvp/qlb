@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it, mock } from 'node:test';
 
-import { createCodexAdapter } from '../src/adapters/codex';
+import { codexAdapter, createCodexAdapter } from '../src/adapters/codex';
 import { addCodexAccount, CodexAddError, type CodexAddDeps } from '../src/codex-add';
 import { parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
@@ -119,6 +119,11 @@ function stageHarness(withUser: boolean) {
 }
 
 describe('Codex S29 activation', () => {
+  it('keeps the default adapter non-probing and snapshot-capable', () => {
+    assert.equal(codexAdapter.probes, false);
+    assert.notEqual(codexAdapter.persistsSnapshots, false);
+  });
+
   it('the adapter reports the slot id and writes no accounts row', async () => {
     const adapter = createCodexAdapter({ readAuth: async () => JSON.stringify(document()) });
     assert.deepEqual(await adapter.fetchSnapshots(), [{
@@ -134,7 +139,7 @@ describe('Codex S29 activation', () => {
     try {
       const adapter = createCodexAdapter({
         readAuth: async () => JSON.stringify(document()),
-        store,
+        getStore: () => store,
         now: () => 1_700_000_000_000,
         probeUsage: async () => ({
           status: 200,
@@ -167,7 +172,7 @@ describe('Codex S29 activation', () => {
       let probes = 0;
       const adapter = createCodexAdapter({
         readAuth: async () => JSON.stringify(document()),
-        store,
+        getStore: () => store,
         now: () => 1_700_000_000_000,
         probeUsage: async () => {
           probes += 1;
@@ -218,7 +223,7 @@ describe('Codex S29 activation', () => {
       });
       const adapter = createCodexAdapter({
         readAuth: async () => JSON.stringify(document()),
-        store,
+        getStore: () => store,
         probeUsage: async () => { throw new Error(secret); },
       });
 

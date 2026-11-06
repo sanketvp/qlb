@@ -157,6 +157,7 @@ export type PiExportTargetInput = Omit<PiExportTargetRow, 'recordedBy'> & {
 
 export interface PiExportInventorySnapshot {
   recordedAt: number;
+  complete: boolean;
   members: Array<{ target: string; slotAccountId: string | null }>;
 }
 
@@ -3310,16 +3311,10 @@ export class Store {
           insert.run(target.provider, target.target, target.slotAccountId, target.lineageFp, target.recordedAt, 'pool-inventory');
         }
       }
-      const expected = new Map((existing.length === 0 ? classified.targets.map((target) => ({
-        target: target.target, slot_account_id: target.slotAccountId,
-      })) : existing).map((target) => [target.target, target.slot_account_id]));
-      const observed = new Map(classified.members.map((member) => [member.target, member.slotAccountId]));
-      const complete = [...expected].every(([target, accountId]) => observed.get(target) === accountId)
-        && [...observed].every(([target, accountId]) => accountId === null || expected.get(target) === accountId);
       this.db.prepare('DELETE FROM pi_export_inventory_members WHERE provider = ?').run(provider);
       this.db.prepare(`INSERT INTO pi_export_inventories (provider, recorded_at, complete) VALUES (?, ?, ?)
         ON CONFLICT(provider) DO UPDATE SET recorded_at = excluded.recorded_at, complete = excluded.complete`)
-        .run(provider, classified.recordedAt, complete ? 1 : 0);
+        .run(provider, classified.recordedAt, classified.complete ? 1 : 0);
       const insertMember = this.db.prepare(`INSERT INTO pi_export_inventory_members (provider, target, slot_account_id)
         VALUES (?, ?, ?)`);
       for (const member of classified.members) insertMember.run(provider, member.target, member.slotAccountId);

@@ -42,6 +42,7 @@ export interface PoolInventoryEntryReport {
 
 export interface PoolInventoryResult {
   recordedAt: number;
+  complete: boolean;
   entries: PoolInventoryEntryReport[];
   targets: PiExportTarget[];
   members: Array<{ target: string; slotAccountId: string | null }>;
@@ -151,7 +152,13 @@ export function classify(
       });
     }
   }
-  return { recordedAt: now, entries: reports, targets, members };
+  return {
+    recordedAt: now,
+    complete: reports.every((entry) => entry.lineageShared),
+    entries: reports,
+    targets,
+    members,
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -309,8 +316,7 @@ export function recordPoolInventoryForPiMigrate(options: {
   store: PoolInventoryStore;
   now?: () => number;
 }): PoolInventoryResult {
-  const recordedAt = options.now?.() ?? Date.now();
-  const result = classify(options.entries, options.lineages, recordedAt);
+  const result = classify(options.entries, options.lineages, options.now?.() ?? Date.now());
   options.store.replacePiExportTargets('anthropic', result.targets);
   return result;
 }
