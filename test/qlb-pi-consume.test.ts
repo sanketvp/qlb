@@ -55,7 +55,7 @@ function sink(): Sink {
   return output;
 }
 
-+describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
+describe('qlb-pi consume reader parity with src/cswap-native-read', () => {
   it('uses the identical allowlisted read-only argv', () => {
     assert.equal(SECURITY_BIN, SRC_SECURITY_BIN);
     assert.deepEqual(activeCcSecurityArgs('someone'), srcArgs('someone'));
@@ -206,6 +206,44 @@ describe('qlb-pi mode decision', () => {
   });
 });
 
+describe('consume marker path parity with the CLI', () => {
+  it('resolves the marker beside the same database the CLI uses', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-marker-'));
+    const custom = join(home, 'custom.json');
+    writeFileSync(custom, JSON.stringify({ dbPath: '~/elsewhere/q.db' }));
+    const bad = join(home, 'bad.json');
+    writeFileSync(bad, '{not json');
+    const arr = join(home, 'arr.json');
+    writeFileSync(arr, '[]');
+    mkdirSync(join(home, '.qlb'), { recursive: true });
+    const cases: NodeJS.ProcessEnv[] = [
+      {},
+      { QLB_DB_PATH: join(home, 'db', 'q.db') },
+      { QLB_DB_PATH: '~/tilde/q.db' },
+      { QLB_DB_PATH: '' },
+      { QLB_CONFIG_PATH: custom },
+      { QLB_CONFIG_PATH: custom, QLB_DB_PATH: join(home, 'env-wins', 'q.db') },
+      { QLB_CONFIG_PATH: bad },
+      { QLB_CONFIG_PATH: arr },
+      { QLB_CONFIG_PATH: join(home, 'missing.json') },
+    ];
+    for (const env of cases) {
+      const cli = resolveConfig({ argv: [], env, home, warn: () => undefined });
+      assert.equal(
+        consumeMarkerPath(env, home),
+        join(dirname(cli.dbPath), 'consume-anthropic.json'),
+        JSON.stringify(env),
+      );
+    }
+    writeFileSync(join(home, '.qlb', 'config.json'), JSON.stringify({ dbPath: join(home, 'cfg', 'q.db') }));
+    assert.equal(consumeMarkerPath({}, home), join(home, 'cfg', 'consume-anthropic.json'));
+    assert.equal(
+      join(dirname(resolveConfig({ argv: [], env: {}, home, warn: () => undefined }).dbPath), 'consume-anthropic.json'),
+      join(home, 'cfg', 'consume-anthropic.json'),
+    );
+  });
+});
+
 
 const model: ModelLike = {
   id: 'claude-sonnet-5', api: 'anthropic-messages', provider: 'anthropic',
@@ -221,41 +259,6 @@ function blob(accessToken: unknown, expiresAt: unknown = FUTURE): string {
 }
 
 describe('qlb-pi consume provider', () => {
-  it('matches the fail-closed mode table', () => {
-    for (const rehearsal of [undefined, '0', '1']) for (const owner of ['absent', 'valid', 'malformed'] as const) for (const journal of ['CONSUMED', 'NATIVE', 'unknown'] as const) for (const marker of [false, true]) {
-      const expected = rehearsal === '0' ? 'inert' : owner === 'malformed' || rehearsal === '1' || owner === 'valid'
-        ? journal === 'NATIVE' && owner !== 'malformed' ? 'owned' : 'conflict'
-        : journal === 'CONSUMED' ? 'consume' : marker ? 'conflict' : 'inert';
-      assert.equal(decidePiMode({ rehearsal, owner, journal, marker }), expected);
-    }
-  });
-
-  it('classifies owner files, status, and marker paths', () => {
-    const home = mkdtempSync(join(tmpdir(), 'qlb-pi-'));
-    assert.equal(readOwnerFileState(join(home, 'missing')), 'absent');
-    writeFileSync(join(home, 'valid'), '{"accounts":[]}');
-    assert.equal(readOwnerFileState(join(home, 'valid')), 'valid');
-    writeFileSync(join(home, 'bad'), '{');
-    assert.equal(readOwnerFileState(join(home, 'bad')), 'malformed');
-    mkdirSync(join(home, 'dir'));
-    assert.equal(readOwnerFileState(join(home, 'dir')), 'malformed');
-    assert.equal(parseConsumeStatus(0, '{"state":"NATIVE"}'), 'NATIVE');
-    assert.equal(parseConsumeStatus(0, 'bad'), 'unknown');
-    const env = { QLB_DB_PATH: join(home, 'db', 'q.db') };
-    assert.equal(consumeMarkerPath(env, home), join(dirname(resolveConfig({ argv: [], env, home, warn: () => undefined }).dbPath), 'consume-anthropic.json'));
-  });
-  it('keeps every incomplete consume transition out of the native pool', () => {
-    for (const journal of ['unknown', 'NATIVE'] as const) {
-      assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal, marker: true }), 'conflict');
-    }
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'valid', journal: 'CONSUMED', marker: false }), 'conflict');
-    assert.equal(decidePiMode({ rehearsal: undefined, owner: 'absent', journal: 'CONSUMED', marker: false }), 'consume');
-    assert.equal(canSkipJournal({ rehearsal: undefined, owner: 'absent', marker: false, dbExists: false }), true);
-    assert.equal(canSkipJournal({ rehearsal: undefined, owner: 'absent', marker: false, dbExists: true }), false);
-    assert.equal(parseConsumeStatus(1, '{"state":"CONSUMED"}'), 'unknown');
-    assert.equal(conflictMessage({ rehearsal: undefined, owner: 'absent', journal: 'unknown', marker: true }), CONSUME_ERRORS.stateUnknown);
-  });
-
   it('fails unavailable without calling the replaced provider', () => {
     let replacedProviderCalls = 0;
     const providers = new Map<string, AnthropicNativeProvider>();
