@@ -40,7 +40,7 @@ describe('provider routing authority', () => {
       assert.equal(decision.ok, false);
       if (decision.ok) return;
       assert.equal(decision.error, 'UNAVAILABLE');
-      assert.match(decision.reason, /fresh provider quota reading required/);
+      assert.match(decision.reason, /fresh Anthropic provider quota reading required/);
     });
   }
 
@@ -58,6 +58,18 @@ describe('provider routing authority', () => {
     assert.equal(exhausted.ok, false);
     if (exhausted.ok) return;
     assert.equal(exhausted.error, 'EXHAUSTED');
+  });
+
+  it('does not declare a mixed pool exhausted', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: [
+        anthropic('exhausted', direct(100)),
+        anthropic('unmeasured', { ...direct(10), source: 'poll' }),
+      ],
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
   });
 
   it('keeps pins and round-robin inside eligible provider readings', () => {

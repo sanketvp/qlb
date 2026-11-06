@@ -223,6 +223,7 @@ export const ROUTING_DECISION_MODES = [
   'round-robin',
   'failover',
   'pin_unavailable',
+  'unavailable',
   'exhausted',
 ] as const;
 
@@ -1660,11 +1661,6 @@ export class Store {
       reading.source,
       reading.confidence,
     );
-  }
-
-  /** Retain failed-probe fallback rows for display, but never let them route. */
-  markSnapshotsNonActionable(accountId: string): void {
-    this.db.prepare("UPDATE snapshots SET confidence = 'unknown' WHERE account_id = ?").run(accountId);
   }
 
   getSnapshot(accountId: string, bucket: string): BucketReading | null {

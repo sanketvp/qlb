@@ -445,6 +445,31 @@ describe('qlb why CLI', () => {
     assert.equal(body.modelSource, 'last routing decision');
   });
 
+  it('omitted --model uses an unavailable routing decision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-why-unavailable-'));
+    const dbPath = join(dir, 'qlb.db');
+    const store = openStore(dbPath);
+    resolveFromSnapshots({
+      model: 'grok-4',
+      snapshots: [{
+        accountId: 'xai',
+        provider: 'xai',
+        label: 'xAI',
+        buckets: {
+          tokens: { usedPct: 10, source: 'headers', confidence: 'advisory', fetchedAt: Date.now() },
+          requests: { usedPct: 10, source: 'headers', confidence: 'advisory', fetchedAt: Date.now() },
+        },
+      }],
+      store,
+    });
+    store.close();
+    const result = runCli(['why', '--json'], isolatedEnv(dbPath));
+    assert.equal(result.status, 0, result.stderr);
+    const body = JSON.parse(result.stdout) as { model: string; modelSource: string };
+    assert.equal(body.model, 'grok-4');
+    assert.equal(body.modelSource, 'last routing decision');
+  });
+
   it('omitted --model with empty journal uses default', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-why-default-'));
     const dbPath = join(dir, 'qlb.db');

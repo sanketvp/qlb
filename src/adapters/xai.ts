@@ -124,9 +124,6 @@ export const xaiAdapter: Adapter = {
         },
       });
 
-      if (probeOutcome === 'cached-after-failure') {
-        getStore().markSnapshotsNonActionable(snapshot.accountId);
-      }
       if (probeOutcome) {
         snapshot.probe = {
           outcome: probeOutcome,

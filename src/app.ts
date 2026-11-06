@@ -1494,10 +1494,11 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
   }
   const store = getStore();
   const models = [opts.model, ...opts.fallback];
+  const usesCodex = models.some((model) => providerForModel(model) === 'openai-codex');
   const { snapshots } = await collectCandidates({
     adapters,
     store,
-    models,
+    models: models.filter((model) => providerForModel(model) !== 'openai-codex'),
     probe: true,
     recordAs: 'resolve',
   });
@@ -1508,7 +1509,7 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     harness: opts.harness,
     effort: opts.effort,
     strategy: opts.strategy,
-    snapshots,
+    snapshots: usesCodex ? [...snapshots, ...snapshotsFromStore(store, 'openai-codex')] : snapshots,
     store,
   });
   if (opts.json) printResolveJson(decision);

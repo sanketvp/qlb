@@ -663,7 +663,11 @@ export class LoopbackProxy {
     }
 
     const consumed = isConsumedState(this.store.getMigration(CSWAP_ANTHROPIC_STORE)?.state);
-    const snapshots = prepareConsumeSnapshots(snapshotsFromStore(this.store), consumed);
+    const snapshots = prepareConsumeSnapshots(
+      snapshotsFromStore(this.store),
+      consumed,
+      this.store.getActiveLogin('anthropic')?.accountId,
+    );
     const decision = resolveFromSnapshots({
       model: policy.realModel,
       fallback: policy.fallback,

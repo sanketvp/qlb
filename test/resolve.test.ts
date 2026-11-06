@@ -397,7 +397,9 @@ describe('qlb resolve — Codex account ownership', () => {
       assert.equal(decision.ok, false);
       if (decision.ok) return;
       assert.equal(decision.error, 'UNAVAILABLE');
-      assert.equal(store.listRoutingDecisions(1)[0]?.account_id ?? null, null);
+      const row = store.listRoutingDecisions(1)[0];
+      assert.equal(row?.mode, 'unavailable');
+      assert.equal(row?.account_id, null);
     } finally {
       store.close();
     }

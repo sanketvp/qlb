@@ -151,9 +151,6 @@ export function createOpenRouterAdapter(
           },
         });
 
-        if (probeOutcome === 'cached-after-failure') {
-          getStore().markSnapshotsNonActionable(ACCOUNT_ID);
-        }
         const probe = probeOutcome
           ? {
               outcome: probeOutcome,

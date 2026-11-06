@@ -46,12 +46,13 @@ export interface CodexAutoPollResult {
 }
 
 function readingsFrom(result: CodexUsageProbeResult, nowMs: number): Record<string, BucketReading> {
+  const directProviderReading = result.source === 'wham' || result.source === 'codex-api';
   return Object.fromEntries((result.windows ?? []).map((window) => [window.bucket, {
     usedPct: window.usedPct,
     ...(window.resetAt === undefined ? {} : { resetAt: window.resetAt }),
     fetchedAt: nowMs,
-    source: 'provider-poll' as const,
-    confidence: 'authoritative' as const,
+    source: directProviderReading ? 'provider-poll' as const : 'poll' as const,
+    confidence: directProviderReading ? 'authoritative' as const : 'advisory' as const,
   }]));
 }
 

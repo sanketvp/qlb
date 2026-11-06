@@ -2,6 +2,7 @@ import type { AccountSnapshot } from './types';
 import {
   ALL_IN_CEILING,
   providerForModel,
+  relevantBuckets,
   scoreAccount,
   type Strategy,
 } from './scoring';
@@ -77,15 +78,42 @@ export type ResolveDecision = ResolveOk | ResolveExhausted | ResolveUnavailable 
 
 export const PROVIDER_REFRESH_REQUIRED = 'fresh provider quota reading required; run qlb refresh --allow-probe';
 
-export function findEarliestReset(snapshots: AccountSnapshot[]): EarliestReset | null {
+function unavailableReason(model: string): string {
+  switch (providerForModel(model)) {
+    case 'xai':
+      return 'xAI quota readings are advisory and unavailable for routing';
+    case 'anthropic':
+      return 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available';
+    case 'openai-codex':
+      return 'fresh Codex provider quota reading required; run the scoped Codex refresh or wait for its auto poll';
+    default:
+      return PROVIDER_REFRESH_REQUIRED;
+  }
+}
+
+export function findEarliestReset(snapshots: AccountSnapshot[], model?: string): EarliestReset | null {
   let best: EarliestReset | null = null;
   for (const snap of snapshots) {
-    for (const [limitType, reading] of Object.entries(snap.buckets)) {
+    const buckets = model === undefined ? Object.entries(snap.buckets) : relevantBuckets(snap, model)
+      .flatMap((limitType) => {
+        const reading = snap.buckets[limitType];
+        return reading === undefined ? [] : [[limitType, reading] as const];
+      });
+    for (const [limitType, reading] of buckets) {
       if (reading.resetAt == null || !Number.isFinite(reading.resetAt)) continue;
       if (best === null || reading.resetAt < best.at) {
         best = { accountId: snap.accountId, at: reading.resetAt, limitType };
       }
     }
+  }
+  return best;
+}
+
+function findEarliestResetForModels(candidates: Array<{ snapshot: AccountSnapshot; model: string }>): EarliestReset | null {
+  let best: EarliestReset | null = null;
+  for (const candidate of candidates) {
+    const reset = findEarliestReset([candidate.snapshot], candidate.model);
+    if (reset !== null && (best === null || reset.at < best.at)) best = reset;
   }
   return best;
 }
@@ -97,6 +125,21 @@ export function snapshotsFromStore(store: Store, provider?: string): AccountSnap
     provider: row.provider as AccountSnapshot['provider'],
     label: row.label,
     buckets: store.getAllSnapshots(row.id),
+  }));
+}
+
+function serializeSnapshots(snapshots: AccountSnapshot[], now: number): Array<Record<string, unknown>> {
+  return snapshots.map((snapshot) => ({
+    accountId: snapshot.accountId,
+    provider: snapshot.provider,
+    buckets: Object.fromEntries(Object.entries(snapshot.buckets).map(([bucket, reading]) => [bucket, {
+      usedPct: reading.usedPct,
+      confidence: reading.confidence,
+      source: reading.source,
+      fetchedAt: reading.fetchedAt,
+      ageMs: reading.fetchedAt ? now - reading.fetchedAt : null,
+      resetAt: reading.resetAt,
+    }])),
   }));
 }
 
@@ -114,40 +157,13 @@ function snapshotJson(decision: ResolveDecision): string {
       return JSON.stringify({
         error: 'UNAVAILABLE',
         reason: decision.reason,
-        candidates: decision.candidates.map((s) => ({
-          accountId: s.accountId,
-          provider: s.provider,
-          buckets: Object.fromEntries(Object.entries(s.buckets).map(([k, v]) => [k, {
-            usedPct: v.usedPct,
-            confidence: v.confidence,
-            source: v.source,
-            fetchedAt: v.fetchedAt,
-            ageMs: v.fetchedAt ? now - v.fetchedAt : null,
-            resetAt: v.resetAt,
-          }])),
-        })),
+        candidates: serializeSnapshots(decision.candidates, now),
       });
     }
     return JSON.stringify({
       error: 'EXHAUSTED',
       earliestReset: decision.earliestReset,
-      candidates: decision.candidates.map((s) => ({
-        accountId: s.accountId,
-        provider: s.provider,
-        buckets: Object.fromEntries(
-          Object.entries(s.buckets).map(([k, v]) => [
-            k,
-            {
-              usedPct: v.usedPct,
-              confidence: v.confidence,
-              source: v.source,
-              fetchedAt: v.fetchedAt,
-              ageMs: v.fetchedAt ? now - v.fetchedAt : null,
-              resetAt: v.resetAt,
-            },
-          ]),
-        ),
-      })),
+      candidates: serializeSnapshots(decision.candidates, now),
     });
   }
   return JSON.stringify({
@@ -156,19 +172,7 @@ function snapshotJson(decision: ResolveDecision): string {
     label: decision.snapshot.label,
     score: decision.score,
     ceiling: decision.ceiling,
-    buckets: Object.fromEntries(
-      Object.entries(decision.snapshot.buckets).map(([k, v]) => [
-        k,
-        {
-          usedPct: v.usedPct,
-          confidence: v.confidence,
-          source: v.source,
-          fetchedAt: v.fetchedAt,
-          ageMs: v.fetchedAt ? now - v.fetchedAt : null,
-          resetAt: v.resetAt,
-        },
-      ]),
-    ),
+    buckets: serializeSnapshots([decision.snapshot], now)[0]!.buckets,
   });
 }
 
@@ -279,7 +283,7 @@ function resolvePinned(
     if (!provider || snap.provider !== provider) continue;
     const authority = routingAuthority(snap, candidateModel);
     if (!authority.eligible) {
-      return unavailable(`pinned account unavailable: ${pinnedId} ${PROVIDER_REFRESH_REQUIRED} (${authority.reason})`);
+      return unavailable(`pinned account unavailable: ${pinnedId} ${unavailableReason(candidateModel)} (${authority.reason})`);
     }
     if (isFullyExhausted(snap, candidateModel)) continue;
     const score = scoreAccount(snap, candidateModel, ALL_IN_CEILING);
@@ -325,7 +329,8 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
   if (pinned) return pinned;
 
   const { reserved, drainFirst } = activeOverrideSets(req.store);
-  let authorityCandidates: AccountSnapshot[] = [];
+  let authorityCandidates: Array<{ snapshot: AccountSnapshot; model: string }> = [];
+  let hasNonActionableCandidate = false;
 
   for (let i = 0; i < chain.length; i++) {
     const candidateModel = chain[i];
@@ -340,7 +345,8 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
           req.store.getAccount(s.accountId)?.provider === 'openai-codex'),
     );
     const eligible = candidates.filter((snapshot) => routingAuthority(snapshot, candidateModel).eligible);
-    authorityCandidates = authorityCandidates.concat(eligible);
+    hasNonActionableCandidate ||= eligible.length !== candidates.length;
+    authorityCandidates = authorityCandidates.concat(eligible.map((snapshot) => ({ snapshot, model: candidateModel })));
     const picked = pickAccount(strategy, {
       snapshots: eligible,
       model: candidateModel,
@@ -384,12 +390,12 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     return decision;
   }
 
-  if (authorityCandidates.length === 0) {
+  if (authorityCandidates.length === 0 || hasNonActionableCandidate) {
     const unavailable: ResolveUnavailable = {
       ok: false,
       error: 'UNAVAILABLE',
       requestedModel: req.model,
-      reason: PROVIDER_REFRESH_REQUIRED,
+      reason: unavailableReason(req.model),
       candidates: req.snapshots,
     };
     unavailable.decisionId = record(req.store, req, unavailable);
@@ -400,7 +406,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     ok: false,
     error: 'EXHAUSTED',
     requestedModel: req.model,
-    earliestReset: findEarliestReset(authorityCandidates),
+    earliestReset: findEarliestResetForModels(authorityCandidates),
     candidates: req.snapshots,
   };
   exhausted.decisionId = record(req.store, req, exhausted);

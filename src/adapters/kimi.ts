@@ -176,9 +176,6 @@ export const kimiAdapter: Adapter = {
         },
       });
 
-      if (probeOutcome === 'cached-after-failure') {
-        getStore().markSnapshotsNonActionable(claimId);
-      }
       const probe = probeOutcome
         ? {
             outcome: probeOutcome,
