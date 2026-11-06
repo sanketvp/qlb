@@ -358,7 +358,7 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
-  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback, retire-cswap and lifecycle-close', () => {
+  it('retirement fence refuses actions that could change a partial retirement', () => {
     const store = fixtureStore();
     try {
       beginCutover(store);
