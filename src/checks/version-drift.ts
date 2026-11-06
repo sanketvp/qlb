@@ -7,7 +7,7 @@ export function claudeVersionDriftCheck(
   recordedVersion: string | null,
   runner?: ClaudeVersionRunner,
 ): { name: 'claude:version-drift'; level: 'PASS' | 'WARN' | 'INFO'; message: string } {
-  if (recordedVersion === null || recordedVersion === '') {
+  if (recordedVersion === null) {
     return { name: 'claude:version-drift', level: 'INFO', message: 'not recorded' };
   }
   try {

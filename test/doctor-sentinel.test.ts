@@ -19,6 +19,21 @@ function fixture() {
 }
 
 describe('claude:version-drift doctor check', () => {
+  it('passes when the installed version matches the recorded sentinel', async () => {
+    const { config } = fixture();
+    const store = openStore(config.dbPath);
+    store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
+    store.close();
+    const report = await doctorQlb(config, {
+      command: () => '', hostCommand: () => '', claudeVersionRunner: () => 'Claude Code 1.0.0\n',
+    });
+    assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
+      name: 'claude:version-drift', level: 'PASS',
+      message: 'Claude Code version matches recorded value: Claude Code 1.0.0',
+    });
+    assert.equal(report.s64.overall, 'PASS');
+  });
+
   it('claude:version-drift warns when the installed version differs from the recorded sentinel', async () => {
     const { config } = fixture();
     const store = openStore(config.dbPath);
