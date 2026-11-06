@@ -17,10 +17,11 @@ import {
   type SourceLineage,
 } from '../src/pool-inventory';
 import { runPiPoolInventoryCommand } from '../src/commands/pi-pool-inventory';
+import { cacheOnlyExport } from '../src/export';
 import { beginCutover } from '../src/lifecycle';
 import type { CommandContext } from '../src/registry';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, type PiExportTargetInput, type PiExportTargetRow } from '../src/store';
+import { openStore, type PiExportInventoryClassified, type PiExportTargetRow } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 const FP_A = `sha256:${'a'.repeat(64)}`;
@@ -120,6 +121,101 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       const result = inventoryPool({ entries, lineages: sources, store, now: () => NOW });
       assert.deepEqual(store.listPiExportTargets('anthropic').map((row) => ({ ...row })), result.targets.map((target) => ({ ...target, recordedBy: 'pool-inventory' })));
       assert.equal(store.listPiExportTargets('xai').length, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('records and refreshes the exact cache-only inventory without changing target mappings', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-export-'));
+    const dbPath = join(dir, 'qlb.db');
+    const setup = openStore(dbPath);
+    try {
+      beginCutover(setup, NOW);
+      (setup as unknown as { db: DatabaseSync }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      ).run('slot-a', FP_A, NOW);
+    } finally {
+      setup.close();
+    }
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    const deps = {
+      openStore,
+      loadCswapLineages: () => [],
+      loadSlotLineages: (store: ReturnType<typeof openStore>) => slotInventoryLineages(store),
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW,
+      loadEntries: () => [
+        { target: 'pool-a', lineageFp: FP_A, expiresAt: null },
+        { target: 'pool-unmatched', lineageFp: FP_B, expiresAt: null },
+      ],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    assert.deepEqual(cacheOnlyExport(NOW, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW, complete: true,
+      members: [
+        { target: 'pool-a', accountId: 'slot-a', readings: [] },
+        { target: 'pool-unmatched', accountId: null, readings: [] },
+      ],
+    }]);
+    const targets = openStore(dbPath);
+    try {
+      assert.deepEqual(targets.listPiExportTargets('anthropic').map(({ target, slotAccountId }) => ({ target, slotAccountId })), [
+        { target: 'pool-a', slotAccountId: 'slot-a' },
+      ]);
+    } finally {
+      targets.close();
+    }
+    const refreshed = {
+      ...deps,
+      now: () => NOW + 1,
+      loadEntries: () => [{ target: 'pool-a', lineageFp: FP_A, expiresAt: null }],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, refreshed), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 1, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 1, complete: true,
+      members: [{ target: 'pool-a', accountId: 'slot-a', readings: [] }],
+    }]);
+    const drifted = {
+      ...deps,
+      now: () => NOW + 2,
+      loadEntries: () => [{ target: 'pool-new', lineageFp: FP_B, expiresAt: null }],
+      loadSlotLineages: () => [
+        { slotAccountId: 'slot-a', lineageFp: FP_A },
+        { slotAccountId: 'slot-b', lineageFp: FP_B },
+      ],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, drifted), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 2, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 2, complete: false,
+      members: [{ target: 'pool-new', accountId: 'slot-b', readings: [] }],
+    }]);
+  });
+
+  it('allows a later mapping after a zero-match inventory record', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-zero-match-'));
+    const dbPath = join(dir, 'qlb.db');
+    const output: string[] = [];
+    const commandContext = context(output);
+    commandContext.config = { ...commandContext.config, dbPath };
+    let records = 0;
+    const deps = {
+      openStore,
+      loadCswapLineages: () => [],
+      loadSlotLineages: () => records === 0 ? [] : [{ slotAccountId: 'slot-a', lineageFp: FP_A }],
+      admitRecord: () => ({ ok: true }),
+      now: () => NOW + records++,
+      loadEntries: () => [{ target: 'pool-a', lineageFp: FP_A, expiresAt: null }],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, deps), 0);
+    const store = openStore(dbPath);
+    try {
+      assert.deepEqual(store.listPiExportTargets('anthropic').map(({ target, slotAccountId }) => ({ target, slotAccountId })), [
+        { target: 'pool-a', slotAccountId: 'slot-a' },
+      ]);
     } finally {
       store.close();
     }
@@ -232,7 +328,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
 
       const recordingStore = Object.create(store) as typeof store;
       recordingStore.close = () => {};
-      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends { targets: PiExportTargetInput[] }>(
+      recordingStore.recordPiExportTargetsIfEmptyClassified = <T extends PiExportInventoryClassified>(
         provider: string,
         classifyInTransaction: () => T,
         admit: (db: DatabaseSync) => { ok: boolean; code?: string },
@@ -356,7 +452,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
         replacements.push(targets);
         return { ok: true };
       },
-      recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => {
+      recordPiExportTargetsIfEmptyClassified: <T extends PiExportInventoryClassified>(_provider: string, classifyInTransaction: () => T) => {
         const result = classifyInTransaction();
         replacements.push(result.targets);
         return { ok: true as const, result };
@@ -395,7 +491,7 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       openStore: () => ({
         ...store,
         recordPiExportTargetsIfEmpty: () => ({ ok: true }),
-        recordPiExportTargetsIfEmptyClassified: <T extends { targets: unknown[] }>(_provider: string, classifyInTransaction: () => T) => ({ ok: true as const, result: classifyInTransaction() }),
+        recordPiExportTargetsIfEmptyClassified: <T extends PiExportInventoryClassified>(_provider: string, classifyInTransaction: () => T) => ({ ok: true as const, result: classifyInTransaction() }),
         close: () => {}, listPiExportTargets: () => [],
         listAnthropicSlotLineageChains: () => [],
       }),

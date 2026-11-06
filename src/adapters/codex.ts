@@ -43,7 +43,7 @@ function stringClaim(payload: JsonObject | undefined, name: string): string | un
   return undefined;
 }
 
-type CodexStore = Pick<Store, 'upsertAccount' | 'recordUsagePollResult'>;
+type CodexStore = Pick<Store, 'upsertAccount' | 'recordUsagePollResult' | 'listUsagePolls'>;
 type ProbeUsage = (deps: CodexUsageProbeDeps) => Promise<CodexUsageProbeResult>;
 
 export interface CodexAdapterDeps {
@@ -129,6 +129,15 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
         }
 
         const attemptedAt = Math.floor(now() / 1_000);
+        let backingOff: boolean;
+        try {
+          backingOff = (store.listUsagePolls(PROVIDER)[accountId]?.backoffUntil ?? 0) > attemptedAt;
+        } catch {
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
+        }
+        if (backingOff) {
+          return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe is backing off' }];
+        }
         let result: CodexUsageProbeResult;
         try {
           result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath });

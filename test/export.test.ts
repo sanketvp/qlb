@@ -51,15 +51,14 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
       { provider: 'anthropic', target: 'pi-a', slotAccountId: 'anthropic-a', lineageFp: 'not-exported-a', recordedAt: poolRecordedAt },
       { provider: 'anthropic', target: 'pi-b', slotAccountId: 'anthropic-b', lineageFp: 'not-exported-b', recordedAt: poolRecordedAt },
     ]);
-    store.replacePiExportInventory('anthropic', {
-      recordedAt: poolRecordedAt,
-      complete: true,
-      members: [
-        { target: 'pi-a', slotAccountId: 'anthropic-a' },
-        { target: 'pi-b', slotAccountId: 'anthropic-b' },
-        { target: 'pi-unmatched', slotAccountId: null },
-      ],
-    });
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    db.prepare(`INSERT INTO pi_export_inventories (provider, recorded_at, complete) VALUES ('anthropic', ?, 1)`)
+      .run(poolRecordedAt);
+    const insertMember = db.prepare(`INSERT INTO pi_export_inventory_members (provider, target, slot_account_id)
+      VALUES ('anthropic', ?, ?)`);
+    insertMember.run('pi-a', 'anthropic-a');
+    insertMember.run('pi-b', 'anthropic-b');
+    insertMember.run('pi-unmatched', null);
     store.upsertSnapshot('anthropic-a', 'five-hour', {
       usedPct: 12,
       remaining: 88,
@@ -106,6 +105,7 @@ describe('cache-only export', () => {
     ]);
     assert.deepEqual(body.surfaces, [{
       id: 'anthropic-pi-pool',
+      source: 'pool-inventory',
       recordedAt: fixture.poolRecordedAt,
       complete: true,
       members: [
@@ -143,6 +143,26 @@ describe('cache-only export', () => {
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout).surfaces, []);
     assert.equal(JSON.parse(result.stdout).readings[0].accountId, 'legacy-anthropic');
+  });
+
+  it('exports legacy target mappings as incomplete', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-target-only-'));
+    const path = join(root, 'qlb.db');
+    const store = openStore(path);
+    try {
+      store.replacePiExportTargets('anthropic', [{
+        provider: 'anthropic', target: 'legacy-target', slotAccountId: 'legacy-account', lineageFp: 'legacy-fp', recordedAt: 1,
+      }]);
+    } finally {
+      store.close();
+    }
+    assert.deepEqual(cacheOnlyExport(Date.now(), path).surfaces, [{
+      id: 'anthropic-pi-pool',
+      source: 'legacy-target-mapping',
+      recordedAt: 1,
+      complete: false,
+      members: [{ target: 'legacy-target', accountId: 'legacy-account', readings: [] }],
+    }]);
   });
 
   it('refuses a database schema newer than this build without output rows', () => {

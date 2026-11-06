@@ -47,6 +47,7 @@ export type CacheExportSurfaceMember = {
 
 export type CacheExportSurface = {
   id: 'anthropic-pi-pool';
+  source: 'pool-inventory' | 'legacy-target-mapping';
   recordedAt: number;
   complete: boolean;
   members: CacheExportSurfaceMember[];
@@ -111,14 +112,20 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
         | { recorded_at: number; complete: number }
         | undefined
       : undefined;
-    const members = inventory
+    const inventoryMembers = inventory
       ? db.prepare(`SELECT target, slot_account_id FROM pi_export_inventory_members
           WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string | null }>
       : [];
-    const surfaces: CacheExportSurface[] = inventory ? [{
+    const legacyTargets = !inventory && Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_targets'").get())
+      ? db.prepare(`SELECT target, slot_account_id, recorded_at FROM pi_export_targets
+          WHERE provider = 'anthropic' ORDER BY target`).all() as Array<{ target: string; slot_account_id: string; recorded_at: number }>
+      : [];
+    const members = inventory ? inventoryMembers : legacyTargets;
+    const surfaces: CacheExportSurface[] = inventory || legacyTargets.length > 0 ? [{
       id: 'anthropic-pi-pool',
-      recordedAt: inventory.recorded_at,
-      complete: inventory.complete !== 0,
+      source: inventory ? 'pool-inventory' : 'legacy-target-mapping',
+      recordedAt: inventory?.recorded_at ?? Math.max(...legacyTargets.map((target) => target.recorded_at)),
+      complete: inventory?.complete !== 0 && inventory !== undefined,
       members: members.map((member) => ({
         target: member.target,
         accountId: member.slot_account_id,

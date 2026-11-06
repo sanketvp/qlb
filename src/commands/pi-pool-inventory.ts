@@ -30,7 +30,7 @@ export interface PoolInventoryCommandStore extends PoolInventoryStore {
     targets: PiExportTarget[],
     admit: (db: DatabaseSync) => { ok: boolean; code?: string },
   ): { ok: boolean; code?: string };
-  recordPiExportTargetsIfEmptyClassified<T extends { targets: PiExportTarget[] }>(
+  recordPiExportTargetsIfEmptyClassified<T extends ReturnType<typeof classify>>(
     provider: string,
     classifyInTransaction: () => T,
     admit: (db: DatabaseSync) => { ok: boolean; code?: string },

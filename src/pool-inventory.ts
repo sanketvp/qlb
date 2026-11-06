@@ -58,11 +58,6 @@ export class PoolInventoryError extends Error {
 /** The small persistence boundary makes every test effect injectable. */
 export interface PoolInventoryStore {
   replacePiExportTargets(provider: string, targets: PiExportTarget[]): void;
-  replacePiExportInventory?(provider: string, inventory: {
-    recordedAt: number;
-    complete: boolean;
-    members: Array<{ target: string; slotAccountId: string | null }>;
-  }): void;
 }
 
 function fail(code: string): never {
@@ -317,11 +312,6 @@ export function recordPoolInventoryForPiMigrate(options: {
   const recordedAt = options.now?.() ?? Date.now();
   const result = classify(options.entries, options.lineages, recordedAt);
   options.store.replacePiExportTargets('anthropic', result.targets);
-  options.store.replacePiExportInventory?.('anthropic', {
-    recordedAt: result.recordedAt,
-    complete: true,
-    members: result.members,
-  });
   return result;
 }
 
