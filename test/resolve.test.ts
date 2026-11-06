@@ -87,6 +87,42 @@ describe('qlb resolve — store-backed end-to-end', () => {
     store.close();
   });
 
+  it('excludes dead Codex slots from store-backed pool measurement', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-resolve-codex-dead-')), 'qlb.db');
+    const initial = openStore(dbPath);
+    initial.upsertAccount('live', 'openai-codex', 'live');
+    initial.upsertAccount('dead', 'openai-codex', 'dead');
+    for (const accountId of ['live', 'dead']) {
+      initial.upsertSnapshot(accountId, 'primary', { ...reading(100), source: accountId === 'live' ? 'provider-poll' : 'poll' });
+      initial.upsertSnapshot(accountId, 'secondary', { ...reading(100), source: accountId === 'live' ? 'provider-poll' : 'poll' });
+    }
+    initial.close();
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT INTO codex_slots (account_id, chatgpt_user_id, chatgpt_account_id, dead, added_at) VALUES ('dead', 'u', 'a', 1, 1)").run();
+    db.close();
+    const store = openStore(dbPath);
+    const decision = resolveFromSnapshots({
+      model: 'gpt-5.1-codex',
+      snapshots: snapshotsFromStore(store, 'openai-codex'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('excludes dead adapter snapshots from pool measurement', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: [
+        { accountId: 'live', provider: 'anthropic', label: 'live', buckets: { '5h': reading(100), '7d': reading(100) } },
+        { accountId: 'dead', provider: 'anthropic', label: 'dead', buckets: {}, error: 'token_dead' },
+      ],
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+  });
+
   it('normal resolve: picks the higher-scoring account (case 1 A vs B)', () => {
     const store = openStore(':memory:');
     seed(store, 'A', { '5h': reading(70), '7d': reading(20) }, 'account-A');

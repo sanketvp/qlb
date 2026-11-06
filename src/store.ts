@@ -1615,8 +1615,12 @@ export class Store {
     return rows as unknown as AccountRow[];
   }
 
-  isAnthropicSlotLive(accountId: string): boolean | null {
-    const row = this.db.prepare('SELECT dead, archived_at FROM claude_slots WHERE account_id = ?').get(accountId) as
+  isAccountLiveForRouting(provider: string, accountId: string): boolean | null {
+    const table = provider === 'anthropic' ? 'claude_slots'
+      : provider === 'openai-codex' ? 'codex_slots'
+        : null;
+    if (table === null) return null;
+    const row = this.db.prepare(`SELECT dead, archived_at FROM ${table} WHERE account_id = ?`).get(accountId) as
       | { dead: number; archived_at: number | null }
       | undefined;
     if (!row) return null;

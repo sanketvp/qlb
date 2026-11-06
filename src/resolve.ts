@@ -121,13 +121,17 @@ function findEarliestResetForModels(candidates: Array<{ snapshot: AccountSnapsho
 export function snapshotsFromStore(store: Store, provider?: string): AccountSnapshot[] {
   const accounts = store.listAccounts(provider).filter((row) =>
     (row.status === 'active' || row.status === 'validated')
-    && (row.provider !== 'anthropic' || store.isAnthropicSlotLive(row.id) !== false));
+    && store.isAccountLiveForRouting(row.provider, row.id) !== false);
   return accounts.map((row) => ({
     accountId: row.id,
     provider: row.provider as AccountSnapshot['provider'],
     label: row.label,
     buckets: store.getAllSnapshots(row.id),
   }));
+}
+
+function isLiveRoutingSnapshot(snapshot: AccountSnapshot): boolean {
+  return snapshot.error !== 'token_dead';
 }
 
 function serializeSnapshots(snapshots: AccountSnapshot[], now: number): Array<Record<string, unknown>> {
@@ -341,6 +345,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     const candidates = req.snapshots.filter(
       (s) =>
         s.provider === provider &&
+        isLiveRoutingSnapshot(s) &&
         !reserved.has(s.accountId) &&
         (req.store == null ||
           s.provider !== 'openai-codex' ||
