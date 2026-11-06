@@ -581,6 +581,9 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
         db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES ('dead-slot', '{}', 1, ?)").run(NOW);
         db.prepare("INSERT INTO config (key, value) VALUES ('auto.anthropic.suspendedUntil', ?)").run(String(Date.UTC(2099, 0, 1)));
       }
+      if (phase === 'retired') {
+        db.prepare("INSERT INTO config (key, value) VALUES ('auto.heartbeatAt', ?)").run(String(NOW));
+      }
     } finally {
       db.close();
     }
@@ -605,7 +608,7 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
         assert.notEqual(report.healthLogId, undefined, phase);
         const row = healthRows.prepare('SELECT ts, phase, overall, dead_slots_json AS deadSlotsJson FROM health_log WHERE id = ?')
           .get(report.healthLogId) as { ts: number; phase: string; overall: string; deadSlotsJson: string } | undefined;
-        assert.notEqual(row, undefined, phase);
+        assert.ok(row, phase);
         assert.equal(row.ts, NOW, phase);
         assert.equal(row.phase, phase, phase);
         assert.equal(row.overall, report.s64.overall, phase);
@@ -664,6 +667,7 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
 
     assert.equal(level(reports.get('rolled-back')!, 'undo:lineage-match'), 'PASS');
     const retired = reports.get('retired')!;
+    assert.equal(level(retired, 'auto:agent'), 'PASS');
     assert.equal(level(retired, 'cswap:agent'), 'PASS');
     assert.equal(level(retired, 'cswap:processes'), 'PASS');
     assert.equal(retired.s64.overall, 'PASS');
