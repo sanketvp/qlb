@@ -327,6 +327,27 @@ describe('lifecycle (AC49)', () => {
       assert.deepEqual(emptyErrors, ['lifecycle sentinel record refused: claude-version-empty']);
       assert.equal(store.getConfig('sentinel.claudeCodeVersion'), 'Claude Code 1.2.3');
 
+      const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+      const unavailableJson: string[] = [];
+      const unavailable = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record', '--json'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: (line: string) => unavailableJson.push(line), stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [secret],
+        claudeVersionRunner: () => { throw new Error(`spawnSync claude ENOENT ${secret}`); },
+      });
+      assert.equal(unavailable, 3);
+      assert.deepEqual(JSON.parse(unavailableJson[0]!), {
+        ok: false, code: 'claude-version-unavailable', detail: 'spawnSync claude ENOENT [redacted]',
+      });
+
+      const unavailableErrors: string[] = [];
+      const unavailableText = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => unavailableErrors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [secret],
+        claudeVersionRunner: () => { throw new Error(`spawnSync claude ENOENT ${secret}`); },
+      });
+      assert.equal(unavailableText, 3);
+      assert.deepEqual(unavailableErrors, ['lifecycle sentinel record refused: claude-version-unavailable; detail: spawnSync claude ENOENT [redacted]']);
+
       const errors: string[] = [];
       const refusal = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
         config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => errors.push(line),

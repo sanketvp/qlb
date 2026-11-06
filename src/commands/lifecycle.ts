@@ -1,5 +1,6 @@
 import { readClaudeVersion } from '../claude-version';
 import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
+import { redactError } from '../redact';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -12,6 +13,12 @@ function parseJson(args: string[]): { json: boolean; args: string[] } {
   return { json: args.includes('--json'), args: args.filter((arg) => arg !== '--json') };
 }
 
+function versionFailure(error: unknown, ctx: CommandContext): { code: string; detail?: string } {
+  const message = error instanceof Error ? error.message : '';
+  if (message === 'exec-seam-required' || message === 'claude-version-empty') return { code: message };
+  return { code: 'claude-version-unavailable', detail: redactError(error, ctx.knownSecrets()) };
+}
+
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parseJson(args);
   const [subcommand, ...rest] = parsed.args;
@@ -20,8 +27,9 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     try {
       version = readClaudeVersion(ctx.claudeVersionRunner, ctx.env);
     } catch (error) {
-      const code = error instanceof Error ? error.message : 'claude-version-unavailable';
-      emit(ctx, parsed.json, { ok: false, code }, `lifecycle sentinel record refused: ${code}`);
+      const failure = versionFailure(error, ctx);
+      const detail = failure.detail ? `; detail: ${failure.detail}` : '';
+      emit(ctx, parsed.json, { ok: false, ...failure }, `lifecycle sentinel record refused: ${failure.code}${detail}`);
       return 3;
     }
     const recordedAt = Date.now();
