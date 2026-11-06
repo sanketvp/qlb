@@ -111,7 +111,6 @@ describe('cache-only export', () => {
       source: 'pool-inventory',
       recordedAt: fixture.poolRecordedAt,
       complete: false,
-      drift: { added: 1, removed: 0, remapped: 0 },
       members: [
         { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings },
         { target: 'pi-b', accountId: 'anthropic-b', readings: [] },
