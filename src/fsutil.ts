@@ -236,8 +236,6 @@ export type ListStrayTempsOptions = {
   isProcessAlive?: (pid: number) => boolean;
 };
 
-export type SweepStrayTempsOptions = ListStrayTempsOptions;
-
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -286,7 +284,7 @@ export function listStrayTemps(dir: string, options: ListStrayTempsOptions = {})
 }
 
 /** Remove QLB atomic-write temps selected by listStrayTemps. */
-export function sweepStrayTemps(dir: string, options: SweepStrayTempsOptions = {}): number {
+export function sweepStrayTemps(dir: string, options: ListStrayTempsOptions = {}): number {
   let removed = 0;
   for (const path of listStrayTemps(dir, options)) {
     try {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import { claudeLoginExpiryCheck } from '../src/checks/claude-login-expiry';
 import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from '../src/checks/claude-unpersisted-token';
+import { strayTempDirectories, strayTempsCheck } from '../src/checks/fs-stray-temps';
 import { defaultConfig } from '../src/config';
 import { doctorQlb, s64DoctorVerdict } from '../src/diagnostics';
 import { LIFECYCLE_STATES } from '../src/checks/lifecycle-phase';
@@ -421,7 +422,7 @@ describe('claude:unpersisted-token doctor check', () => {
 });
 
 describe('fs:stray-temps doctor check', () => {
-  it('WARNs with every published-target path in every lifecycle phase without deleting files', async () => {
+  it('WARNs with every atomic-publish path in every lifecycle phase without deleting files', async () => {
     for (const state of LIFECYCLE_STATES) {
       const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-phase-'));
       try {
@@ -435,7 +436,10 @@ describe('fs:stray-temps doctor check', () => {
           } finally {
             db.close();
           }
-          const directories = [join(home, '.qlb'), join(home, '.claude'), join(home, 'Library', 'LaunchAgents')];
+          const backupLeaf = join(home, '.qlb', 'backups', 'pi-auth', 'by-auth', '0123456789abcdef');
+          mkdirSync(backupLeaf, { recursive: true });
+          const directories = strayTempDirectories(home);
+          assert.ok(directories.includes(backupLeaf));
           const paths = directories.map((directory, index) => {
             mkdirSync(directory, { recursive: true });
             const path = join(directory, `.qlb-target-${index}.999999999.aaaaaaaaaaaaaaaa.tmp`);
@@ -471,6 +475,39 @@ describe('fs:stray-temps doctor check', () => {
           name: 'fs:stray-temps', level: 'PASS', message: 'no stray temporary files found',
         });
       });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('retains findings across unreadable directories and skips absent duplicate directories', () => {
+    const found = '/qlb/found.tmp';
+    const result = strayTempsCheck({
+      directories: ['/qlb', '/qlb/.', '/absent', '/unreadable'],
+      exists: (directory) => directory !== '/absent',
+      list: (directory) => {
+        if (directory === '/unreadable') throw new Error('EACCES');
+        return [found];
+      },
+    });
+    assert.deepEqual(result, {
+      name: 'fs:stray-temps',
+      level: 'WARN',
+      message: `1 stray temporary file found: ${found}; unable to inspect stray temporary files in /unreadable`,
+      detail: { paths: [found], unreadableDirectories: ['/unreadable'] },
+    });
+  });
+
+  it('discovers only immediate Pi backup leaves without following symlinks', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-backups-'));
+    try {
+      const root = join(home, '.qlb', 'backups', 'pi-auth', 'by-auth');
+      const leaf = join(root, '0123456789abcdef');
+      const nested = join(leaf, 'nested');
+      mkdirSync(nested, { recursive: true });
+      mkdirSync(join(root, 'not-a-hash'));
+      symlinkSync(leaf, join(root, 'fedcba9876543210'));
+      assert.deepEqual(strayTempDirectories(home).filter((directory) => directory.startsWith(root)), [leaf]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
