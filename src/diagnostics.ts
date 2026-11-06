@@ -75,6 +75,7 @@ import { claudeSwitchJournalCheck } from './checks/claude-switch-journal';
 import { journalInProgressCheck } from './checks/journal-in-progress';
 import { journalOrphanedCheck } from './checks/journal-orphaned';
 import { claudeUnclaimedCheck } from './checks/claude-unclaimed';
+import { claudeUnpersistedTokenCheck } from './checks/claude-unpersisted-token';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
@@ -859,6 +860,7 @@ export async function doctorQlb(
     phase,
     options.now?.() ?? Date.now(),
   ));
+  checks.push(claudeUnpersistedTokenCheck(config.dbPath, phase));
   checks.push(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),

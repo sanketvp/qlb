@@ -1119,7 +1119,7 @@ describe('Codex rekey apply', () => {
         { id: 'user:bare', provider: 'openai-codex' },
       ]);
       assert.deepEqual(plainRows(f.db.prepare('SELECT * FROM usage_polls ORDER BY provider, account_id').all()), [
-        { provider: 'anthropic', account_id: 'bare', last_fetch_at: null, last_attempt_at: null, next_due_at: 4, poll_interval_s: null, last_status: null, consecutive_failures: 0, backoff_until: null, last_429_at: null, held_until: null },
+        { provider: 'anthropic', account_id: 'bare', last_fetch_at: null, last_attempt_at: null, next_due_at: 4, poll_interval_s: null, last_status: null, consecutive_failures: 0, backoff_until: null, last_429_at: null, held_until: null, unpersisted_at: null },
       ]);
     } finally { f.close(); }
   });
