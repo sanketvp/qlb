@@ -296,7 +296,38 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
-  it('retirement fence refuses actions that could change a partial retirement', () => {
+  it('sentinels record stores the version through the seam and refuses without one in test mode', async () => {
+    const store = fixtureStore();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-sentinel-'));
+    const config = { ...defaultConfig(home), dbPath: store.dbPath };
+    const output: string[] = [];
+    let calls = 0;
+    try {
+      for (const rules of Object.values(PHASE_RULES)) {
+        assert.equal(rules.has('lifecycle-sentinels-record'), true);
+      }
+      const code = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record', '--json'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        claudeVersionRunner: () => { calls += 1; return 'Claude Code 1.2.3\n'; },
+      });
+      assert.equal(code, 0);
+      assert.equal(calls, 1);
+      assert.equal(store.getConfig('sentinel.claudeCodeVersion'), 'Claude Code 1.2.3');
+      assert.match(store.getConfig('sentinel.recordedAt') ?? '', /^\d+$/);
+      assert.equal(JSON.parse(output[0]!).claudeCodeVersion, 'Claude Code 1.2.3');
+
+      const errors: string[] = [];
+      const refusal = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => errors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      });
+      assert.equal(refusal, 3);
+      assert.deepEqual(errors, ['lifecycle sentinel record refused: exec-seam-required']);
+    } finally { store.close(); }
+  });
+
+  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback, retire-cswap and lifecycle-close', () => {
     const store = fixtureStore();
     try {
       beginCutover(store);

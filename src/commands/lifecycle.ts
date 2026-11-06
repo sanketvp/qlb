@@ -1,6 +1,5 @@
 import { readClaudeVersion } from '../claude-version';
 import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
-import { redactSecrets } from '../redact';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -29,11 +28,11 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     const store = openStore(ctx.config.dbPath);
     try {
       store.runImmediate(() => {
-        store.setConfig('sentinel.claudeCodeVersion', redactSecrets(version, []));
+        store.setConfig('sentinel.claudeCodeVersion', version);
         store.setConfig('sentinel.recordedAt', String(recordedAt));
       });
     } finally { store.close(); }
-    const result = { ok: true, claudeCodeVersion: redactSecrets(version, []), recordedAt };
+    const result = { ok: true, claudeCodeVersion: version, recordedAt };
     emit(ctx, parsed.json, result, `lifecycle sentinel recorded: ${result.claudeCodeVersion}`);
     return 0;
   }

@@ -5,8 +5,6 @@ import { redactSecrets } from './redact';
 export type ClaudeVersionRunner = () => string;
 
 export class ClaudeVersionSeamRequiredError extends Error {
-  code = 'exec-seam-required';
-
   constructor() {
     super('exec-seam-required');
   }

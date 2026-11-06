@@ -76,7 +76,7 @@ import { journalInProgressCheck } from './checks/journal-in-progress';
 import { journalOrphanedCheck } from './checks/journal-orphaned';
 import { claudeUnclaimedCheck } from './checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from './checks/claude-unpersisted-token';
-import { claudeVersionDriftCheck } from './checks/claude-version-drift';
+import { claudeVersionDriftCheck } from './checks/version-drift';
 import type { ClaudeVersionRunner } from './claude-version';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
@@ -695,7 +695,7 @@ export async function doctorQlb(
       }
       const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
       if (cfgTable) {
-        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
+        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
           'migrations.recovery_pending',
           'keychain.helperCheckResult',
           'keychain.helperCheckPrompted',
@@ -707,7 +707,6 @@ export async function doctorQlb(
           'keychain.liveItemsAuthorizedAt',
           'keychain.liveItemsAuthorizedIdentityHash',
           'sentinel.claudeCodeVersion',
-          'sentinel.recordedAt',
         ) as Array<{ key: string; value: string }>;
         for (const row of rows) recordedConfig.set(row.key, row.value);
         recoveryPending = recordedConfig.has('migrations.recovery_pending');
