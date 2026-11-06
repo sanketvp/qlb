@@ -47,6 +47,22 @@ function codex(accountId: string): AccountSnapshot {
 }
 
 describe('qlb resolve — store-backed end-to-end', () => {
+  it('excludes inactive accounts from store-backed pool measurement', () => {
+    const store = openStore(':memory:');
+    seed(store, 'active', { '5h': reading(100), '7d': reading(100) });
+    store.upsertAccount('handed-back', 'anthropic', 'handed-back', 'handed-back');
+    store.upsertSnapshot('handed-back', '5h', { ...reading(10), source: 'poll' });
+    store.upsertSnapshot('handed-back', '7d', { ...reading(10), source: 'poll' });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
   it('normal resolve: picks the higher-scoring account (case 1 A vs B)', () => {
     const store = openStore(':memory:');
     seed(store, 'A', { '5h': reading(70), '7d': reading(20) }, 'account-A');

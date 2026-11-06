@@ -59,14 +59,13 @@ describe('cswap consume inject', () => {
         },
       ],
       true,
-      'cswap-slot-2',
     );
     const decision = resolveFromSnapshots({
       model: 'claude-sonnet-5',
       snapshots: consumed,
     });
-    assert.equal(decision.ok, true);
-    if (decision.ok) assert.equal(decision.accountId, CSWAP_ACTIVE_ID);
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
     console.log('SLOT_PICKS=0');
   });
 

@@ -85,7 +85,7 @@ function unavailableReason(model: string): string {
     case 'anthropic':
       return 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available';
     case 'openai-codex':
-      return 'fresh Codex provider quota reading required; run the scoped Codex refresh or wait for its auto poll';
+      return 'fresh Codex provider quota reading required; wait for its auto poll or a quota-bearing proxy response';
     default:
       return PROVIDER_REFRESH_REQUIRED;
   }
@@ -119,7 +119,7 @@ function findEarliestResetForModels(candidates: Array<{ snapshot: AccountSnapsho
 }
 
 export function snapshotsFromStore(store: Store, provider?: string): AccountSnapshot[] {
-  const accounts = store.listAccounts(provider);
+  const accounts = store.listAccounts(provider).filter((row) => row.status === 'active' || row.status === 'validated');
   return accounts.map((row) => ({
     accountId: row.id,
     provider: row.provider as AccountSnapshot['provider'],
@@ -330,7 +330,7 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
 
   const { reserved, drainFirst } = activeOverrideSets(req.store);
   let authorityCandidates: Array<{ snapshot: AccountSnapshot; model: string }> = [];
-  let hasNonActionableCandidate = false;
+  let blockingPool: { provider: string; model: string } | null = null;
 
   for (let i = 0; i < chain.length; i++) {
     const candidateModel = chain[i];
@@ -345,7 +345,9 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
           req.store.getAccount(s.accountId)?.provider === 'openai-codex'),
     );
     const eligible = candidates.filter((snapshot) => routingAuthority(snapshot, candidateModel).eligible);
-    hasNonActionableCandidate ||= eligible.length !== candidates.length;
+    if (blockingPool === null && eligible.length !== candidates.length) {
+      blockingPool = { provider, model: candidateModel };
+    }
     authorityCandidates = authorityCandidates.concat(eligible.map((snapshot) => ({ snapshot, model: candidateModel })));
     const picked = pickAccount(strategy, {
       snapshots: eligible,
@@ -390,12 +392,14 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     return decision;
   }
 
-  if (authorityCandidates.length === 0 || hasNonActionableCandidate) {
+  if (authorityCandidates.length === 0 || blockingPool !== null) {
     const unavailable: ResolveUnavailable = {
       ok: false,
       error: 'UNAVAILABLE',
       requestedModel: req.model,
-      reason: unavailableReason(req.model),
+      reason: blockingPool === null
+        ? unavailableReason(req.model)
+        : `${unavailableReason(blockingPool.model)} (${blockingPool.provider} ${blockingPool.model} pool requires a fresh provider reading)`,
       candidates: req.snapshots,
     };
     unavailable.decisionId = record(req.store, req, unavailable);

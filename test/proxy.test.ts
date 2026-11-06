@@ -320,7 +320,7 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
       assert.equal(response.status, 503);
       assert.deepEqual(response.json, {
         error: 'UNAVAILABLE',
-        reason: 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available',
+        reason: 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available (anthropic claude-sonnet-5 pool requires a fresh provider reading)',
       });
       assert.equal(hits, 0);
     } finally {

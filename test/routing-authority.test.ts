@@ -72,6 +72,28 @@ describe('provider routing authority', () => {
     if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
   });
 
+  it('names the unmeasured fallback pool', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      fallback: ['grok-4'],
+      snapshots: [
+        anthropic('exhausted', direct(100)),
+        {
+          accountId: 'xai', provider: 'xai', label: 'xAI',
+          buckets: {
+            tokens: { ...direct(10), source: 'headers', confidence: 'advisory' },
+            requests: { ...direct(10), source: 'headers', confidence: 'advisory' },
+          },
+        },
+      ],
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) {
+      assert.equal(decision.error, 'UNAVAILABLE');
+      assert.match(decision.reason, /xAI grok-4 pool requires a fresh provider reading/);
+    }
+  });
+
   it('keeps pins and round-robin inside eligible provider readings', () => {
     const store = openStore(':memory:');
     try {

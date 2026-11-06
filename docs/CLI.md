@@ -371,15 +371,15 @@ Successful JSON shape (from `src/resolve.ts`):
     "provider": "anthropic",
     "label": "alice@example.com",
     "buckets": {
-      "5h":     { "usedPct": 60, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 },
-      "7d":     { "usedPct": 30, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 },
-      "7d:Fable": { "usedPct": 45, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 }
+      "5h":     { "usedPct": 60, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 },
+      "7d":     { "usedPct": 30, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 },
+      "7d:Fable": { "usedPct": 45, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 }
     }
   }
 }
 ```
 
-`mode` is one of `headroom`, `all-in`, `fallback`, `fallback-all-in` (or `exhausted` in the audit row). When the served model differs from the requested one, the human output prints `⚠ served by <model>` prominently — substitution is never silent.
+`mode` is one of `headroom`, `all-in`, `fallback`, `fallback-all-in` (or `exhausted` / `unavailable` in the audit row). When the served model differs from the requested one, the human output prints `⚠ served by <model>` prominently — substitution is never silent.
 
 When every candidate is exhausted:
 
@@ -398,6 +398,8 @@ $ qlb resolve --model claude-sonnet-5 --json
 ```
 
 (`earliestReset` is `null` when no candidate has a known reset time.) Exit code `1`.
+
+When no fresh direct provider quota reading is available, resolve instead returns `UNAVAILABLE` and exits `1`; cached, imported, advisory, stale, and failed-probe readings remain visible in status but cannot select an account or establish exhaustion.
 
 Flags: `--model <modelId>` (required), `[--fallback m1,m2,...]`, `[--session <id>]`, `[--harness pi|claude-code|codex|dispatch]`, `[--effort <lvl>]`, `[--strategy headroom|spread|round-robin|failover]` (default `headroom`, or `defaultStrategy` from config), `[--json]`. Model → provider mapping is documented in `src/scoring.ts`: `claude*` → anthropic, `gpt-*`/`*sol*`/`*astra*`/`*luna*`/`*terra*` → openai-codex, `*grok*` → xai, `*k3*`/`*kimi*` → kimi-coding, `openrouter/*`, `z-ai/*`, `*glm*` → openrouter.
 
@@ -693,7 +695,7 @@ $ qlb proxy --json
 }
 ```
 
-Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer; `--idle-ms 0` is invalid), `[--no-idle]` (do not arm the idle timer; used by the supervising wrapper), `[--port <n>]`, `[--started-by wrapper|cli]`, `[--db <path>]`, `[--json]`. A second `qlb proxy` on an already-bound `--port` exits 1 and does not rewrite `proxy.json` or mint a token. Security posture: loopback-only bind (refuses anything else), per-launch random 32-byte token minted only after listen in the same `proxy.json` write as `startedBy`/`pid`/`lstart`, constant-time token comparison, `Host` header allow-list, path allow-list (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/backend-api/codex/responses`, `/qlb/health`), local auth-failure rate limiting, and credentials injected only for providers whose migration journal says `QLB_OWNED` or `RETIRED` — except Anthropic consume (see below).
+Flags: `[--info-path <path>]`, `[--idle-ms <n>]` (positive integer; `--idle-ms 0` is invalid), `[--no-idle]` (do not arm the idle timer; used by the supervising wrapper), `[--port <n>]`, `[--started-by wrapper|cli]`, `[--db <path>]`, `[--json]`. A second `qlb proxy` on an already-bound `--port` exits 1 and does not rewrite `proxy.json` or mint a token. Security posture: loopback-only bind (refuses anything else), per-launch random 32-byte token minted only after listen in the same `proxy.json` write as `startedBy`/`pid`/`lstart`, constant-time token comparison, `Host` header allow-list, path allow-list (`/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/backend-api/codex/responses`, `/qlb/health`), local auth-failure rate limiting, and credentials injected only for providers whose migration journal says `QLB_OWNED` or `RETIRED` — except Anthropic consume (see below). A request without fresh provider-authoritative quota evidence receives HTTP 503 with `{ "error": "UNAVAILABLE" }`.
 
 ## `qlb consume`
 

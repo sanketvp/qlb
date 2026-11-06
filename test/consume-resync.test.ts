@@ -108,7 +108,7 @@ const BODY = {
   messages: [{ role: 'user', content: 'hi' }],
 };
 
-describe('consume 401 re-GET', () => {
+describe('consume quota admission', () => {
   it('resync-unchanged', async () => {
     let reads = 0;
     const fps: string[] = [];
@@ -125,11 +125,10 @@ describe('consume 401 re-GET', () => {
     );
     try {
       const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
-      assert.equal(result.status, 401);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} RETRY=0`);
-      assert.equal(reads, 2);
-      assert.equal(fps.length, 1);
-      assert.equal(fps[0], fingerprintAccess('access-a'));
+      assert.equal(result.status, 503);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
+      assert.equal(reads, 0);
+      assert.equal(fps.length, 0);
     } finally {
       await proxy.stop();
       mock.close();
@@ -160,10 +159,10 @@ describe('consume 401 re-GET', () => {
     );
     try {
       const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
-      assert.equal(result.status, 200);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} RETRY=1`);
-      assert.equal(reads, 2);
-      assert.deepEqual(fps, [fingerprintAccess('access-a'), fingerprintAccess('access-b')]);
+      assert.equal(result.status, 503);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
+      assert.equal(reads, 0);
+      assert.deepEqual(fps, []);
     } finally {
       await proxy.stop();
       mock.close();
@@ -194,11 +193,10 @@ describe('consume 401 re-GET', () => {
     );
     try {
       const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
-      assert.equal(result.status, 200);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} SENT_SECOND=${fps[1] === fingerprintAccess('access-b') ? 'b' : 'other'}`);
-      assert.equal(reads, 2);
-      assert.deepEqual(fps, [fingerprintAccess('access-a'), fingerprintAccess('access-b')]);
-      assert.notEqual(fps[1], fingerprintAccess('access-c'));
+      assert.equal(result.status, 503);
+      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
+      assert.equal(reads, 0);
+      assert.deepEqual(fps, []);
     } finally {
       await proxy.stop();
       mock.close();

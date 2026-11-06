@@ -55,7 +55,7 @@ import {
   validateRawMigratePath,
   type MigratePathKind,
 } from './migrate-paths';
-import { resolveFromSnapshots, providerForModel } from './resolve';
+import { resolveFromSnapshots, providerForModel, snapshotsFromStore } from './resolve';
 import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
   checkRetirementEligibility,
@@ -1487,6 +1487,28 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
   );
 }
 
+async function collectRoutingCandidates(
+  store: Store,
+  models: string[],
+  probe: boolean,
+  recordAs?: 'resolve',
+) {
+  const usesCodex = models.some((model) => providerForModel(model) === 'openai-codex');
+  const collected = await collectCandidates({
+    adapters,
+    store,
+    models: models.filter((model) => providerForModel(model) !== 'openai-codex'),
+    probe,
+    ...(recordAs === undefined ? {} : { recordAs }),
+  });
+  return {
+    ...collected,
+    snapshots: usesCodex
+      ? [...collected.snapshots, ...snapshotsFromStore(store, 'openai-codex')]
+      : collected.snapshots,
+  };
+}
+
 async function runResolve(opts: ResolveOpts): Promise<number> {
   if (!providerForModel(opts.model)) {
     console.error(`qlb resolve: unknown model '${opts.model}' (cannot map to a provider)`);
@@ -1494,14 +1516,7 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
   }
   const store = getStore();
   const models = [opts.model, ...opts.fallback];
-  const usesCodex = models.some((model) => providerForModel(model) === 'openai-codex');
-  const { snapshots } = await collectCandidates({
-    adapters,
-    store,
-    models: models.filter((model) => providerForModel(model) !== 'openai-codex'),
-    probe: true,
-    recordAs: 'resolve',
-  });
+  const { snapshots } = await collectRoutingCandidates(store, models, true, 'resolve');
   const decision = resolveFromSnapshots({
     model: opts.model,
     fallback: opts.fallback,
@@ -1509,7 +1524,7 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
     harness: opts.harness,
     effort: opts.effort,
     strategy: opts.strategy,
-    snapshots: usesCodex ? [...snapshots, ...snapshotsFromStore(store, 'openai-codex')] : snapshots,
+    snapshots,
     store,
   });
   if (opts.json) printResolveJson(decision);
@@ -1540,12 +1555,7 @@ async function runWhy(opts: WhyOpts): Promise<number> {
   }
   const strategy: Strategy = opts.strategy
     ?? (isStrategy(config.defaultStrategy) ? config.defaultStrategy : 'headroom');
-  const { snapshots, observations } = await collectCandidates({
-    adapters,
-    store,
-    models: [model, ...opts.fallback],
-    probe: false,
-  });
+  const { snapshots, observations } = await collectRoutingCandidates(store, [model, ...opts.fallback], false);
   const report = explainWhy({
     model,
     modelSource,

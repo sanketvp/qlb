@@ -53,14 +53,10 @@ export function syntheticCswapActiveSnapshot(
 export function prepareConsumeSnapshots(
   snapshots: AccountSnapshot[],
   consumed: boolean,
-  activeAccountId?: string | null,
 ): AccountSnapshot[] {
   if (!consumed) return snapshots;
   const others = snapshots.filter((s) => s.provider !== 'anthropic');
-  const active = activeAccountId == null
-    ? undefined
-    : snapshots.find((snapshot) => snapshot.provider === 'anthropic' && snapshot.accountId === activeAccountId);
-  return [syntheticCswapActiveSnapshot(active ? { buckets: active.buckets, probe: active.probe } : {}), ...others];
+  return [syntheticCswapActiveSnapshot(), ...others];
 }
 
 export function getConsumedAccess(opts: ConsumeReadOpts = {}): ConsumedAccess {
