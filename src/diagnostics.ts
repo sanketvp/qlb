@@ -76,6 +76,8 @@ import { journalInProgressCheck } from './checks/journal-in-progress';
 import { journalOrphanedCheck } from './checks/journal-orphaned';
 import { claudeUnclaimedCheck } from './checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from './checks/claude-unpersisted-token';
+import { claudeVersionDriftCheck } from './checks/version-drift';
+import type { ClaudeVersionRunner } from './claude-version';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
@@ -643,6 +645,8 @@ export async function doctorQlb(
     now?: () => number;
     /** Test-only fixture for `ps -axo pid=,lstart=,command=`. */
     piProcessList?: () => string;
+    /** Injectable seam for the non-credential Claude Code version probe. */
+    claudeVersionRunner?: ClaudeVersionRunner;
     /** Tests inject a stable read; production reads lifecycle once per report. */
     readLifecyclePhase?: (dbPath: string) => LifecyclePhaseResult;
     /** Test seam for the non-secret Claude unclaimed-stash index root. */
@@ -691,7 +695,7 @@ export async function doctorQlb(
       }
       const cfgTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'").get();
       if (cfgTable) {
-        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
+        const rows = db.prepare('SELECT key, value FROM config WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').all(
           'migrations.recovery_pending',
           'keychain.helperCheckResult',
           'keychain.helperCheckPrompted',
@@ -702,6 +706,7 @@ export async function doctorQlb(
           'keychain.liveItemsReadAuthorizedIdentityHash',
           'keychain.liveItemsAuthorizedAt',
           'keychain.liveItemsAuthorizedIdentityHash',
+          'sentinel.claudeCodeVersion',
         ) as Array<{ key: string; value: string }>;
         for (const row of rows) recordedConfig.set(row.key, row.value);
         recoveryPending = recordedConfig.has('migrations.recovery_pending');
@@ -862,6 +867,10 @@ export async function doctorQlb(
     options.now?.() ?? Date.now(),
   ));
   checks.push(claudeUnpersistedTokenCheck(config.dbPath, phase));
+  checks.push(claudeVersionDriftCheck(
+    recordedConfig.get('sentinel.claudeCodeVersion') ?? null,
+    options.claudeVersionRunner,
+  ));
   checks.push(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),

@@ -1,6 +1,7 @@
 import { readdirSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import type { QlbConfig, ResolveConfigOptions } from './config';
+import type { ClaudeVersionRunner } from './claude-version';
 
 export interface CommandContext {
   stdout(message: string): void;
@@ -15,6 +16,8 @@ export interface CommandContext {
   deliverSecret(value: string): void;
   /** Registered runtime credentials, retained across copied or wrapped contexts. */
   knownSecrets(): readonly string[];
+  /** Injectable Claude Code version seam. Tests must provide this before execution. */
+  claudeVersionRunner?: ClaudeVersionRunner;
 }
 
 export interface CommandDefinition {

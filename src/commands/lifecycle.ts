@@ -1,4 +1,6 @@
+import { readClaudeVersion } from '../claude-version';
 import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
+import { redactError } from '../redact';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -11,9 +13,37 @@ function parseJson(args: string[]): { json: boolean; args: string[] } {
   return { json: args.includes('--json'), args: args.filter((arg) => arg !== '--json') };
 }
 
+function versionFailure(error: unknown, ctx: CommandContext): { code: string; detail?: string } {
+  const message = error instanceof Error ? error.message : '';
+  if (message === 'exec-seam-required' || message === 'claude-version-empty') return { code: message };
+  return { code: 'claude-version-unavailable', detail: redactError(error, ctx.knownSecrets()) };
+}
+
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parseJson(args);
   const [subcommand, ...rest] = parsed.args;
+  if (subcommand === 'sentinels' && rest[0] === 'record' && rest.length === 1) {
+    let version: string;
+    try {
+      version = readClaudeVersion(ctx.claudeVersionRunner, ctx.env);
+    } catch (error) {
+      const failure = versionFailure(error, ctx);
+      const detail = failure.detail ? `; detail: ${failure.detail}` : '';
+      emit(ctx, parsed.json, { ok: false, ...failure }, `lifecycle sentinel record refused: ${failure.code}${detail}`);
+      return 3;
+    }
+    const recordedAt = Date.now();
+    const store = openStore(ctx.config.dbPath);
+    try {
+      store.runImmediate(() => {
+        store.setConfig('sentinel.claudeCodeVersion', version);
+        store.setConfig('sentinel.recordedAt', String(recordedAt));
+      });
+    } finally { store.close(); }
+    const result = { ok: true, claudeCodeVersion: version, recordedAt };
+    emit(ctx, parsed.json, result, `lifecycle sentinel recorded: ${result.claudeCodeVersion}`);
+    return 0;
+  }
   const store = openStore(ctx.config.dbPath);
   try {
     if (subcommand === 'drill-done' && rest.length === 0) {
@@ -45,7 +75,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 0;
     }
   } finally { store.close(); }
-  ctx.stderr('usage: qlb lifecycle status|drill-done|close <id> --note <why> [--json]');
+  ctx.stderr('usage: qlb lifecycle status|drill-done|sentinels record|close <id> --note <why> [--json]');
   return 2;
 }
 

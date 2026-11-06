@@ -296,6 +296,68 @@ describe('lifecycle (AC49)', () => {
     } finally { store.close(); }
   });
 
+  it('sentinels record stores the version through the seam and refuses without one in test mode', async () => {
+    const store = fixtureStore();
+    const home = mkdtempSync(join(tmpdir(), 'qlb-lifecycle-sentinel-'));
+    const config = { ...defaultConfig(home), dbPath: store.dbPath };
+    const output: string[] = [];
+    let calls = 0;
+    try {
+      for (const rules of Object.values(PHASE_RULES)) {
+        assert.equal(rules.has('lifecycle-sentinels-record'), true);
+      }
+      const code = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record', '--json'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: (line: string) => output.push(line), stderr: (line: string) => output.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        claudeVersionRunner: () => { calls += 1; return 'Claude Code 1.2.3\n'; },
+      });
+      assert.equal(code, 0);
+      assert.equal(calls, 1);
+      assert.equal(store.getConfig('sentinel.claudeCodeVersion'), 'Claude Code 1.2.3');
+      assert.match(store.getConfig('sentinel.recordedAt') ?? '', /^\d+$/);
+      assert.equal(JSON.parse(output[0]!).claudeCodeVersion, 'Claude Code 1.2.3');
+
+      const emptyErrors: string[] = [];
+      const empty = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => emptyErrors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        claudeVersionRunner: () => '  \n',
+      });
+      assert.equal(empty, 3);
+      assert.deepEqual(emptyErrors, ['lifecycle sentinel record refused: claude-version-empty']);
+      assert.equal(store.getConfig('sentinel.claudeCodeVersion'), 'Claude Code 1.2.3');
+
+      const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+      const unavailableJson: string[] = [];
+      const unavailable = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record', '--json'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: (line: string) => unavailableJson.push(line), stderr: () => {},
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [secret],
+        claudeVersionRunner: () => { throw new Error(`spawnSync claude ENOENT ${secret}`); },
+      });
+      assert.equal(unavailable, 3);
+      assert.deepEqual(JSON.parse(unavailableJson[0]!), {
+        ok: false, code: 'claude-version-unavailable', detail: 'spawnSync claude ENOENT [redacted]',
+      });
+
+      const unavailableErrors: string[] = [];
+      const unavailableText = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => unavailableErrors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [secret],
+        claudeVersionRunner: () => { throw new Error(`spawnSync claude ENOENT ${secret}`); },
+      });
+      assert.equal(unavailableText, 3);
+      assert.deepEqual(unavailableErrors, ['lifecycle sentinel record refused: claude-version-unavailable; detail: spawnSync claude ENOENT [redacted]']);
+
+      const errors: string[] = [];
+      const refusal = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => errors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+      });
+      assert.equal(refusal, 3);
+      assert.deepEqual(errors, ['lifecycle sentinel record refused: exec-seam-required']);
+    } finally { store.close(); }
+  });
+
   it('retirement fence refuses actions that could change a partial retirement', () => {
     const store = fixtureStore();
     try {
