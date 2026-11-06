@@ -25,7 +25,7 @@ describe('claude:version-drift doctor check', () => {
     store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
     store.close();
     const report = await doctorQlb(config, {
-      command: () => '', hostCommand: () => '', claudeVersionRunner: () => 'Claude Code 1.0.0\n',
+      command: () => '', hostCommand: () => '', hostPlatform: 'linux', claudeVersionRunner: () => 'Claude Code 1.0.0\n',
     });
     assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
       name: 'claude:version-drift', level: 'PASS',
@@ -40,7 +40,7 @@ describe('claude:version-drift doctor check', () => {
     store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
     store.close();
     const report = await doctorQlb(config, {
-      command: () => '', hostCommand: () => '', claudeVersionRunner: () => 'Claude Code 2.0.0\n',
+      command: () => '', hostCommand: () => '', hostPlatform: 'linux', claudeVersionRunner: () => 'Claude Code 2.0.0\n',
     });
     assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
       name: 'claude:version-drift', level: 'WARN',
@@ -56,7 +56,7 @@ describe('claude:version-drift doctor check', () => {
       try {
         db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run(state, 1);
       } finally { db.close(); }
-      const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+      const report = await doctorQlb(config, { command: () => '', hostCommand: () => '', hostPlatform: 'linux' });
       assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
         name: 'claude:version-drift', level: 'INFO', message: 'not recorded',
       }, state);
@@ -73,7 +73,7 @@ describe('claude:version-drift doctor check', () => {
       store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
       store.close();
       const report = await doctorQlb(config, {
-        command: () => '', hostCommand: () => '', claudeVersionRunner,
+        command: () => '', hostCommand: () => '', hostPlatform: 'linux', claudeVersionRunner,
       });
       assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
         name: 'claude:version-drift', level: 'WARN', message: 'Claude Code version unknown',
