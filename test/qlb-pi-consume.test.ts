@@ -1,8 +1,16 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { CONSUME_ERRORS, CSWAP_ACTIVE_ID } from '../extensions/qlb-pi/consume';
 import {
+  canSkipJournal,
+  conflictMessage,
+  CONSUME_ERRORS,
+  CSWAP_ACTIVE_ID,
+  decidePiMode,
+  parseConsumeStatus,
+} from '../extensions/qlb-pi/consume';
+import {
+  registerConflictProvider,
   registerConsumeProvider,
   type AnthropicNativeProvider,
   type EventSink,
@@ -30,6 +38,18 @@ const model: ModelLike = {
 };
 
 describe('qlb-pi consume provider', () => {
+  it('keeps every incomplete consume transition out of the native pool', () => {
+    for (const journal of ['unknown', 'NATIVE'] as const) {
+      assert.equal(decidePiMode({ owner: 'absent', journal, marker: true }), 'conflict');
+    }
+    assert.equal(decidePiMode({ owner: 'valid', journal: 'CONSUMED', marker: false }), 'conflict');
+    assert.equal(decidePiMode({ owner: 'absent', journal: 'CONSUMED', marker: false }), 'consume');
+    assert.equal(canSkipJournal({ owner: 'absent', marker: false, dbExists: false }), true);
+    assert.equal(canSkipJournal({ owner: 'absent', marker: false, dbExists: true }), false);
+    assert.equal(parseConsumeStatus(1, '{"state":"CONSUMED"}'), 'unknown');
+    assert.equal(conflictMessage({ owner: 'absent', journal: 'unknown', marker: true }), CONSUME_ERRORS.stateUnknown);
+  });
+
   it('fails unavailable without calling the replaced provider', () => {
     let replacedProviderCalls = 0;
     const providers = new Map<string, AnthropicNativeProvider>();
@@ -71,5 +91,19 @@ describe('qlb-pi consume provider', () => {
       outcome: 'unavailable',
       error: CONSUME_ERRORS.quotaUnavailable,
     }]);
+  });
+
+  it('conflict provider replaces the pool with an error-only provider', () => {
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
+    };
+    registerConflictProvider(pi, sink, CONSUME_ERRORS.conflict, { models: [model] });
+    const output = providers.get('anthropic')!.streamSimple(model, {}) as Sink;
+    assert.equal(output.ended, true);
+    assert.deepEqual(output.events.map((event) => (event as { error: { errorMessage: string } }).error.errorMessage), [
+      CONSUME_ERRORS.conflict,
+    ]);
   });
 });

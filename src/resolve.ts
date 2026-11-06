@@ -7,7 +7,7 @@ import {
   type Strategy,
 } from './scoring';
 import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
-import { routingAuthority } from './routing-authority';
+import { currentProviderObservation, routingAuthority } from './routing-authority';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -126,7 +126,7 @@ export function snapshotsFromStore(store: Store, provider?: string): AccountSnap
     accountId: row.id,
     provider: row.provider as AccountSnapshot['provider'],
     label: row.label,
-    buckets: store.getAllSnapshots(row.id),
+    buckets: currentProviderObservation(store.getAllSnapshots(row.id)),
   }));
 }
 

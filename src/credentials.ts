@@ -19,6 +19,7 @@ import {
   singleJournalAccount,
 } from './single-grant-ownership';
 import type { Store } from './store';
+import { CSWAP_ACTIVE_ID, CSWAP_ANTHROPIC_STORE, isConsumedState } from './cswap-consume';
 
 const OWNED_OR_LATER = new Set(['QLB_OWNED', 'RETIRED']);
 
@@ -72,6 +73,10 @@ export function createOwnedCredentialSource(opts: {
   return async (accountId: string): Promise<string> => {
     const acct = opts.store.getAccount(accountId);
     const provider = acct?.provider ?? guessProvider(accountId);
+    if (isConsumedState(opts.store.getMigration(CSWAP_ANTHROPIC_STORE)?.state)
+      && (accountId === CSWAP_ACTIVE_ID || provider === 'anthropic')) {
+      throw notOwnedError(accountId, provider);
+    }
     const storeName = provider ? migrationStoreNameFor(provider) : undefined;
     const migration = storeName ? opts.store.getMigration(storeName) : undefined;
     const state = migration?.state;

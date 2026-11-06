@@ -20,6 +20,19 @@ export function isProviderAuthoritativeReading(
   return now - reading.fetchedAt <= PROVIDER_READING_MAX_AGE_MS;
 }
 
+export function currentProviderObservation(buckets: Record<string, BucketReading>): Record<string, BucketReading> {
+  const newest = Math.max(...Object.values(buckets)
+    .filter((reading) => reading.confidence === 'authoritative'
+      && (reading.source === 'provider-poll' || reading.source === 'provider-headers'))
+    .map((reading) => reading.fetchedAt));
+  if (!Number.isFinite(newest)) return buckets;
+  return Object.fromEntries(Object.entries(buckets).filter(([, reading]) =>
+    reading.confidence !== 'authoritative'
+    || (reading.source !== 'provider-poll' && reading.source !== 'provider-headers')
+    || reading.fetchedAt >= newest,
+  ));
+}
+
 /**
  * Routing may only use a complete, fresh direct provider measurement.
  * This leaves cached rows intact for status, export, and cross-check display.

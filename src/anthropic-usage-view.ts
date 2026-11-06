@@ -2,6 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { redactSecrets } from './redact';
+import { currentProviderObservation } from './routing-authority';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S };
@@ -200,7 +201,7 @@ export function anthropicStoreSnapshots(
         );
       }
       const buckets = projectAnthropicUsageReadings(
-        store.getAllSnapshots(slot.accountId), row, nowS,
+        currentProviderObservation(store.getAllSnapshots(slot.accountId)), row, nowS,
       );
       return statusSnapshot(
         slot,
@@ -224,7 +225,7 @@ export function hasFreshAnthropicUsagePoll(
   return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
     const row = polls[slot.accountId];
     return row !== undefined
-      && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;
+      && Object.keys(projectAnthropicUsageReadings(currentProviderObservation(store.getAllSnapshots(slot.accountId)), row, nowS)).length > 0;
   });
 }
 

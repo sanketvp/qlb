@@ -2,16 +2,19 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { createOwnedCredentialSource, notOwnedError } from '../src/credentials';
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
 import { openStore } from '../src/store';
 
 describe('credentials consume gating', () => {
-  it('does not inject an unattributed consumed credential', async () => {
+  it('rejects unattributed and Anthropic credentials while consumed', async () => {
     const store = openStore(':memory:');
     const keychain = new MockKeychain();
+    store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
+    store.upsertAccount('anthropic-slot', 'anthropic', 'Anthropic slot');
     const source = createOwnedCredentialSource({ store, keychain });
-    await assert.rejects(() => source('cswap-active'), (err: unknown) => {
+    for (const accountId of ['cswap-active', 'anthropic-slot']) await assert.rejects(() => source(accountId), (err: unknown) => {
       assert.ok(err instanceof Error);
       assert.match(err.message, /not yet owned/);
       return true;
