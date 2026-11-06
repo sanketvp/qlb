@@ -2199,6 +2199,7 @@ function lifecycleOperationFor(command: string, args: string[]): LifecycleOperat
     return args.includes('--resume') ? 'undo-cswap:resume' : 'undo-cswap';
   }
   if (command === 'lifecycle') {
+    if (args[0] === 'sentinels' && args[1] === 'record') return 'lifecycle-sentinels-record';
     if (args[0] === 'drill-done') return 'lifecycle-drill-done';
     if (args[0] === 'close') return 'lifecycle-close';
     if (args[0] === 'status') return 'status';

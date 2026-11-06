@@ -1,4 +1,6 @@
+import { readClaudeVersion } from '../claude-version';
 import { CSWAP_RESTORE_PENDING, FINISH_CSWAP_RESTORE_FIRST, FINISH_RETIREMENT_FIRST, RETIREMENT_IN_PROGRESS, closeLifecycle, markDrillDone, phase } from '../lifecycle';
+import { redactSecrets } from '../redact';
 import { openStore } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -14,6 +16,27 @@ function parseJson(args: string[]): { json: boolean; args: string[] } {
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parseJson(args);
   const [subcommand, ...rest] = parsed.args;
+  if (subcommand === 'sentinels' && rest[0] === 'record' && rest.length === 1) {
+    let version: string;
+    try {
+      version = readClaudeVersion(ctx.claudeVersionRunner, ctx.env);
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'claude-version-unavailable';
+      emit(ctx, parsed.json, { ok: false, code }, `lifecycle sentinel record refused: ${code}`);
+      return 3;
+    }
+    const recordedAt = Date.now();
+    const store = openStore(ctx.config.dbPath);
+    try {
+      store.runImmediate(() => {
+        store.setConfig('sentinel.claudeCodeVersion', redactSecrets(version, []));
+        store.setConfig('sentinel.recordedAt', String(recordedAt));
+      });
+    } finally { store.close(); }
+    const result = { ok: true, claudeCodeVersion: redactSecrets(version, []), recordedAt };
+    emit(ctx, parsed.json, result, `lifecycle sentinel recorded: ${result.claudeCodeVersion}`);
+    return 0;
+  }
   const store = openStore(ctx.config.dbPath);
   try {
     if (subcommand === 'drill-done' && rest.length === 0) {
@@ -45,7 +68,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
       return 0;
     }
   } finally { store.close(); }
-  ctx.stderr('usage: qlb lifecycle status|drill-done|close <id> --note <why> [--json]');
+  ctx.stderr('usage: qlb lifecycle status|drill-done|sentinels record|close <id> --note <why> [--json]');
   return 2;
 }
 
