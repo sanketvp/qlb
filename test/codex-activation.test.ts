@@ -166,6 +166,25 @@ describe('Codex S29 activation', () => {
     }
   });
 
+  it('does not provide rollout snapshots to the explicit quota probe', async () => {
+    const store = openStore(':memory:');
+    try {
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        probeUsage: async ({ readRollout }) => {
+          assert.deepEqual(await readRollout?.('fixture-account'), []);
+          return { status: 200, source: 'wham', keys: ['primary'], windows: [{ bucket: 'primary', usedPct: 12 }] };
+        },
+      });
+
+      const [snapshot] = await adapter.fetchSnapshots();
+      assert.equal(snapshot?.buckets.primary?.usedPct, 12);
+    } finally {
+      store.close();
+    }
+  });
+
   it('records a provider Retry-After as a 429 backoff', async () => {
     const store = openStore(':memory:');
     try {

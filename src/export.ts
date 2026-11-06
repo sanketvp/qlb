@@ -141,9 +141,11 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
     } : { added: 0, removed: 0, remapped: 0 };
     const hasLifecycle = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle'").get());
     const lifecycle = hasLifecycle
-      ? db.prepare("SELECT state FROM lifecycle WHERE state <> 'closed' ORDER BY id DESC LIMIT 1").get() as { state: string } | undefined
+      ? db.prepare("SELECT state, began_at FROM lifecycle WHERE state <> 'closed' ORDER BY id DESC LIMIT 1").get() as { state: string; began_at: number } | undefined
       : undefined;
-    const servingPool = lifecycle?.state === 'cutting-over' || lifecycle?.state === 'cutover' || lifecycle?.state === 'retired';
+    const servingPool = (lifecycle?.state === 'cutting-over' || lifecycle?.state === 'cutover' || lifecycle?.state === 'retired')
+      && inventory !== undefined
+      && inventory.recorded_at >= lifecycle.began_at;
     const surfaces: CacheExportSurface[] = servingPool && inventory ? [{
       id: 'anthropic-pi-pool',
       source: 'pool-inventory',

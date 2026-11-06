@@ -46,7 +46,7 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
   const poolRecordedAt = now - 60_000;
   const store = openStore(path);
   try {
-    beginCutover(store, now);
+    beginCutover(store, poolRecordedAt - 1);
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
     store.upsertAccount('anthropic-b', 'anthropic', 'account-b');
     store.recordPiExportTargetsIfEmptyClassified('anthropic', () => ({
@@ -194,7 +194,36 @@ describe('cache-only export', () => {
     } finally {
       store.close();
     }
-    assert.equal(cacheOnlyExport(Date.now(), fixture.path).surfaces.length, 1);
+    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+  });
+
+  it('requires a new inventory after beginning a new lifecycle generation', () => {
+    const fixture = fixtureDb();
+    const store = openStore(fixture.path);
+    const beganAt = Date.now();
+    const recordedAt = beganAt + 1;
+    try {
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      db.prepare("UPDATE lifecycle SET state = 'closed'").run();
+      beginCutover(store, beganAt);
+      assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+
+      const recorded = store.recordPiExportTargetsIfEmptyClassified('anthropic', () => ({
+        recordedAt,
+        complete: true,
+        targets: [],
+        members: [
+          { target: 'pi-a', slotAccountId: 'anthropic-a' },
+          { target: 'pi-b', slotAccountId: 'anthropic-b' },
+        ],
+      }), () => ({ ok: true }));
+      assert.equal(recorded.ok, true);
+    } finally {
+      store.close();
+    }
+    const [surface] = cacheOnlyExport(Date.now(), fixture.path).surfaces;
+    assert.equal(surface?.recordedAt, recordedAt);
+    assert.equal(surface?.complete, true);
   });
 
   it('refuses a database schema newer than this build without output rows', () => {

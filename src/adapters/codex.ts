@@ -138,7 +138,7 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
         }
         let result: CodexUsageProbeResult;
         try {
-          result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath });
+          result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath, readRollout: async () => [] });
         } catch {
           try {
             store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
