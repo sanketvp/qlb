@@ -49,16 +49,21 @@ describe('claude:version-drift doctor check', () => {
   });
 
   it('claude:version-drift warns when claude cannot be run', async () => {
-    const { config } = fixture();
-    const store = openStore(config.dbPath);
-    store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
-    store.close();
-    const report = await doctorQlb(config, {
-      command: () => '', hostCommand: () => '', claudeVersionRunner: () => { throw new Error('missing'); },
-    });
-    assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
-      name: 'claude:version-drift', level: 'WARN', message: 'Claude Code version unknown',
-    });
-    assert.equal(report.s64.overall, 'PASS');
+    for (const claudeVersionRunner of [
+      () => { throw new Error('missing'); },
+      () => '  \n',
+    ]) {
+      const { config } = fixture();
+      const store = openStore(config.dbPath);
+      store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0');
+      store.close();
+      const report = await doctorQlb(config, {
+        command: () => '', hostCommand: () => '', claudeVersionRunner,
+      });
+      assert.deepEqual(report.checks.find((row) => row.name === 'claude:version-drift'), {
+        name: 'claude:version-drift', level: 'WARN', message: 'Claude Code version unknown',
+      });
+      assert.equal(report.s64.overall, 'PASS');
+    }
   });
 });

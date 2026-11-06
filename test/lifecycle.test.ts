@@ -317,6 +317,16 @@ describe('lifecycle (AC49)', () => {
       assert.match(store.getConfig('sentinel.recordedAt') ?? '', /^\d+$/);
       assert.equal(JSON.parse(output[0]!).claudeCodeVersion, 'Claude Code 1.2.3');
 
+      const emptyErrors: string[] = [];
+      const empty = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
+        config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => emptyErrors.push(line),
+        loadConfig: () => config, registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [],
+        claudeVersionRunner: () => '  \n',
+      });
+      assert.equal(empty, 3);
+      assert.deepEqual(emptyErrors, ['lifecycle sentinel record refused: claude-version-empty']);
+      assert.equal(store.getConfig('sentinel.claudeCodeVersion'), 'Claude Code 1.2.3');
+
       const errors: string[] = [];
       const refusal = await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, {
         config, env: { QLB_TEST_MODE: '1' }, home, stdout: () => {}, stderr: (line: string) => errors.push(line),
