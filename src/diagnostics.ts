@@ -90,7 +90,7 @@ import { lifecycleDrillCheck } from './checks/lifecycle-drill';
 import { claudeConfigPathCheck } from './checks/claude-config-path';
 import { claudeConfigFileCheck } from './checks/claude-config-file';
 import { claudeLocksCheck } from './checks/claude-locks';
-import { strayTempsCheck } from './checks/fs-stray-temps';
+import { strayTempDirectories, strayTempsCheck } from './checks/fs-stray-temps';
 import { libsecretStashChecks } from './checks/stash-libsecret';
 import { stashRootFor } from './single-stash';
 import { appendHealthLog } from './health-log';
