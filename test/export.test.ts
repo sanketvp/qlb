@@ -119,6 +119,8 @@ describe('cache-only export', () => {
       ],
     }]);
     assert.doesNotMatch(result.stdout, /lineage/i);
+    assert.equal(result.stdout.includes('not-exported-a'), false);
+    assert.equal(result.stdout.includes('not-exported-b'), false);
   });
 
   it('omits surfaces when no persisted Anthropic Pi targets exist', () => {
