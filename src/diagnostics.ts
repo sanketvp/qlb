@@ -90,6 +90,7 @@ import { lifecycleDrillCheck } from './checks/lifecycle-drill';
 import { claudeConfigPathCheck } from './checks/claude-config-path';
 import { claudeConfigFileCheck } from './checks/claude-config-file';
 import { claudeLocksCheck } from './checks/claude-locks';
+import { strayTempDirectories, strayTempsCheck } from './checks/fs-stray-temps';
 import { libsecretStashChecks } from './checks/stash-libsecret';
 import { stashRootFor } from './single-stash';
 import { appendHealthLog } from './health-log';
@@ -865,6 +866,14 @@ export async function doctorQlb(
     claudeConfigPathCheck(),
     claudeConfigFileCheck(),
     claudeLocksCheck(),
+    strayTempsCheck({
+      directories: [
+        ...strayTempDirectories(),
+        dirname(config.codexAuthJsonPath),
+        dirname(config.piAuthJsonPath),
+        dirname(config.anthropicPoolPath),
+      ],
+    }),
     autoBreakerCheck(config.dbPath, 'anthropic', lifecycle),
     autoParkedCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
     autoAgentCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),

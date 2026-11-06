@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import { claudeLoginExpiryCheck } from '../src/checks/claude-login-expiry';
 import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from '../src/checks/claude-unpersisted-token';
+import { strayTempDirectories, strayTempsCheck } from '../src/checks/fs-stray-temps';
 import { defaultConfig } from '../src/config';
 import { doctorQlb, s64DoctorVerdict } from '../src/diagnostics';
 import { LIFECYCLE_STATES } from '../src/checks/lifecycle-phase';
@@ -20,8 +21,10 @@ const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
 async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
   const previousTestMode = process.env.QLB_TEST_MODE;
   const previousQlbHome = process.env.QLB_HOME;
+  const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
   process.env.QLB_TEST_MODE = '1';
   process.env.QLB_HOME = home;
+  process.env.CLAUDE_CONFIG_DIR = join(home, '.claude');
   try {
     return await operation();
   } finally {
@@ -29,6 +32,8 @@ async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Pr
     else process.env.QLB_TEST_MODE = previousTestMode;
     if (previousQlbHome === undefined) delete process.env.QLB_HOME;
     else process.env.QLB_HOME = previousQlbHome;
+    if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
   }
 }
 
@@ -417,5 +422,140 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.deepEqual(claudeUnpersistedTokenCheck(fixture(), 'pre-cutover'), {
       name: 'claude:unpersisted-token', level: 'N/A', message: 'not applicable in phase=pre-cutover',
     });
+  });
+});
+
+describe('fs:stray-temps doctor check', () => {
+  it('WARNs with every atomic-publish path in every lifecycle phase without deleting files', async () => {
+    for (const state of LIFECYCLE_STATES) {
+      const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-phase-'));
+      try {
+        await withTestQlbHome(home, async () => {
+          const config = defaultConfig(home);
+          const store = openStore(config.dbPath);
+          store.close();
+          const db = new DatabaseSync(config.dbPath);
+          try {
+            db.prepare('INSERT INTO lifecycle (state, began_at) VALUES (?, ?)').run(state, NOW);
+          } finally {
+            db.close();
+          }
+          const backupRoot = join(home, '.qlb', 'backups', 'pi-auth');
+          const backupLeaf = join(backupRoot, 'by-auth', '0123456789abcdef');
+          mkdirSync(backupLeaf, { recursive: true });
+          const directories = [
+            home,
+            join(home, '.qlb'),
+            join(home, '.qlb', 'journal'),
+            join(home, '.claude'),
+            join(home, 'Library', 'LaunchAgents'),
+            join(home, '.codex'),
+            join(home, '.pi', 'agent'),
+            backupRoot,
+            backupLeaf,
+          ];
+          const paths = directories.map((directory, index) => {
+            mkdirSync(directory, { recursive: true });
+            const path = join(directory, `.qlb-target-${index}.999999999.aaaaaaaaaaaaaaaa.tmp`);
+            writeFileSync(path, 'not a credential');
+            const old = new Date(Date.now() - 61_000);
+            utimesSync(path, old, old);
+            return path;
+          });
+
+          const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+          const row = report.checks.find((check) => check.name === 'fs:stray-temps');
+          assert.equal(row?.level, 'WARN', state);
+          for (const path of paths) {
+            assert.match(row?.message ?? '', new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+            assert.equal(existsSync(path), true, state);
+          }
+        });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('PASSes when published targets contain no qualifying temporary files', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-none-'));
+    try {
+      await withTestQlbHome(home, async () => {
+        const config = defaultConfig(home);
+        const store = openStore(config.dbPath);
+        store.close();
+        const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+        assert.deepEqual(report.checks.find((check) => check.name === 'fs:stray-temps'), {
+          name: 'fs:stray-temps', level: 'PASS', message: 'no stray temporary files found',
+        });
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('retains findings across unreadable directories and skips absent duplicate directories', () => {
+    const found = '/qlb/found.tmp';
+    const result = strayTempsCheck({
+      directories: ['/qlb', '/qlb/.', '/absent', '/unreadable'],
+      exists: (directory) => directory !== '/absent',
+      list: (directory) => {
+        if (directory === '/unreadable') throw new Error('EACCES');
+        return [found];
+      },
+    });
+    assert.deepEqual(result, {
+      name: 'fs:stray-temps',
+      level: 'WARN',
+      message: `1 stray temporary file found: ${found}; unable to inspect stray temporary files in /unreadable`,
+      detail: { paths: [found], unreadableDirectories: ['/unreadable'] },
+    });
+  });
+
+  it('reports temps beside configured Codex and Pi publish targets', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-configured-'));
+    try {
+      await withTestQlbHome(home, async () => {
+        const config = defaultConfig(home);
+        config.codexAuthJsonPath = join(home, 'custom-codex', 'auth.json');
+        config.piAuthJsonPath = join(home, 'custom-pi', 'auth.json');
+        config.anthropicPoolPath = join(home, 'custom-pool', 'anthropic-pool.json');
+        const store = openStore(config.dbPath);
+        store.close();
+        const paths = [config.codexAuthJsonPath, config.piAuthJsonPath, config.anthropicPoolPath].map((target, index) => {
+          const directory = dirname(target);
+          mkdirSync(directory, { recursive: true });
+          const path = join(directory, `.qlb-target-${index}.999999999.aaaaaaaaaaaaaaaa.tmp`);
+          writeFileSync(path, 'not a credential');
+          const old = new Date(Date.now() - 61_000);
+          utimesSync(path, old, old);
+          return path;
+        });
+        const report = await doctorQlb(config, { command: () => '', hostCommand: () => '' });
+        const row = report.checks.find((check) => check.name === 'fs:stray-temps');
+        assert.equal(row?.level, 'WARN');
+        assert.deepEqual(row?.detail, { paths, unreadableDirectories: [] });
+        for (const path of paths) assert.equal(existsSync(path), true);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers only immediate Pi backup leaves without following symlinks', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-stray-temps-backups-'));
+    try {
+      await withTestQlbHome(home, async () => {
+        const root = join(home, '.qlb', 'backups', 'pi-auth', 'by-auth');
+        const leaf = join(root, '0123456789abcdef');
+        const nested = join(leaf, 'nested');
+        mkdirSync(nested, { recursive: true });
+        mkdirSync(join(root, 'not-a-hash'));
+        symlinkSync(leaf, join(root, 'fedcba9876543210'));
+        assert.deepEqual(strayTempDirectories(home).filter((directory) => directory.startsWith(root)), [leaf]);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

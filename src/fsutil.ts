@@ -231,7 +231,7 @@ export function atomicWriteText(path: string, text: string, options: AtomicWrite
   return atomicWriteBytes(path, Buffer.from(text, 'utf8'), options);
 }
 
-export type SweepStrayTempsOptions = {
+export type ListStrayTempsOptions = {
   /** Injectable for tests; false means that the owner PID is known to be dead. */
   isProcessAlive?: (pid: number) => boolean;
 };
@@ -248,14 +248,14 @@ function processIsAlive(pid: number): boolean {
 }
 
 /**
- * Remove QLB atomic-write temps older than 60 seconds immediately below `dir`.
+ * List QLB atomic-write temps older than 60 seconds immediately below `dir`.
  * This is a QLB addition (the upstream helper has no sweep); lstat avoids
  * following symlinks. The owner PID is checked instead of extending the grace
- * period so an indefinitely stalled live writer is never swept.
+ * period so an indefinitely stalled live writer is never returned.
  */
-export function sweepStrayTemps(dir: string, options: SweepStrayTempsOptions = {}): number {
+export function listStrayTemps(dir: string, options: ListStrayTempsOptions = {}): string[] {
   const isProcessAlive = options.isProcessAlive ?? processIsAlive;
-  let removed = 0;
+  const paths: string[] = [];
   const oldestAllowed = Date.now() - STRAY_TEMP_MIN_AGE_MS;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const match = STRAY_TEMP.exec(entry.name);
@@ -278,7 +278,15 @@ export function sweepStrayTemps(dir: string, options: SweepStrayTempsOptions = {
       // A failed custom probe cannot prove the owner dead.
       ownerIsAlive = true;
     }
-    if (ownerIsAlive) continue;
+    if (!ownerIsAlive) paths.push(path);
+  }
+  return paths;
+}
+
+/** Remove QLB atomic-write temps selected by listStrayTemps. */
+export function sweepStrayTemps(dir: string, options: ListStrayTempsOptions = {}): number {
+  let removed = 0;
+  for (const path of listStrayTemps(dir, options)) {
     try {
       unlinkSync(path);
       removed += 1;
