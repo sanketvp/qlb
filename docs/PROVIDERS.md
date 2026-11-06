@@ -29,10 +29,10 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 ## OpenAI Codex (`openai-codex`)
 
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
-- **Usage signal:** response headers only. Codex exposes no standalone usage GET; `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers arrive on real requests to the Codex backend. The adapter itself therefore reports an authenticated account with **no buckets** — numbers populate when real traffic flows through `qlb proxy` (whose `parseUsageHeaders` writes header-derived readings into the same snapshot cache).
+- **Usage signal:** scheduled or explicit provider usage polling through wham/codex-api writes `provider-poll` readings. Quota-bearing proxy response headers — `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers — write `provider-headers` readings when real traffic flows through `qlb proxy`.
 - **Buckets:** `primary` (5-hour), `secondary` (weekly).
-- **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that. Unknown readings remain visible but make routing unavailable.
-- **Caveats:** because every reading requires a real request, Codex data is exactly as fresh as the last request that went through. There is no free refresh, and QLB does not send probe requests on its own in the CLI path.
+- **Confidence:** `authoritative` once a provider-poll or quota-bearing header reading exists; `unknown` before that. Rollout fallback remains advisory and display-only. Unknown readings remain visible but make routing unavailable.
+- **Caveats:** Codex data is actionable only while its provider reading is fresh. QLB does not route from rollout fallback data.
 
 ### Pi OAuth source compatibility (P3)
 

@@ -79,9 +79,11 @@ score = min over scored buckets b of ( discount_b × headroom_b × f_b )
 headroom_b = ceiling − usedPct_b            ceiling defaults to 80
 discount_b = 1.0 (5-hour-class buckets)
            = 0.6 (weekly-class buckets)     WEEKLY_SCARCITY
-f_b        = 1.0 (authoritative)
+f_b        = 1.0 (authoritative) | 0.5 (stale)
 score      = -Infinity when no eligible bucket is scored
 ```
+
+The scoring layer retains the stale factor for display and diagnostic calculations, but routing authority rejects stale readings before selection, so stale readings never route.
 
 The scarcity discount is the part that is easy to get backwards, and an earlier revision of the design *did* get it backwards. Weekly capacity recovers slowly (up to 7 days), 5-hour capacity recovers quickly, so a thin *weekly* margin should drive an account's score down faster than a thin 5-hour margin. That is achieved by multiplying the weekly headroom by a number **less than 1** (0.6), which makes the weekly term the first to hit the minimum — not by weighting it above 1.
 

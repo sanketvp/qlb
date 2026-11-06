@@ -111,11 +111,11 @@ describe('qlb resolve — store-backed end-to-end', () => {
     assert.equal(decision.ok, false);
     if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
     store.recordUsagePollResult('anthropic', 'account', {
-      attemptedAt: Math.floor(now / 1000) + 1,
+      attemptedAt: Math.floor(now / 1000),
       status: 'ok',
       readings: {
-        '5h': { ...reading(10), fetchedAt: now + 1_000 },
-        '7d': { ...reading(10), fetchedAt: now + 1_000 },
+        '5h': { ...reading(10), fetchedAt: now },
+        '7d': { ...reading(10), fetchedAt: now },
       },
     });
     decision = resolveFromSnapshots({
