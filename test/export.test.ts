@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { cacheOnlyExport } from '../src/export';
+import { beginCutover } from '../src/lifecycle';
 import { openStore } from '../src/store';
 
 const cliPath = join(__dirname, '..', 'src', 'cli.js');
@@ -45,6 +46,7 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
   const poolRecordedAt = now - 60_000;
   const store = openStore(path);
   try {
+    beginCutover(store, now);
     store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
     store.upsertAccount('anthropic-b', 'anthropic', 'account-b');
     store.replacePiExportTargets('anthropic', [
@@ -151,6 +153,7 @@ describe('cache-only export', () => {
     const path = join(root, 'qlb.db');
     const store = openStore(path);
     try {
+      beginCutover(store, 1);
       store.replacePiExportTargets('anthropic', [{
         provider: 'anthropic', target: 'legacy-target', slotAccountId: 'legacy-account', lineageFp: 'legacy-fp', recordedAt: 1,
       }]);
@@ -164,6 +167,51 @@ describe('cache-only export', () => {
       complete: false,
       drift: { added: 0, removed: 0, remapped: 0 },
       members: [{ target: 'legacy-target', accountId: 'legacy-account', readings: [] }],
+    }]);
+  });
+
+  it('serves persisted pool inventory only in active lifecycle states', () => {
+    const fixture = fixtureDb();
+    const setState = (state: string | null) => {
+      const db = new DatabaseSync(fixture.path);
+      try {
+        if (state === null) db.exec('DELETE FROM lifecycle');
+        else db.prepare('UPDATE lifecycle SET state = ?').run(state);
+      } finally {
+        db.close();
+      }
+    };
+    for (const state of ['cutting-over', 'cutover', 'retired']) {
+      setState(state);
+      assert.equal(cacheOnlyExport(Date.now(), fixture.path).surfaces.length, 1, state);
+    }
+    for (const state of ['undoing', 'rolled-back', 'aborted']) {
+      setState(state);
+      assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, [], state);
+    }
+    setState(null);
+    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, []);
+    const store = openStore(fixture.path);
+    try {
+      beginCutover(store, Date.now());
+      (store as unknown as { db: DatabaseSync }).db.prepare("UPDATE lifecycle SET state = 'retired'").run();
+    } finally {
+      store.close();
+    }
+    assert.equal(cacheOnlyExport(Date.now(), fixture.path).surfaces.length, 1);
+  });
+
+  it('downgrades a legacy empty inventory to incomplete', () => {
+    const fixture = fixtureDb();
+    const db = new DatabaseSync(fixture.path);
+    try {
+      db.exec("DELETE FROM pi_export_inventory_members WHERE provider = 'anthropic'");
+    } finally {
+      db.close();
+    }
+    assert.deepEqual(cacheOnlyExport(Date.now(), fixture.path).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: fixture.poolRecordedAt,
+      complete: false, drift: { added: 0, removed: 2, remapped: 0 }, members: [],
     }]);
   });
 

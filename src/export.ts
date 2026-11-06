@@ -133,7 +133,7 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       : [];
     const legacyTargets = inventory ? [] : targetRows;
     const members = inventory ? inventoryMembers : legacyTargets;
-    const complete = inventory !== undefined && inventory.complete !== 0
+    const complete = inventory !== undefined && inventory.complete !== 0 && inventoryMembers.length > 0
       && inventoryMembers.every((member) => member.slot_account_id !== null);
     const targets = new Map(targetRows.map((target) => [target.target, target.slot_account_id]));
     const observed = new Map(inventoryMembers.map((member) => [member.target, member.slot_account_id]));
@@ -142,7 +142,12 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       removed: [...targets].filter(([target]) => !observed.has(target)).length,
       remapped: [...observed].filter(([target, accountId]) => accountId !== null && targets.has(target) && targets.get(target) !== accountId).length,
     } : { added: 0, removed: 0, remapped: 0 };
-    const surfaces: CacheExportSurface[] = inventory || legacyTargets.length > 0 ? [{
+    const hasLifecycle = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lifecycle'").get());
+    const lifecycle = hasLifecycle
+      ? db.prepare("SELECT state FROM lifecycle WHERE state <> 'closed' ORDER BY id DESC LIMIT 1").get() as { state: string } | undefined
+      : undefined;
+    const servingPool = lifecycle?.state === 'cutting-over' || lifecycle?.state === 'cutover' || lifecycle?.state === 'retired';
+    const surfaces: CacheExportSurface[] = servingPool && (inventory || legacyTargets.length > 0) ? [{
       id: 'anthropic-pi-pool',
       source: inventory ? 'pool-inventory' : 'legacy-target-mapping',
       recordedAt: inventory?.recorded_at ?? Math.max(...legacyTargets.map((target) => target.recorded_at)),

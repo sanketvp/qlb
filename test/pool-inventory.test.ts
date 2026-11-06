@@ -197,6 +197,16 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
       drift: { added: 1, removed: 1, remapped: 0 },
       members: [{ target: 'pool-new', accountId: 'slot-b', readings: [] }],
     }]);
+    const empty = {
+      ...deps,
+      now: () => NOW + 3,
+      loadEntries: () => [],
+    };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext, empty), 0);
+    assert.deepEqual(cacheOnlyExport(NOW + 3, dbPath).surfaces, [{
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: NOW + 3, complete: false,
+      drift: { added: 0, removed: 1, remapped: 0 }, members: [],
+    }]);
   });
 
   it('admits inventory records only in active and retired lifecycle phases', () => {

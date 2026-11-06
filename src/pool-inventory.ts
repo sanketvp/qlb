@@ -154,7 +154,7 @@ export function classify(
   }
   return {
     recordedAt: now,
-    complete: reports.every((entry) => entry.lineageShared),
+    complete: reports.length > 0 && reports.every((entry) => entry.lineageShared),
     entries: reports,
     targets,
     members,
