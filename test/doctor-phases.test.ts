@@ -313,7 +313,7 @@ describe('claude:unpersisted-token doctor check', () => {
     assert.match(row.message, /re-login affected slot/);
   });
 
-  it('claude:unpersisted-token fails on an auto.log unpersisted line for the active slot with no later ok poll', () => {
+  it('claude:unpersisted-token fails on an auto.log unpersisted line with no later lineage', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'active');
     const log = join(dirname(dbPath), 'auto.log');
@@ -361,6 +361,17 @@ describe('claude:unpersisted-token doctor check', () => {
     recordUsage(dbPath, 'active', 'consume-consume-gate-unpersisted', Math.floor(NOW / 1000));
     insertLineage(dbPath, 'active', NOW + 1);
     assert.equal(claudeUnpersistedTokenCheck(dbPath, 'cutover').level, 'PASS');
+  });
+
+  it('claude:unpersisted-token does not recover from another slot lineage', () => {
+    const dbPath = fixture();
+    insertSlot(dbPath, 'lost');
+    insertSlot(dbPath, 'other');
+    insertSwitch(dbPath, 'lost', 'refused', NOW, 0, 'freshen-consume-gate-unpersisted');
+    insertLineage(dbPath, 'other', NOW + 1);
+    const row = claudeUnpersistedTokenCheck(dbPath, 'cutover');
+    assert.equal(row.level, 'FAIL');
+    assert.match(row.message, /lost/);
   });
 
   it('claude:unpersisted-token ignores dead and archived slot evidence', () => {
