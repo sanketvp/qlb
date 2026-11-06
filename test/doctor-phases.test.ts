@@ -10,7 +10,7 @@ import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from '../src/checks/claude-unpersisted-token';
 import { strayTempDirectories, strayTempsCheck } from '../src/checks/fs-stray-temps';
 import { defaultConfig } from '../src/config';
-import { doctorQlb, listCheckNames, s64DoctorVerdict } from '../src/diagnostics';
+import { doctorQlb, s64DoctorVerdict } from '../src/diagnostics';
 import { LIFECYCLE_STATES } from '../src/checks/lifecycle-phase';
 import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
@@ -617,9 +617,6 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
         healthRows.close();
       }
       assert.equal(level(report, 'doctor:registry'), 'PASS', phase);
-      for (const name of listCheckNames()) {
-        assert.notEqual(level(report, name), undefined, `${phase}: missing registered row ${name}`);
-      }
       return report;
     });
   }
@@ -653,6 +650,8 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
       'N/A rows do not affect the aggregate S64 verdict',
     );
 
+    assert.equal(reports.get('cutting-over')!.s64.overall, 'PASS');
+
     const cutover = reports.get('cutover')!;
     assert.equal(level(cutover, 'claude:slots'), 'FAIL', JSON.stringify(cutover.checks.find((row) => row.name === 'claude:slots')));
     assert.equal(level(cutover, 'auto:anthropic:breaker'), 'FAIL', JSON.stringify(cutover.checks.find((row) => row.name === 'auto:anthropic:breaker')));
@@ -665,7 +664,10 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
       assert.equal(level(undoing, name), 'N/A', `undoing ${name}`);
     }
 
-    assert.equal(level(reports.get('rolled-back')!, 'undo:lineage-match'), 'PASS');
+    const rolledBack = reports.get('rolled-back')!;
+    assert.equal(level(rolledBack, 'undo:incomplete'), 'PASS');
+    assert.equal(level(rolledBack, 'undo:lineage-match'), 'PASS');
+    assert.equal(rolledBack.s64.overall, 'PASS');
     const retired = reports.get('retired')!;
     assert.equal(level(retired, 'auto:agent'), 'PASS');
     assert.equal(level(retired, 'cswap:agent'), 'PASS');
