@@ -24,6 +24,15 @@ function anthropic(id: string, reading: BucketReading, extra: Partial<AccountSna
   };
 }
 
+function codex(id: string, reading: BucketReading): AccountSnapshot {
+  return {
+    accountId: id,
+    provider: 'openai-codex',
+    label: id,
+    buckets: { primary: reading, secondary: { ...reading } },
+  };
+}
+
 describe('provider routing authority', () => {
   for (const [name, snapshot] of [
     ['cache/import/rollout source', anthropic('cache', { ...direct(), source: 'poll' })],
@@ -92,6 +101,35 @@ describe('provider routing authority', () => {
       assert.equal(decision.error, 'UNAVAILABLE');
       assert.match(decision.reason, /xai grok-4 pool requires a fresh provider reading/);
     }
+  });
+
+  it('uses a measured fallback without borrowing an unmeasured primary reading', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      fallback: ['gpt-5.4'],
+      snapshots: [
+        anthropic('stale-anthropic', { ...direct(), fetchedAt: Date.now() - 300_001 }),
+        codex('fresh-codex', direct()),
+      ],
+    });
+    assert.equal(decision.ok, true);
+    if (!decision.ok) return;
+    assert.equal(decision.provider, 'openai-codex');
+    assert.equal(decision.accountId, 'fresh-codex');
+    assert.equal(decision.mode, 'fallback');
+  });
+
+  it('rejects an unmeasured fallback after an unmeasured primary', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      fallback: ['gpt-5.4'],
+      snapshots: [
+        anthropic('stale-anthropic', { ...direct(), fetchedAt: Date.now() - 300_001 }),
+        codex('stale-codex', { ...direct(), fetchedAt: Date.now() - 300_001 }),
+      ],
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
   });
 
   it('keeps pins and round-robin inside eligible provider readings', () => {

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -14,15 +13,15 @@ import {
 } from '../src/cswap-native-read';
 
 import {
+  activeCcSecurityArgs,
   canSkipJournal,
   conflictMessage,
+  consumeMarkerPath,
   CONSUME_ERRORS,
   CSWAP_ACTIVE_ID,
   decidePiMode,
-  activeCcSecurityArgs,
   fingerprintAccess,
   parseConsumeStatus,
-  consumeMarkerPath,
   readActiveClaudeAccess,
   readOwnerFileState,
   SECURITY_BIN,

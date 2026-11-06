@@ -401,6 +401,8 @@ $ qlb resolve --model claude-sonnet-5 --json
 
 When no fresh direct provider quota reading is available, resolve instead returns `UNAVAILABLE` and exits `1`; cached, imported, advisory, stale, and failed-probe readings remain visible in status but cannot select an account or establish exhaustion. A direct provider reading is fresh for five minutes, so scheduler jitter, backoff, or an exhausted account's slower polling can produce temporary `UNAVAILABLE` gaps rather than routing on stale quota.
 
+Fallback models are evaluated independently: an unmeasured primary pool may fall through to a fallback only when that fallback has its own fresh direct provider reading. QLB never carries quota evidence between providers; an unmeasured fallback still returns `UNAVAILABLE`.
+
 Flags: `--model <modelId>` (required), `[--fallback m1,m2,...]`, `[--session <id>]`, `[--harness pi|claude-code|codex|dispatch]`, `[--effort <lvl>]`, `[--strategy headroom|spread|round-robin|failover]` (default `headroom`, or `defaultStrategy` from config), `[--json]`. Model → provider mapping is documented in `src/scoring.ts`: `claude*` → anthropic, `gpt-*`/`*sol*`/`*astra*`/`*luna*`/`*terra*` → openai-codex, `*grok*` → xai, `*k3*`/`*kimi*` → kimi-coding, `openrouter/*`, `z-ai/*`, `*glm*` → openrouter.
 
 Strategies:
