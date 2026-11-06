@@ -561,7 +561,8 @@ describe('fs:stray-temps doctor check', () => {
 });
 
 describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
-  type Phase = 'pre-cutover' | 'cutting-over' | 'cutover' | 'undoing' | 'rolled-back' | 'retired';
+  const PHASES = ['pre-cutover', 'cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired'] as const;
+  type Phase = (typeof PHASES)[number];
 
   function level(report: Awaited<ReturnType<typeof doctorQlb>>, name: string): string | undefined {
     return report.checks.find((row) => row.name === name)?.level;
@@ -601,22 +602,28 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
       try {
         const { count } = healthRows.prepare('SELECT COUNT(*) AS count FROM health_log').get() as { count: number };
         assert.equal(count, 1, phase);
+        assert.notEqual(report.healthLogId, undefined, phase);
+        const row = healthRows.prepare('SELECT ts, phase, overall, dead_slots_json AS deadSlotsJson FROM health_log WHERE id = ?')
+          .get(report.healthLogId) as { ts: number; phase: string; overall: string; deadSlotsJson: string } | undefined;
+        assert.notEqual(row, undefined, phase);
+        assert.equal(row.ts, NOW, phase);
+        assert.equal(row.phase, phase, phase);
+        assert.equal(row.overall, report.s64.overall, phase);
+        assert.deepEqual(JSON.parse(row.deadSlotsJson), phase === 'cutover' ? ['dead-slot'] : [], phase);
       } finally {
         healthRows.close();
       }
-      assert.notEqual(report.healthLogId, undefined, phase);
       assert.equal(level(report, 'doctor:registry'), 'PASS', phase);
       for (const name of listCheckNames()) {
         assert.notEqual(level(report, name), undefined, `${phase}: missing registered row ${name}`);
       }
-      for (const row of report.checks) assert.match(row.level, /^(PASS|WARN|FAIL|INFO|N\/A)$/, `${phase}: ${row.name}`);
       return report;
     });
   }
 
   it('covers each phase class with controlled health-log, applicability, and S64 fixtures', async () => {
     const reports = new Map<Phase, Awaited<ReturnType<typeof doctorQlb>>>();
-    for (const phase of ['pre-cutover', 'cutting-over', 'cutover', 'undoing', 'rolled-back', 'retired'] as const) {
+    for (const phase of PHASES) {
       reports.set(phase, await runFixture(phase));
     }
 
@@ -650,13 +657,15 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
 
     const undoing = reports.get('undoing')!;
     assert.equal(level(undoing, 'undo:incomplete'), 'FAIL');
+    assert.equal(undoing.s64.overall, 'FAIL');
     for (const name of ['undo:lineage-match', 'journal:in-progress', 'journal:orphaned', 'claude:slots', 'claude:active']) {
       assert.equal(level(undoing, name), 'N/A', `undoing ${name}`);
     }
 
-    assert.notEqual(level(reports.get('rolled-back')!, 'undo:lineage-match'), 'N/A');
+    assert.equal(level(reports.get('rolled-back')!, 'undo:lineage-match'), 'PASS');
     const retired = reports.get('retired')!;
     assert.equal(level(retired, 'cswap:agent'), 'PASS');
     assert.equal(level(retired, 'cswap:processes'), 'PASS');
+    assert.equal(retired.s64.overall, 'PASS');
   });
 });
