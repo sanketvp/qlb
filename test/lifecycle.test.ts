@@ -291,11 +291,12 @@ describe('lifecycle (AC49)', () => {
       assert.equal(assertAdmitted(store, 'switch:manual').ok, true);
       assert.equal(assertAdmitted(store, 'auto').ok, true);
       assert.equal(assertAdmitted(store, 'pi-migrate').code, 'phase=retired');
+      assert.equal(assertAdmitted(store, 'pi-inventory-record').ok, true);
       assert.ok(PHASE_RULES.retired.has('gate'));
     } finally { store.close(); }
   });
 
-  it('retirement fence refuses only undo-cswap, undo-cswap:resume, pi-rollback, retire-cswap and lifecycle-close', () => {
+  it('retirement fence refuses actions that could change a partial retirement', () => {
     const store = fixtureStore();
     try {
       beginCutover(store);
@@ -304,7 +305,7 @@ describe('lifecycle (AC49)', () => {
       for (const operation of ['gate', 'switch:manual', 'switch:auto', 'auto', 'report-cutover', 'claude-add', 'doctor', 'status', 'retire-cswap:resume'] as const) {
         assert.equal(assertAdmitted(store, operation).ok, true, operation);
       }
-      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap', 'lifecycle-close'] as const) {
+      for (const operation of ['undo-cswap', 'undo-cswap:resume', 'pi-rollback', 'retire-cswap', 'pi-inventory-record', 'lifecycle-close'] as const) {
         assert.equal(assertAdmitted(store, operation).code, RETIREMENT_IN_PROGRESS, operation);
       }
     } finally { store.close(); }
@@ -784,7 +785,7 @@ describe('lifecycle (AC49)', () => {
         drain: () => ({ ok: true }),
       });
       await bootoutStarted;
-      for (const operation of ['import-cswap', 'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'cutover-commit', 'cutover-abort'] as const) {
+      for (const operation of ['import-cswap', 'pi-migrate', 'pi-inventory-record', 'pi-rollback', 'switch:manual', 'gate', 'cutover-commit', 'cutover-abort'] as const) {
         assert.equal(assertAdmitted(store, operation).code, 'cutover-begin-in-progress', operation);
       }
       assert.equal(gateLifecycleAdmissionCode(store.dbPath, store.dbPath), 'cutover-begin-in-progress');
@@ -793,7 +794,7 @@ describe('lifecycle (AC49)', () => {
       assert.equal(assertAdmitted(store, 'doctor').ok, true);
       releaseBootout();
       assert.deepEqual(await begin, { ok: true, state: 'cutting-over' });
-      for (const operation of ['import-cswap', 'pi-migrate', 'pi-rollback', 'switch:manual', 'gate'] as const) {
+      for (const operation of ['import-cswap', 'pi-migrate', 'pi-inventory-record', 'pi-rollback', 'switch:manual', 'gate'] as const) {
         assert.equal(assertAdmitted(store, operation).ok, true, operation);
       }
     } finally { store.close(); }

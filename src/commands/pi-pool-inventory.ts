@@ -42,7 +42,7 @@ export interface PiPoolInventoryCommandDeps {
   loadEntries(path: string): PoolInventoryEntry[];
   loadCswapLineages(sequencePath: string): SourceLineage[];
   loadSlotLineages(store: PoolInventoryCommandStore): SourceLineage[];
-  /** Writing uses pi-migrate's lifecycle admission on the writer transaction. */
+  /** Writing uses the inventory-record lifecycle admission on the writer transaction. */
   admitRecord(db: DatabaseSync): { ok: boolean; code?: string };
   now(): number;
 }
@@ -52,7 +52,7 @@ const defaultDeps: PiPoolInventoryCommandDeps = {
   loadEntries: (path) => readPoolInventoryEntries(path, readFileSync),
   loadCswapLineages: (path) => readCswapInventoryLineages(path, platformKeychain, readFileSync),
   loadSlotLineages: (store) => slotInventoryLineages(store as Pick<Store, 'listAnthropicSlotLineageChains'>),
-  admitRecord: (db) => assertAdmittedInConnection(db, 'pi-migrate'),
+  admitRecord: (db) => assertAdmittedInConnection(db, 'pi-inventory-record'),
   now: Date.now,
 };
 

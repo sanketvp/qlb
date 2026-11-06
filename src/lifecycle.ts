@@ -12,7 +12,7 @@ export type LifecycleOperation =
   | 'gate' | 'switch:manual' | 'switch:auto' | 'auto' | 'auto:dry-run' | 'auto:resume' | 'auto:drill-begin'
   | 'import-cswap' | 'import-cswap:reconcile' | 'import-cswap:reconcile-preview'
   | 'undo-cswap' | 'undo-cswap:resume' | 'undo-cswap:dry-run-record' | 'retire-cswap' | 'retire-cswap:resume'
-  | 'pi-migrate' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
+  | 'pi-migrate' | 'pi-inventory-record' | 'pi-rollback' | 'codex-import-active' | 'codex-add' | 'claude-add'
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
   | 'lifecycle-close' | 'lifecycle-drill-done' | 'claude-journal-resolve'
@@ -74,20 +74,20 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
   'cutting-over': rules(
     'doctor', 'status', 'import-cswap', 'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve',
-    'pi-migrate', 'pi-rollback', 'switch:manual', 'gate', 'auto:dry-run', 'cutover-commit',
+    'pi-migrate', 'pi-inventory-record', 'pi-rollback', 'switch:manual', 'gate', 'auto:dry-run', 'cutover-commit',
     'cutover-abort', 'keychain-authorize-cswap', 'keychain-check-launchd-live',
   ),
   cutover: rules(
     'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'auto:drill-begin', 'gate',
     'import-cswap:reconcile', 'import-cswap:reconcile-preview',
-    'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-rollback',
+    'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-inventory-record', 'pi-rollback',
     'verify-l13', 'report-cutover', 'undo-cswap', 'undo-cswap:dry-run-record', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done',
   ),
   undoing: rules('doctor', 'status', 'undo-cswap:resume', 'pi-rollback'),
   'rolled-back': rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
   retired: rules(
     'doctor', 'status', 'gate', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume',
-    'claude-add', 'codex-add', 'claude-journal-resolve', 'report-cutover', 'retire-cswap:resume', 'lifecycle-close',
+    'claude-add', 'codex-add', 'claude-journal-resolve', 'report-cutover', 'retire-cswap:resume', 'pi-inventory-record', 'lifecycle-close',
   ),
   aborted: rules('doctor', 'status', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
 };
@@ -164,7 +164,7 @@ function assertAdmittedForPhase(current: LifecycleRow, operation: LifecycleOpera
   // retirement; normal service and its reporting remain available.
   if (current.note === RETIREMENT_IN_PROGRESS && (
     operation === 'undo-cswap' || operation === 'undo-cswap:resume' || operation === 'pi-rollback' || operation === 'retire-cswap'
-    || operation === 'lifecycle-close'
+    || operation === 'pi-inventory-record' || operation === 'lifecycle-close'
   )) {
     return { ok: false, code: RETIREMENT_IN_PROGRESS, row: current };
   }

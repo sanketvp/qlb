@@ -199,6 +199,77 @@ describe('anthropic-pool inventory (P11, AC52)', () => {
     }]);
   });
 
+  it('admits inventory records only in active and retired lifecycle phases', () => {
+    const phases = [
+      ['pre-cutover', 3], ['cutting-over', 0], ['cutover', 0], ['retired', 0],
+      ['undoing', 3], ['rolled-back', 3], ['aborted', 3],
+    ] as const;
+    for (const [state, expected] of phases) {
+      const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-phase-'));
+      const dbPath = join(dir, 'qlb.db');
+      const poolPath = join(dir, 'anthropic-pool.json');
+      const refresh = 'phase-refresh';
+      const fingerprint = `sha256:${createHash('sha256').update(refresh).digest('hex')}`;
+      writeFileSync(poolPath, JSON.stringify({ accounts: [{
+        id: 'pool-a', credentials: { access: 'phase-access', refresh, expires: NOW + 1 },
+      }] }));
+      const setup = openStore(dbPath);
+      try {
+        if (state !== 'pre-cutover') {
+          beginCutover(setup, NOW);
+          (setup as unknown as { db: DatabaseSync }).db.prepare('UPDATE lifecycle SET state = ?').run(state);
+        }
+        (setup as unknown as { db: DatabaseSync }).db.prepare(
+          "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+        ).run('slot-a', fingerprint, NOW);
+      } finally {
+        setup.close();
+      }
+      const commandContext = context([]);
+      commandContext.config = { ...commandContext.config, dbPath, anthropicPoolPath: poolPath };
+      const code = runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext);
+      assert.equal(code, expected, state);
+    }
+  });
+
+  it('refreshes a retired inventory after a classified membership change', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-retired-'));
+    const dbPath = join(dir, 'qlb.db');
+    const poolPath = join(dir, 'anthropic-pool.json');
+    const refreshA = 'retired-refresh-a';
+    const refreshB = 'retired-refresh-b';
+    const fingerprintA = `sha256:${createHash('sha256').update(refreshA).digest('hex')}`;
+    const fingerprintB = `sha256:${createHash('sha256').update(refreshB).digest('hex')}`;
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-a', credentials: { access: 'retired-access-a', refresh: refreshA, expires: NOW + 1 },
+    }] }));
+    const setup = openStore(dbPath);
+    try {
+      beginCutover(setup, NOW);
+      (setup as unknown as { db: DatabaseSync }).db.prepare("UPDATE lifecycle SET state = 'retired'").run();
+      const insert = (setup as unknown as { db: DatabaseSync }).db.prepare(
+        "INSERT INTO claude_slots (account_id, config_json, fingerprint, dead, added_at) VALUES (?, '{}', ?, 0, ?)",
+      );
+      insert.run('slot-a', fingerprintA, NOW);
+      insert.run('slot-b', fingerprintB, NOW);
+    } finally {
+      setup.close();
+    }
+    const commandContext = context([]);
+    commandContext.config = { ...commandContext.config, dbPath, anthropicPoolPath: poolPath };
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext), 0);
+    writeFileSync(poolPath, JSON.stringify({ accounts: [{
+      id: 'pool-b', credentials: { access: 'retired-access-b', refresh: refreshB, expires: NOW + 2 },
+    }] }));
+    assert.equal(runPiPoolInventoryCommand(['--against', 'slots', '--record'], commandContext), 0);
+    const surface = cacheOnlyExport(Date.now(), dbPath).surfaces[0];
+    assert.deepEqual({ ...surface, recordedAt: 0 }, {
+      id: 'anthropic-pi-pool', source: 'pool-inventory', recordedAt: 0, complete: true,
+      drift: { added: 1, removed: 1, remapped: 0 },
+      members: [{ target: 'pool-b', accountId: 'slot-b', readings: [] }],
+    });
+  });
+
   it('allows a later mapping after a zero-match inventory record', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-pool-zero-match-'));
     const dbPath = join(dir, 'qlb.db');

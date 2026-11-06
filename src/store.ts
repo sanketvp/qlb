@@ -3301,9 +3301,8 @@ export class Store {
       const classified = classifyInTransaction();
       const admission = admit(this.db);
       if (!admission.ok) return { ok: false, code: admission.code };
-      const existing = this.db.prepare(`SELECT target, slot_account_id FROM pi_export_targets WHERE provider = ?`)
-        .all(provider) as Array<{ target: string; slot_account_id: string }>;
-      if (existing.length === 0 && classified.targets.length > 0) {
+      const hasExisting = Boolean(this.db.prepare('SELECT 1 FROM pi_export_targets WHERE provider = ? LIMIT 1').get(provider));
+      if (!hasExisting && classified.targets.length > 0) {
         const insert = this.db.prepare(`INSERT INTO pi_export_targets
           (provider, target, slot_account_id, lineage_fp, recorded_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?)`);
         for (const target of classified.targets) {
