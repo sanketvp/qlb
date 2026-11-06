@@ -51,6 +51,36 @@ function codex(accountId: string): AccountSnapshot {
 }
 
 describe('qlb resolve — store-backed end-to-end', () => {
+  it('ignores an authoritative bucket superseded by a newer provider observation', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d:Opus', { ...reading(100), fetchedAt: now - 600_000 });
+    const decision = resolveFromSnapshots({
+      model: 'claude-opus-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, true);
+    if (decision.ok) assert.equal(decision.accountId, 'account');
+    store.close();
+  });
+
+  it('retains an older non-provider bucket as unavailable evidence', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d:Opus', { ...reading(10), source: 'poll', fetchedAt: now - 600_000 });
+    const decision = resolveFromSnapshots({
+      model: 'claude-opus-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
+    store.close();
+  });
+
   it('excludes inactive accounts from store-backed pool measurement', () => {
     const store = openStore(':memory:');
     seed(store, 'active', { '5h': reading(100), '7d': reading(100) });
