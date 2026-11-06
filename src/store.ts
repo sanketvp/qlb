@@ -1615,6 +1615,14 @@ export class Store {
     return rows as unknown as AccountRow[];
   }
 
+  isAnthropicSlotLive(accountId: string): boolean | null {
+    const row = this.db.prepare('SELECT dead, archived_at FROM claude_slots WHERE account_id = ?').get(accountId) as
+      | { dead: number; archived_at: number | null }
+      | undefined;
+    if (!row) return null;
+    return row.dead === 0 && row.archived_at === null;
+  }
+
   /** Current provider-owned login, if an adoption or switch has recorded one. */
   getActiveLogin(provider: string): { provider: string; accountId: string | null; since: number; setBy: string } | null {
     const row = this.db.prepare('SELECT provider, account_id, since, set_by FROM active_login WHERE provider = ?').get(provider) as

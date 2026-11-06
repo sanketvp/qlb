@@ -72,6 +72,7 @@ describe('custom provider plugins', () => {
     assert.ok(adapter);
     const snapshots = await adapter.fetchSnapshots();
     assert.equal(snapshots[0]?.buckets['5h']?.source, 'plugin');
+    assert.equal(snapshots[0]?.buckets['5h']?.confidence, 'authoritative');
     const decision = resolveFromSnapshots({ model: 'claude-sonnet-5', snapshots });
     assert.equal(decision.ok, false);
     if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');

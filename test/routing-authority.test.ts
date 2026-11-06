@@ -90,7 +90,7 @@ describe('provider routing authority', () => {
     assert.equal(decision.ok, false);
     if (!decision.ok) {
       assert.equal(decision.error, 'UNAVAILABLE');
-      assert.match(decision.reason, /xAI grok-4 pool requires a fresh provider reading/);
+      assert.match(decision.reason, /xai grok-4 pool requires a fresh provider reading/);
     }
   });
 

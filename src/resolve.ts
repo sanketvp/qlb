@@ -119,7 +119,9 @@ function findEarliestResetForModels(candidates: Array<{ snapshot: AccountSnapsho
 }
 
 export function snapshotsFromStore(store: Store, provider?: string): AccountSnapshot[] {
-  const accounts = store.listAccounts(provider).filter((row) => row.status === 'active' || row.status === 'validated');
+  const accounts = store.listAccounts(provider).filter((row) =>
+    (row.status === 'active' || row.status === 'validated')
+    && (row.provider !== 'anthropic' || store.isAnthropicSlotLive(row.id) !== false));
   return accounts.map((row) => ({
     accountId: row.id,
     provider: row.provider as AccountSnapshot['provider'],

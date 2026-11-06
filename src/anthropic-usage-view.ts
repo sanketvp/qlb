@@ -166,7 +166,7 @@ function hasPollsForLiveSlots(
   slots: readonly AnthropicUsageSlot[],
   polls: Record<string, AnthropicUsagePollRow>,
 ): boolean {
-  return slots.some((slot) => slot.archivedAt == null && polls[slot.accountId] !== undefined);
+  return slots.some((slot) => slot.archivedAt == null && !slot.dead && polls[slot.accountId] !== undefined);
 }
 
 /** Read-only status projection of QLB-owned slots and stored poll results. */
@@ -221,7 +221,7 @@ export function hasFreshAnthropicUsagePoll(
   nowS: number,
 ): boolean {
   const polls = store.listUsagePolls('anthropic');
-  return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
+  return slots.filter((slot) => slot.archivedAt == null && !slot.dead).some((slot) => {
     const row = polls[slot.accountId];
     return row !== undefined
       && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;

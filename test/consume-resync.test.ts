@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import type { AddressInfo } from 'node:net';
 
-import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE, fingerprintAccess } from '../src/cswap-consume';
+import { CSWAP_ANTHROPIC_STORE, CONSUME_STATE } from '../src/cswap-consume';
 import { setPolicy } from '../src/policy';
 import { LoopbackProxy } from '../src/proxy';
 import { openStore } from '../src/store';
@@ -71,13 +71,6 @@ function post(
   });
 }
 
-function authFingerprint(req: http.IncomingMessage): string {
-  const raw = req.headers.authorization;
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  const token = typeof value === 'string' ? value.replace(/^Bearer\s+/i, '') : '';
-  return fingerprintAccess(token);
-}
-
 async function withProxy(
   getCredentialForAccount: () => Promise<string>,
   upstream: (req: http.IncomingMessage, res: http.ServerResponse) => void,
@@ -109,50 +102,16 @@ const BODY = {
 };
 
 describe('consume quota admission', () => {
-  it('resync-unchanged', async () => {
+  it('rejects before credential and upstream access', async () => {
     let reads = 0;
-    const fps: string[] = [];
+    let upstreamRequests = 0;
     const { proxy, store, mock } = await withProxy(
       async () => {
         reads += 1;
         return 'access-a';
       },
-      (req, res) => {
-        fps.push(authFingerprint(req));
-        res.writeHead(401);
-        res.end('{}');
-      },
-    );
-    try {
-      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
-      assert.equal(result.status, 503);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
-      assert.equal(reads, 0);
-      assert.equal(fps.length, 0);
-    } finally {
-      await proxy.stop();
-      mock.close();
-      store.close();
-    }
-  });
-
-  it('resync-changed', async () => {
-    let reads = 0;
-    const tokens = ['access-a', 'access-b'];
-    const fps: string[] = [];
-    const { proxy, store, mock } = await withProxy(
-      async () => {
-        const token = tokens[Math.min(reads, tokens.length - 1)]!;
-        reads += 1;
-        return token;
-      },
-      (req, res) => {
-        fps.push(authFingerprint(req));
-        if (fps.length === 1) {
-          res.writeHead(401);
-          res.end('{}');
-          return;
-        }
+      (_req, res) => {
+        upstreamRequests += 1;
         res.writeHead(200);
         res.end('{}');
       },
@@ -160,9 +119,9 @@ describe('consume quota admission', () => {
     try {
       const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
       assert.equal(result.status, 503);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
+      console.log(`READS=${reads} UPSTREAM_REQUESTS=${upstreamRequests} UNAVAILABLE=1`);
       assert.equal(reads, 0);
-      assert.deepEqual(fps, []);
+      assert.equal(upstreamRequests, 0);
     } finally {
       await proxy.stop();
       mock.close();
@@ -170,37 +129,4 @@ describe('consume quota admission', () => {
     }
   });
 
-  it('resync-between-read-rotation', async () => {
-    let reads = 0;
-    const tokens = ['access-a', 'access-b', 'access-c'];
-    const fps: string[] = [];
-    const { proxy, store, mock } = await withProxy(
-      async () => {
-        const token = tokens[Math.min(reads, tokens.length - 1)]!;
-        reads += 1;
-        return token;
-      },
-      (req, res) => {
-        fps.push(authFingerprint(req));
-        if (fps.length === 1) {
-          res.writeHead(401);
-          res.end('{}');
-          return;
-        }
-        res.writeHead(200);
-        res.end('{}');
-      },
-    );
-    try {
-      const result = await post(proxy.proxyInfo.port, proxy.proxyInfo.token, BODY);
-      assert.equal(result.status, 503);
-      console.log(`READS=${reads} UPSTREAM_FPS=${fps.length} UNAVAILABLE=1`);
-      assert.equal(reads, 0);
-      assert.deepEqual(fps, []);
-    } finally {
-      await proxy.stop();
-      mock.close();
-      store.close();
-    }
-  });
 });

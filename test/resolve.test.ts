@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import type { AccountSnapshot, BucketReading, Confidence } from '../src/types';
 import { openStore } from '../src/store';
@@ -53,6 +57,26 @@ describe('qlb resolve — store-backed end-to-end', () => {
     store.upsertAccount('handed-back', 'anthropic', 'handed-back', 'handed-back');
     store.upsertSnapshot('handed-back', '5h', { ...reading(10), source: 'poll' });
     store.upsertSnapshot('handed-back', '7d', { ...reading(10), source: 'poll' });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('excludes dead Anthropic slots from store-backed pool measurement', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-resolve-dead-')), 'qlb.db');
+    const initial = openStore(dbPath);
+    seed(initial, 'live', { '5h': reading(100), '7d': reading(100) });
+    seed(initial, 'dead', { '5h': { ...reading(10), source: 'poll' }, '7d': { ...reading(10), source: 'poll' } });
+    initial.close();
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES ('dead', '{}', 1, 1)").run();
+    db.close();
+    const store = openStore(dbPath);
     const decision = resolveFromSnapshots({
       model: 'claude-sonnet-5',
       snapshots: snapshotsFromStore(store, 'anthropic'),
