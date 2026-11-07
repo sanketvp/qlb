@@ -45,8 +45,7 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
 }
 
 function journalIdentityValid(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal): boolean {
-  try { return validateClaudeSwitchJournalIdentity(journal, deps.slots.listSlots()); }
-  catch { return false; }
+  return validateClaudeSwitchJournalIdentity(journal, deps.slots.listSlots());
 }
 
 export type ClaudeJournalResolveDirection = 'forward' | 'back';

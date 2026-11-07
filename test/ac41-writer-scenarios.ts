@@ -315,13 +315,19 @@ async function runDoctorRow(
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-/** Row 4: an orphaned Claude switch journal whose `from` and `to` account fields carry the AC41 body. */
+/** Row 4: an orphaned Claude switch journal whose attempt id carries the AC41 body. */
 export function runDoctorSwitchJournal(): Promise<DoctorArtifacts> {
-  return runDoctorRow('claude:switch-journal', 'cutover', (_dir, _dbPath, cliEnv) => {
+  return runDoctorRow('claude:switch-journal', 'cutover', (_dir, dbPath, cliEnv) => {
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    try {
+      for (const accountId of ['ac41-from-slot', 'ac41-to-slot']) {
+        repository.createSlot({ accountId, fingerprint: null, prevFingerprint: null, addedAt: 1 });
+      }
+    } finally { repository.close(); }
     const paths = claudePaths({ env: cliEnv });
     const options = { env: cliEnv, configPath: paths.globalConfigPath, keychainService: paths.keychainService };
     createClaudeSwitchJournal({
-      v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: AC41_BODY, to: AC41_BODY, trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
+      v: 1, provider: 'anthropic', attemptId: AC41_BODY, from: 'ac41-from-slot', to: 'ac41-to-slot', trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
       decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: null, bindingJson: null, step: 7,
       stagedBlobService: 'qlb:anthropic:staged-rollback:ac41', stagedAccount: 'qlb', stagedWritten: false,
       keychainService: options.keychainService, configPath: options.configPath, configText: null, configWrittenHash: null, fromOauthAccount: null,

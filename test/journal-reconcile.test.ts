@@ -270,7 +270,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     }
   });
 
-  it('allows archived slots and the parked autoswitch compatibility trigger in recovery journals', async () => {
+  it('allows archived slots and the current parked autoswitch trigger in recovery journals', async () => {
     const subject = await fixture();
     await install(subject, journal(subject, { trigger: 'parked' }));
     const listSlots = subject.slots.listSlots.bind(subject.slots);
@@ -280,6 +280,21 @@ describe('Claude switch journal reconciliation (G10)', () => {
 
     assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
     assert.deepEqual(subject.rows.map((row) => [row.fromAccount, row.toAccount, row.trigger]), [['a', 'b', 'parked']]);
+  });
+
+  it('propagates slot inventory failures rather than treating them as invalid journals', async () => {
+    for (const recover of [
+      (subject: Subject) => resolveClaudeSwitchJournal(subject.deps, 'back'),
+      (subject: Subject) => reconcileClaudeSwitch(subject.deps),
+    ]) {
+      const subject = await fixture();
+      await install(subject);
+      subject.slots.listSlots = () => { throw new Error('slot inventory unavailable'); };
+
+      await assert.rejects(recover(subject), /slot inventory unavailable/);
+      assert.deepEqual(subject.rows, []);
+      assert.deepEqual(subject.commits, []);
+    }
   });
 
   it('doctor reports an invalid journal without exposing its identity fields', async () => {

@@ -19,7 +19,7 @@ const JOURNAL_TRIGGER_ALLOWLIST = new Set([
   'at-limit',
   'failover',
   'consume-first',
-  // Kept for journals written when autoswitch parked a switch decision.
+  // Current autoswitch trigger when it parks a switch decision.
   'parked',
 ]);
 const journalOwnerHandle = Symbol('claude-switch-journal-owner');
