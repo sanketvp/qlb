@@ -5,7 +5,7 @@ QLB ships with five built-in provider adapters (`src/adapters/`). Each one is re
 - **Polled** — the provider exposes a usage endpoint, so QLB can refresh a reading through an authorized probe (coalesced through the single-flight claim; see [ARCHITECTURE.md](ARCHITECTURE.md)).
 - **Header-observed** — the provider only reports usage on real requests, so readings come from response headers of traffic that actually went through QLB's proxy/transport.
 
-Routing accepts a bucket only when it is an `authoritative`, direct provider reading (`provider-poll` or `provider-headers`) no more than five minutes old. Cached, imported, plugin, advisory, unknown, or stale readings remain available for display and cross-checking, but cannot select an account or establish exhaustion. A failed provider probe also makes its account unavailable until a later direct provider reading succeeds.
+The [routing-admission rule](ARCHITECTURE.md#confidence-levels) governs which readings can select an account. Cached, imported, plugin, advisory, unknown, or stale readings remain available for display and cross-checking.
 
 An adapter must never throw: failures become an error snapshot on the account (visible in `qlb status`), so one unavailable provider never breaks the overall status command.
 

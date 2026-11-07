@@ -20,7 +20,7 @@ interface AccountSnapshot {
 }
 ```
 
-`fetchSnapshots()` must be read-only and should return error snapshots rather than throw. QLB also wraps plugin calls so an accidental throw cannot crash `qlb status`. Plugin readings are retained for display and cross-checking, but QLB marks their source as `plugin`, so they cannot establish routing capacity or select an account.
+`fetchSnapshots()` must be read-only and should return error snapshots rather than throw. QLB also wraps plugin calls so an accidental throw cannot crash `qlb status`. Plugin readings are retained for display and cross-checking and are marked `plugin`; see the [routing-admission rule](ARCHITECTURE.md#confidence-levels).
 
 ## Minimal Mistral example
 
