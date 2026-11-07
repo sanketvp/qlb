@@ -10,7 +10,7 @@ import { explainWhy } from '../src/why';
 function reading(usedPct: number): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence: 'authoritative',
     fetchedAt: Date.now(),
   };
@@ -328,7 +328,7 @@ describe('collectCandidates', () => {
     });
     assert.equal(decision.ok, false);
     if (decision.ok) return;
-    assert.equal(decision.error, 'EXHAUSTED');
+    assert.equal(decision.error, 'UNAVAILABLE');
     store.close();
   });
 
@@ -353,7 +353,7 @@ describe('collectCandidates', () => {
     });
     assert.equal(livePick.ok, true);
     if (!livePick.ok) return;
-    assert.equal(livePick.accountId, 'A');
+    assert.equal(livePick.accountId, 'B', 'cached-after-failure must be non-actionable');
     const recalled = await collectCandidates({
       adapters,
       store,
@@ -367,15 +367,15 @@ describe('collectCandidates', () => {
     });
     assert.equal(whyPick.ok, true);
     if (!whyPick.ok) return;
-    assert.equal(whyPick.accountId, livePick.accountId);
+    assert.equal(whyPick.accountId, 'B');
     store.close();
   }
 
-  it('cached-after-failure recorded via resolve is recalled as the same winner', async () => {
+  it('cached-after-failure recorded via resolve is excluded from recalled routing', async () => {
     await cafRecall('resolve');
   });
 
-  it('cached-after-failure recorded via status is recalled as the same winner', async () => {
+  it('cached-after-failure recorded via status is excluded from recalled routing', async () => {
     await cafRecall('status');
   });
 });

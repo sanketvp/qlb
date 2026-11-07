@@ -208,6 +208,15 @@ describe('Codex S29 ids end to end', () => {
         setStoreForTests(null);
       }
 
+      const now = Date.now();
+      for (const bucket of ['primary', 'secondary'] as const) {
+        f.store.upsertSnapshot(SLOT_ID, bucket, {
+          usedPct: 10,
+          source: 'provider-poll',
+          confidence: 'authoritative',
+          fetchedAt: now,
+        });
+      }
       setPolicy(f.store, { harness: 'codex', virtualModel: MODEL, realModel: 'gpt-5.4', effort: 'high' });
       let receivedHeader: string | string[] | undefined;
       const upstream = await listenMock((request, response) => {

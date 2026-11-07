@@ -817,7 +817,7 @@ describe('qlb refresh observation recording', () => {
     }
   });
 
-  it('partial refresh keeps the healthy account selectable and labels the failed one', async () => {
+  it('partial refresh leaves accounts unavailable without provider-authoritative readings', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-partial-'));
     const pluginsDir = join(root, 'plugins');
     mkdirSync(pluginsDir);
@@ -865,7 +865,7 @@ describe('qlb refresh observation recording', () => {
         observations: recalled.observations,
         store,
       });
-      assert.equal(why.accountId, 'healthy');
+      assert.equal(why.accountId, null);
       const sick = why.losers.find((l) => l.accountId === 'sick');
       assert.ok(sick);
       assert.equal(sick!.reason, 'unavailable');
