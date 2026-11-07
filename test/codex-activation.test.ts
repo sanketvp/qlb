@@ -162,8 +162,8 @@ describe('Codex S29 activation', () => {
         }),
       });
 
-      const [snapshot] = await adapter.fetchSnapshots();
-      assert.deepEqual(snapshot?.buckets, {
+      const [fetchedSnapshot] = await adapter.fetchSnapshots();
+      assert.deepEqual(fetchedSnapshot?.buckets, {
         primary: { usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
         secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
       });
