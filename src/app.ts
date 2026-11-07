@@ -1454,18 +1454,12 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
       return;
     }
     if (decision.error === 'UNAVAILABLE') {
-      console.log(
-        JSON.stringify(
-          {
-            error: 'UNAVAILABLE',
-            requestedModel: decision.requestedModel,
-            reason: decision.reason,
-            decisionId: decision.decisionId,
-          },
-          null,
-          2,
-        ),
-      );
+      console.log(JSON.stringify({
+        error: 'UNAVAILABLE',
+        requestedModel: decision.requestedModel,
+        reason: decision.reason,
+        decisionId: decision.decisionId,
+      }, null, 2));
       return;
     }
     console.log(
