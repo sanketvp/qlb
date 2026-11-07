@@ -73,14 +73,14 @@ export function readCodexUsageDiagnostic(now = Date.now(), dbPath = config.dbPat
   }
 }
 
-export function runCodexUsageDiagnostic(args: string[], write = console.log, error = console.error): number {
+export function runCodexUsageDiagnostic(args: string[], write = console.log, error = console.error, dbPath = config.dbPath): number {
   const json = args.length === 1 && args[0] === '--json';
   if (!(args.length === 0 || json)) {
     error('usage: qlb codex usage-diagnostic [--json]');
     return 1;
   }
   try {
-    const result = readCodexUsageDiagnostic();
+    const result = readCodexUsageDiagnostic(Date.now(), dbPath);
     if (json) write(JSON.stringify(result));
     else if (!result.recorded) write('codex usage diagnostic: no recorded scoped-refresh diagnostic');
     else write(`codex usage diagnostic: attemptedAt=${result.attemptedAt} dispatch=${result.networkDispatchAttempted} classification=${result.classification} entitlement=${result.entitlementEvidence} http=${result.httpStatus ?? 'none'} endpoint=${result.endpoint} fallback=${result.fallbackAttempted} parser=${result.parserShape} backoff=${result.backoffUntil ?? 'none'} authoritative=${result.authoritativeWindowObserved} stale=${result.stale}`);

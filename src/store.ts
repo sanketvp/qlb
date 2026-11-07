@@ -16,7 +16,7 @@ import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 import type { CodexWatch } from './codex-switch';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
-import { assertCodexUsageDiagnosticAttempt, isCodexUsageDiagnosticAttempt, type CodexUsageDiagnosticAttempt } from './codex-usage-diagnostic-shared';
+import { assertCodexUsageDiagnosticAttempt, type CodexUsageDiagnosticAttempt } from './codex-usage-diagnostic-shared';
 export { SCHEMA_VERSION };
 
 export const DEFAULT_DB_PATH = config.dbPath;
@@ -49,7 +49,6 @@ export interface UsagePollRow {
   backoffUntil: number | null;
   last429At: number | null;
   heldUntil: number | null;
-  codexDiagnostic?: CodexUsageDiagnosticAttempt;
 }
 
 export interface AnthropicAutoswitchBreakerRow {
@@ -1859,22 +1858,12 @@ export class Store {
 
   listUsagePolls(provider: string): Record<string, UsagePollRow> {
     const rows = this.db.prepare(`SELECT account_id, last_fetch_at, last_attempt_at, next_due_at,
-      poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until,
-      codex_diag_class, codex_diag_http_status, codex_diag_endpoint, codex_diag_fallback_attempted,
-      codex_diag_parser_shape, codex_diag_entitlement_evidence
+      poll_interval_s, last_status, consecutive_failures, backoff_until, last_429_at, held_until
       FROM usage_polls WHERE provider = ?`).all(provider) as Array<Record<string, unknown>>;
     const out: Record<string, UsagePollRow> = {};
     for (const row of rows) {
       const value = (key: string): number | null => typeof row[key] === 'number' ? row[key] : null;
       const accountId = String(row.account_id);
-      const diagnostic = {
-        classification: row.codex_diag_class,
-        httpStatus: value('codex_diag_http_status'),
-        endpoint: row.codex_diag_endpoint,
-        fallbackAttempted: row.codex_diag_fallback_attempted === 1,
-        parserShape: row.codex_diag_parser_shape,
-        entitlementEvidence: row.codex_diag_entitlement_evidence,
-      };
       out[accountId] = {
         accountId,
         lastFetchAt: value('last_fetch_at'), lastAttemptAt: value('last_attempt_at'),
@@ -1882,7 +1871,6 @@ export class Store {
         lastStatus: typeof row.last_status === 'string' ? row.last_status : null,
         consecutiveFailures: typeof row.consecutive_failures === 'number' ? row.consecutive_failures : 0,
         backoffUntil: value('backoff_until'), last429At: value('last_429_at'), heldUntil: value('held_until'),
-        ...(isCodexUsageDiagnosticAttempt(diagnostic) ? { codexDiagnostic: diagnostic } : {}),
       };
     }
     return out;
@@ -1939,6 +1927,10 @@ export class Store {
           result.codexDiagnostic.endpoint, result.codexDiagnostic.fallbackAttempted ? 1 : 0,
           result.codexDiagnostic.parserShape, result.codexDiagnostic.entitlementEvidence, provider, accountId,
         );
+      } else if (provider === 'openai-codex') {
+        this.db.prepare(`UPDATE usage_polls SET codex_diag_class = NULL, codex_diag_http_status = NULL,
+          codex_diag_endpoint = NULL, codex_diag_fallback_attempted = NULL, codex_diag_parser_shape = NULL,
+          codex_diag_entitlement_evidence = NULL WHERE provider = ? AND account_id = ?`).run(provider, accountId);
       }
     });
   }
