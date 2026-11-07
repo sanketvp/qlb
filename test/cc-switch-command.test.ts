@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential, credentialWithFixtureAccess } from './support/claude-fixtures';
+
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
@@ -123,10 +125,9 @@ describe('qlb switch anthropic command (K5-6)', () => {
     const repository = SqliteClaudeSlotRepository.open(run.ctx.config.dbPath);
     const backend = new MockKeychain();
     const slots = new ClaudeSlots({ backend, repository, stashDir: join(HOME, 'unclaimed'), now: () => 1 });
-    const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt: 3_600_001 } });
-    await slots.createSlot({ accountId: 'account-a', credential: credential('a'), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
-    await slots.createSlot({ accountId: 'account-b', credential: credential('b'), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
-    await backend.set(paths.keychainService, 'fixture-user', credential('a'));
+    await slots.createSlot({ accountId: 'account-a', credential: credential('a', { expiresAt: 3_600_001 }), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
+    await slots.createSlot({ accountId: 'account-b', credential: credential('b', { expiresAt: 3_600_001 }), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+    await backend.set(paths.keychainService, 'fixture-user', credential('a', { expiresAt: 3_600_001 }));
     store.setActiveLogin('anthropic', 'account-a', 'manual', 1);
     for (const key of ['auto.anthropic.leftHeadroom', 'auto.anthropic.leftRecoveryAt', 'auto.anthropic.leftTrigger']) store.setConfig(key, 'stale');
     const command = subject({
@@ -189,11 +190,10 @@ describe('qlb switch anthropic command (K5-6)', () => {
     const repository = SqliteClaudeSlotRepository.open(run.ctx.config.dbPath);
     const backend = new MockKeychain();
     const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => 1 });
-    const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: 3_600_001 } });
     try {
-      await slots.createSlot({ accountId: 'account-a', credential: credential('a'), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
-      await slots.createSlot({ accountId: 'account-b', credential: credential('b'), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
-      await backend.set(paths.keychainService, 'fixture-user', credential('a'));
+      await slots.createSlot({ accountId: 'account-a', credential: credentialWithFixtureAccess('a', 'fixture-refresh-a', 3_600_001), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
+      await slots.createSlot({ accountId: 'account-b', credential: credentialWithFixtureAccess('b', 'fixture-refresh-b', 3_600_001), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+      await backend.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('a', 'fixture-refresh-a', 3_600_001));
       store.setActiveLogin('anthropic', 'account-a', 'manual', 1);
     } finally {
       store.close();

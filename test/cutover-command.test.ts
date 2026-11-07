@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
+import { credentialWithRefresh } from './support/claude-fixtures';
 import { defaultConfig } from '../src/config';
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { createCutoverCommand } from '../src/commands/cutover';
@@ -61,10 +62,6 @@ class TestKeychain {
   async set(service: string, account: string, value: string): Promise<void> {
     this.values.set(`${service}\0${account}`, value);
   }
-}
-
-function credential(account: string, refresh: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
 }
 
 function prepareDeferredCommit(dbPath: string): void {
@@ -256,7 +253,7 @@ test('abort after import hands back and ends aborted', async () => {
   const f = fixture();
   try {
     const keychain = new TestKeychain();
-    const active = credential('account-a', 'refresh-current');
+    const active = credentialWithRefresh('account-a', 'refresh-current');
     await keychain.set('qlb:anthropic:account-a', 'qlb', active);
     const store = openStore(f.dbPath);
     try {

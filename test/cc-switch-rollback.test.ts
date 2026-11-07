@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential as claudeCredential } from './support/claude-fixtures';
+
 import { claudePaths } from '../src/cc-paths';
 import { atomicWriteText } from '../src/fsutil';
 import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-locks';
@@ -20,7 +22,7 @@ import {
 
 const NOW = 1_000_000;
 const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
-const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 3_600_000 } });
+const credential = (tag: string) => claudeCredential(tag, { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 3_600_000 });
 
 async function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'qlb-rollback-'));

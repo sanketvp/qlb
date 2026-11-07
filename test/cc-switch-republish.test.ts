@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential as claudeCredential } from './support/claude-fixtures';
+
 import { runKeychainCommand, type LiveSwitchReceipt } from '../src/commands/keychain';
 import { createSwitchAnthropicCommand } from '../src/commands/switch-anthropic';
 import { defaultConfig } from '../src/config';
@@ -18,8 +20,7 @@ import { switchClaude, type ClaudeSwitchDeps, type SwitchClaudeInput } from '../
 import { claudeSwitchJournalDir } from '../src/cc-switch-journal';
 
 const NOW = 1_000_000;
-const credential = (tag: string, expiresAt = NOW + 3_600_000) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt } });
-
+const credential = (tag: string, expiresAt = NOW + 3_600_000) => claudeCredential(tag, { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt });
 type Subject = Awaited<ReturnType<typeof fixture>>;
 
 async function fixture(): Promise<{

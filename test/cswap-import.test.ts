@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credentialWithRefresh } from './support/claude-fixtures';
+
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { withClaudeConfigPathLock, withClaudeCredentialLocks } from '../src/cc-locks';
@@ -20,17 +22,15 @@ import {
   reconcileCswapImportJournals, recoverUncommittedCswapImport,
 } from '../src/cswap-import';
 
-function credential(id: string, refresh: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${id}`, refreshToken: refresh, expiresAt: 1_800_000_000_000, scopes: ['user:inference'], subscriptionType: 'max' } });
-}
+const cswapImportCredential = (tag: string, refreshToken: string) => credentialWithRefresh(tag, refreshToken, { extra: { scopes: ['user:inference'], subscriptionType: 'max' } });
 
 function fixture(): { root: string; backup: string; keychain: MockKeychain; repo: InMemoryClaudeSlotRepository } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-cswap-import-'));
   const backup = join(root, '.claude-swap-backup');
   mkdirSync(join(backup, 'configs'), { recursive: true });
   mkdirSync(join(backup, 'credentials'), { recursive: true });
-  const first = credential('account-a', 'refresh-a');
-  const second = credential('account-b', 'refresh-b');
+  const first = cswapImportCredential('account-a', 'refresh-a');
+  const second = cswapImportCredential('account-b', 'refresh-b');
   writeFileSync(join(backup, 'sequence.json'), JSON.stringify({
     activeAccountNumber: 1,
     sequence: [1, 2],
@@ -82,8 +82,8 @@ describe('C-swap import (K10 / AC16)', () => {
   it('purges only staged services named by a valid staged journal and records an inert terminal journal', async () => {
     const h = fixture();
     const { journalDir, staging } = stagedJournal(h.root, 'staged-purge');
-    await h.keychain.set(staging, QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'fixture-refresh'));
-    await h.keychain.set('qlb:anthropic:unrelated', QLB_KEYCHAIN_ACCOUNT, credential('unrelated', 'unrelated-refresh'));
+    await h.keychain.set(staging, QLB_KEYCHAIN_ACCOUNT, cswapImportCredential('account-a', 'fixture-refresh'));
+    await h.keychain.set('qlb:anthropic:unrelated', QLB_KEYCHAIN_ACCOUNT, cswapImportCredential('unrelated', 'unrelated-refresh'));
     const options = { backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo };
     const before = await classifyCswapImportJournals(options);
     assert.deepEqual(before.map(({ runId, phase, action }) => ({ runId, phase, action })), [{ runId: 'staged-purge', phase: 'staged', action: 'purge-staging' }]);
@@ -114,8 +114,8 @@ describe('C-swap import (K10 / AC16)', () => {
       accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}',
       fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture',
     });
-    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'refresh-a'));
-    await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'prior-previous'));
+    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, cswapImportCredential('account-a', 'refresh-a'));
+    await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, cswapImportCredential('account-a', 'prior-previous'));
     let cleanupFailed = false;
     const failingKeychain = {
       get: h.keychain.get.bind(h.keychain), set: h.keychain.set.bind(h.keychain),
@@ -185,9 +185,9 @@ describe('C-swap import (K10 / AC16)', () => {
       now: () => 2, afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
     }), CswapImportInjectedCrash);
     renameSync(join(journalDir, 'cswap-import-a-old'), join(journalDir, 'held-old'));
-    const newer = credential('account-a', 'refresh-a-newer');
+    const newer = cswapImportCredential('account-a', 'refresh-a-newer');
     writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(newer).toString('base64'));
-    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a', 'refresh-a')).toString('base64'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(cswapImportCredential('account-a', 'refresh-a')).toString('base64'));
     let cleanupFailed = false;
     const failingKeychain = {
       get: h.keychain.get.bind(h.keychain), set: h.keychain.set.bind(h.keychain),
@@ -218,13 +218,13 @@ describe('C-swap import (K10 / AC16)', () => {
   it('refuses recovery when an admitted slot update moved the destination', async () => {
     const h = fixture();
     const journalDir = join(h.root, 'journals');
-    const original = credential('account-a', 'refresh-a');
+    const original = cswapImportCredential('account-a', 'refresh-a');
     await importCswap({ backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, runId: 'base-run' });
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir, keychain: h.keychain, repository: h.repo, replace: true, runId: 'moved-slot',
       afterPromotionWrite: () => { throw new CswapImportInjectedCrash(); },
     }), CswapImportInjectedCrash);
-    const moved = credential('account-a', 'refresh-a-moved');
+    const moved = cswapImportCredential('account-a', 'refresh-a-moved');
     const originalFingerprint = credentialFingerprint(original);
     const movedFingerprint = credentialFingerprint(moved);
     assert.ok(originalFingerprint, 'fixture credential has a fingerprint');
@@ -245,7 +245,7 @@ describe('C-swap import (K10 / AC16)', () => {
     const h = fixture();
     const home = join(h.root, 'home');
     stagedJournal(home, 'dry-run-orphan', 'account-a', join(home, '.qlb', 'backups'));
-    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-b')).toString('base64'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(cswapImportCredential('account-b', 'refresh-b')).toString('base64'));
     const dbPath = join(h.root, 'dry-run.db');
     const store = openStore(dbPath);
     beginCutover(store);
@@ -323,7 +323,7 @@ describe('C-swap import (K10 / AC16)', () => {
 
   it('stages, adopts an active live successor, promotes, and commits one destination record', async () => {
     const h = fixture();
-    const live = credential('account-a', 'refresh-a-rotated');
+    const live = cswapImportCredential('account-a', 'refresh-a-rotated');
     const result = await importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
       liveCredential: async () => live, liveAccountId: async () => 'account-a', now: () => 1_700_000_000_000, runId: 'fixture-run',
@@ -331,8 +331,8 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.equal(result.phase, 'cleaned');
     assert.equal(h.repo.listSlots().length, 2);
     assert.equal(h.repo.getSlot('account-a')?.fingerprint, credentialFingerprint(live));
-    assert.equal(h.repo.getSlot('account-a')?.prevFingerprint, credentialFingerprint(credential('account-a', 'refresh-a')));
-    assert.equal(await h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), credential('account-a', 'refresh-a'));
+    assert.equal(h.repo.getSlot('account-a')?.prevFingerprint, credentialFingerprint(cswapImportCredential('account-a', 'refresh-a')));
+    assert.equal(await h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), cswapImportCredential('account-a', 'refresh-a'));
     assert.equal(h.repo.getImportRun('fixture-run')?.committedAt, 1_700_000_000_000);
   });
 
@@ -377,7 +377,7 @@ describe('C-swap import (K10 / AC16)', () => {
       accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}',
       fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture',
     });
-    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, credential('account-a', 'refresh-a'));
+    await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, cswapImportCredential('account-a', 'refresh-a'));
     await assert.rejects(importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }), /non-empty/);
     await assert.doesNotReject(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
@@ -398,7 +398,7 @@ describe('C-swap import (K10 / AC16)', () => {
   it('cswap import refuses two slots on one refresh-token lineage', async () => {
     const h = fixture();
     // Slot 2 holds the same refresh token as slot 1 under a different account.
-    h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'refresh-a'));
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test', cswapImportCredential('account-b', 'refresh-a'));
     for (const run of [
       () => planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo }),
       () => importCswap({ backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo }),
@@ -425,7 +425,7 @@ describe('C-swap import (K10 / AC16)', () => {
     // The live credential for active slot 1 holds slot 2's refresh token.
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-duplicate',
-      liveCredential: async () => credential('account-a', 'refresh-b'), liveAccountId: async () => 'account-a',
+      liveCredential: async () => cswapImportCredential('account-a', 'refresh-b'), liveAccountId: async () => 'account-a',
     }), (error: unknown) => {
       assert.ok(error instanceof CswapImportRefusalError);
       assert.equal(error.code, 'duplicate-login');
@@ -443,7 +443,7 @@ describe('C-swap import (K10 / AC16)', () => {
     const h = fixture();
     const home = join(h.root, 'home');
     const env = { QLB_TEST_MODE: '1', QLB_HOME: join(h.root, 'qlb-home'), HOME: home, USER: macosKeychainAccountName() };
-    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-a')).toString('base64'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(cswapImportCredential('account-b', 'refresh-a')).toString('base64'));
     const dbPath = join(h.root, 'qlb.db');
     const store = openStore(dbPath);
     beginCutover(store);
@@ -477,13 +477,13 @@ describe('C-swap import (K10 / AC16)', () => {
     for (const previousOn of [1, 2]) {
       const h = fixture();
       if (previousOn === 1) {
-        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('account-a', 'new-login')).toString('base64'));
-        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a', 'old-login')).toString('base64'));
-        h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'old-login'));
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(cswapImportCredential('account-a', 'new-login')).toString('base64'));
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(cswapImportCredential('account-a', 'old-login')).toString('base64'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test', cswapImportCredential('account-b', 'old-login'));
       } else {
-        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('account-a', 'old-login')).toString('base64'));
-        h.keychain.setSync('claude-swap', 'account-2-b@example.test', credential('account-b', 'new-login'));
-        h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'old-login'));
+        writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(cswapImportCredential('account-a', 'old-login')).toString('base64'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test', cswapImportCredential('account-b', 'new-login'));
+        h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', cswapImportCredential('account-b', 'old-login'));
       }
       const before = backupSnapshot(h.backup);
       const sourceItems = async () => Promise.all(['account-2-b@example.test', 'account-2-b@example.test.prev']
@@ -503,11 +503,11 @@ describe('C-swap import (K10 / AC16)', () => {
   it('cswap import refuses a live login that is another slot\'s previous login', async () => {
     const h = fixture();
     // Slot 2 previously held "old-login"; the live credential of active slot 1 is that login.
-    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'old-login'));
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', cswapImportCredential('account-b', 'old-login'));
     const before = backupSnapshot(h.backup);
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-previous-login',
-      liveCredential: async () => credential('account-a', 'old-login'), liveAccountId: async () => 'account-a',
+      liveCredential: async () => cswapImportCredential('account-a', 'old-login'), liveAccountId: async () => 'account-a',
     }), assertDuplicateLogin);
     assert.equal(h.repo.listSlots().length, 0);
     assert.deepEqual(h.keychain.listServices().filter((name) => name.startsWith('qlb:')), []);
@@ -517,12 +517,12 @@ describe('C-swap import (K10 / AC16)', () => {
   it('a slot whose previous login is its own, or an unrelated one, still imports', async () => {
     const h = fixture();
     // Slot 1's previous copy is its own login (same refresh token, older access token).
-    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(credential('account-a-old', 'refresh-a')).toString('base64'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-1-a@example.test.enc.prev'), Buffer.from(cswapImportCredential('account-a-old', 'refresh-a')).toString('base64'));
     // Slot 2's previous login belongs to no other slot.
-    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', credential('account-b', 'refresh-unrelated'));
+    h.keychain.setSync('claude-swap', 'account-2-b@example.test.prev', cswapImportCredential('account-b', 'refresh-unrelated'));
     const result = await importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'no-false-positive',
-      liveCredential: async () => credential('account-a', 'refresh-a'), liveAccountId: async () => 'account-a',
+      liveCredential: async () => cswapImportCredential('account-a', 'refresh-a'), liveAccountId: async () => 'account-a',
     });
     assert.equal(result.phase, 'cleaned');
     assert.deepEqual(h.repo.listSlots().map((slot) => slot.accountId).sort(), ['account-a', 'account-b']);
@@ -565,8 +565,8 @@ describe('C-swap import (K10 / AC16)', () => {
     const h = fixture();
     const plan = await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo });
     const source = plan.slots[0];
-    const prior = credential('account-a', 'refresh-a');
-    const priorPrevious = credential('account-a', 'prior-previous');
+    const prior = cswapImportCredential('account-a', 'refresh-a');
+    const priorPrevious = cswapImportCredential('account-a', 'prior-previous');
     h.repo.createSlot({ accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}', fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture' });
     await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, prior);
     await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, priorPrevious);
@@ -584,7 +584,7 @@ describe('C-swap import (K10 / AC16)', () => {
     };
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo,
-      replace: true, runId: 'prev-failure', liveCredential: async () => credential('account-a', 'live-successor'), liveAccountId: async () => 'account-a',
+      replace: true, runId: 'prev-failure', liveCredential: async () => cswapImportCredential('account-a', 'live-successor'), liveAccountId: async () => 'account-a',
     }), /prev write failure/);
     assert.equal(await h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), prior);
     assert.equal(await h.keychain.get('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT), priorPrevious);
@@ -593,7 +593,7 @@ describe('C-swap import (K10 / AC16)', () => {
     assert.equal(journal.slots[0].prevSaved, true);
     assert.equal(journal.slots[0].previousSaved, true);
     assert.equal(journal.slots[0].reached, 'previous');
-    assert.equal(journal.slots[0].promotedFingerprint, credentialFingerprint(credential('account-a', 'live-successor')));
+    assert.equal(journal.slots[0].promotedFingerprint, credentialFingerprint(cswapImportCredential('account-a', 'live-successor')));
     for (const service of [
       'qlb:anthropic:staging:prev-failure:account-a',
       'qlb:anthropic:import-prev:prev-failure:account-a',
@@ -608,7 +608,7 @@ describe('C-swap import (K10 / AC16)', () => {
       let writes = 0;
       const options = {
         backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId,
-        liveAccountId: async () => 'account-a', liveCredential: async () => credential('account-a', 'live-successor'),
+        liveAccountId: async () => 'account-a', liveCredential: async () => cswapImportCredential('account-a', 'live-successor'),
         afterPromotionWrite: () => { if (++writes === crashAfter) throw new CswapImportInjectedCrash(); },
       };
       await assert.rejects(importCswap(options), CswapImportInjectedCrash);
@@ -628,8 +628,8 @@ describe('C-swap import (K10 / AC16)', () => {
   it('keeps --replace backups when an in-process restore fails, then recovery restores byte-exact preimages', async () => {
     const h = fixture();
     const source = (await planCswapImport({ backupDir: h.backup, keychain: h.keychain, repository: h.repo })).slots[0];
-    const prior = credential('account-a', 'refresh-a');
-    const priorPrevious = credential('account-a', 'prior-previous');
+    const prior = cswapImportCredential('account-a', 'refresh-a');
+    const priorPrevious = cswapImportCredential('account-a', 'prior-previous');
     h.repo.createSlot({ accountId: source.accountId, slotNum: source.slotNum, email: source.email, configJson: '{}', fingerprint: source.fingerprint, prevFingerprint: null, addedAt: 1, source: 'fixture' });
     await h.keychain.set('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT, prior);
     await h.keychain.set('qlb:anthropic:account-a:prev', QLB_KEYCHAIN_ACCOUNT, priorPrevious);
@@ -653,7 +653,7 @@ describe('C-swap import (K10 / AC16)', () => {
     };
     const options = {
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: backend, repository: h.repo, replace: true, runId: 'restore-failure',
-      liveSnapshot: async () => ({ credential: credential('account-a', 'live-successor'), accountId: 'account-a' }),
+      liveSnapshot: async () => ({ credential: cswapImportCredential('account-a', 'live-successor'), accountId: 'account-a' }),
     };
     await assert.rejects(importCswap(options), /recovery required/);
     assert.equal(await h.keychain.get('qlb:anthropic:import-prev:restore-failure:account-a', QLB_KEYCHAIN_ACCOUNT), prior);
@@ -666,11 +666,11 @@ describe('C-swap import (K10 / AC16)', () => {
 
   it('refuses a live snapshot that changes before commit and rolls back promotion', async () => {
     const h = fixture();
-    let live = credential('account-a', 'live-one');
+    let live = cswapImportCredential('account-a', 'live-one');
     await assert.rejects(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo, runId: 'live-changed',
       liveSnapshot: async () => ({ credential: live, accountId: 'account-a' }),
-      afterLiveSnapshot: () => { live = credential('account-a', 'live-two'); },
+      afterLiveSnapshot: () => { live = cswapImportCredential('account-a', 'live-two'); },
     }), (error: unknown) => error instanceof CswapImportRefusalError && error.code === 'live-changed');
     assert.equal(h.repo.listSlots().length, 0);
     await assert.rejects(h.keychain.get('qlb:anthropic:account-a', QLB_KEYCHAIN_ACCOUNT), /item not found/);
@@ -691,8 +691,8 @@ describe('C-swap import (K10 / AC16)', () => {
         2: { email: 'b@example.test', uuid: 'account-b' },
       },
     }));
-    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(credential('account-b', 'refresh-b')).toString('base64'));
-    await platformKeychain.set(paths.keychainService, env.USER, credential('account-b', 'live-successor'));
+    writeFileSync(join(h.backup, 'credentials', '.creds-2-b@example.test.enc'), Buffer.from(cswapImportCredential('account-b', 'refresh-b')).toString('base64'));
+    await platformKeychain.set(paths.keychainService, env.USER, cswapImportCredential('account-b', 'live-successor'));
     const dbPath = join(h.root, 'qlb.db');
     const store = openStore(dbPath);
     beginCutover(store);
@@ -727,7 +727,7 @@ describe('C-swap import (K10 / AC16)', () => {
     }
     const repository = SqliteClaudeSlotRepository.open(dbPath);
     try {
-      assert.equal(repository.getSlot('account-b')?.fingerprint, credentialFingerprint(credential('account-b', 'live-successor')));
+      assert.equal(repository.getSlot('account-b')?.fingerprint, credentialFingerprint(cswapImportCredential('account-b', 'live-successor')));
     } finally {
       repository.close();
     }
@@ -755,7 +755,7 @@ describe('C-swap import (K10 / AC16)', () => {
     await assert.doesNotReject(importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
       runId: 'commit-under-live-locks', withLiveStateLocks,
-      liveSnapshot: async () => ({ credential: credential('account-a', 'live-successor'), accountId: liveAccount }),
+      liveSnapshot: async () => ({ credential: cswapImportCredential('account-a', 'live-successor'), accountId: liveAccount }),
       afterLiveRecheck: () => {
         nativeSwitch = withLiveStateLocks(async () => {
           liveAccount = 'account-b';
@@ -831,7 +831,7 @@ describe('C-swap import (K10 / AC16)', () => {
     const first = importCswap({
       backupDir: h.backup, journalDir: join(h.root, 'journals'), keychain: h.keychain, repository: h.repo,
       liveAccountId: async () => 'account-a',
-      liveCredential: async () => { entered(); await held; return credential('account-a', 'live-successor'); },
+      liveCredential: async () => { entered(); await held; return cswapImportCredential('account-a', 'live-successor'); },
     });
     await enteredLiveRead;
     await assert.rejects(importCswap({

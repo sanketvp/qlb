@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential } from './support/claude-fixtures';
+
 import { createAnthropicGate, sendRefresh, type AnthropicGateDeps } from '../src/gate/anthropic';
 import { loadGate } from '../src/gate';
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
@@ -20,18 +22,6 @@ import { beginCutover } from '../src/lifecycle';
 import { openStore, openStoreConnection } from '../src/store';
 
 const NOW = 1_700_000_000_000;
-
-function credential(tag: string, expiresAt = NOW - 1): string {
-  return JSON.stringify({ claudeAiOauth: {
-    accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt,
-  } });
-}
-
-function credentialWithoutExpiry(tag: string): string {
-  return JSON.stringify({ claudeAiOauth: {
-    accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`,
-  } });
-}
 
 interface Fixture {
   dbPath: string;
@@ -55,7 +45,7 @@ async function fixture(expiresAt = NOW + 10 * 60_000): Promise<Fixture> {
   store.setActiveLogin('anthropic', 'account-a', 'fixture');
   const repository = SqliteClaudeSlotRepository.open(dbPath);
   const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => NOW });
-  const initial = credential('slot', expiresAt);
+  const initial = credential('slot', { expiresAt });
   await slots.createSlot({ accountId: 'account-a', credential: initial, email: 'a@example.test', orgUuid: 'org-a', source: 'cswap-import' });
   await backend.set(paths.keychainService, 'fixture-user', initial);
   let current: { accountId: string; email: string; orgUuid: string } | null = { accountId: 'account-a', email: 'a@example.test', orgUuid: 'org-a' };
@@ -169,7 +159,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('a rotated live credential under the locks is served with source adopted and 0 POSTs', async () => {
     const f = await fixture(NOW - 1);
-    rotateLiveDuringLockedRead(f, credential('rotated', NOW + 60 * 60_000));
+    rotateLiveDuringLockedRead(f, credential('rotated', { expiresAt: NOW + 60 * 60_000 }));
     let posts = 0;
     const result = await run(f, undefined, {
       postRefresh: async () => { posts += 1; return { status: 500, body: '' }; },
@@ -200,7 +190,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('a stranded live store is restored from the slot with 0 POSTs and source restored', async () => {
     const f = await fixture(NOW + 60 * 60_000);
-    await f.backend.set(f.live.paths.keychainService, f.live.account, credential('stranded', NOW - 1));
+    await f.backend.set(f.live.paths.keychainService, f.live.account, credential('stranded', { expiresAt: NOW - 1 }));
     let posts = 0;
     const result = await run(f, undefined, { postRefresh: async () => { posts += 1; return { status: 500, body: '' }; } });
     assert.equal(posts, 0);
@@ -221,12 +211,12 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     served.store.close();
 
     const adopted = await fixture(NOW - 1);
-    rotateLiveDuringLockedRead(adopted, credential('rotated', NOW + 60 * 60_000));
+    rotateLiveDuringLockedRead(adopted, credential('rotated', { expiresAt: NOW + 60 * 60_000 }));
     assert.equal((await run(adopted, undefined, { postRefresh })).code, 0);
     adopted.store.close();
 
     const restored = await fixture(NOW - 1);
-    await restored.slots.writeSlot('account-a', credential('slot-successor', NOW + 60 * 60_000), { cause: 'post', by: 'qlb-gate', evidence: 'post' });
+    await restored.slots.writeSlot('account-a', credential('slot-successor', { expiresAt: NOW + 60 * 60_000 }), { cause: 'post', by: 'qlb-gate', evidence: 'post' });
     assert.equal((await run(restored, undefined, { postRefresh })).code, 0);
     restored.store.close();
 
@@ -240,7 +230,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('routes a live credential with unknown expiry through refresh instead of serving it live', async () => {
     const f = await fixture();
-    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithoutExpiry('slot'));
+    await f.backend.set(f.live.paths.keychainService, f.live.account, credential('slot'));
     let posts = 0;
     const result = await run(f, undefined, {
       postRefresh: async () => ({
@@ -285,7 +275,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
     const result = await run(f, undefined, {
       refresh: async () => {
         f.store.setActiveLogin('anthropic', 'account-b', 'fixture');
-        return { outcome: 'posted', working: credential('issued', NOW + 60 * 60_000) };
+        return { outcome: 'posted', working: credential('issued', { expiresAt: NOW + 60 * 60_000 }) };
       },
     });
     assert.equal(result.code, 3);
@@ -411,12 +401,12 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
 
   it('a dead slot with a still-valid live token is served; the same slot at five minutes refuses relogin-needed with 0 POSTs', async () => {
     const valid = await fixture();
-    await valid.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(credential('slot', NOW + 10 * 60_000))!, ts: NOW });
+    await valid.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(credential('slot', { expiresAt: NOW + 10 * 60_000 }))!, ts: NOW });
     const result = await run(valid);
     assert.equal(result.code, 0);
     valid.store.close();
     const expired = await fixture(NOW - 1);
-    await expired.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(credential('slot', NOW - 1))!, ts: NOW });
+    await expired.slots.strikeDead('account-a', { reason: 'invalid_grant', struckFp: credentialLineage(credential('slot', { expiresAt: NOW - 1 }))!, ts: NOW });
     const dead = await run(expired);
     assert.equal(dead.code, 1);
     assert.deepEqual(dead.stdout, []);
@@ -488,7 +478,7 @@ describe('Anthropic Pi gate refresh mapping (K6-7)', () => {
   });
 
   it('every RefreshOutcome variant maps to exactly one gate result', async () => {
-    const working = credential('working', NOW + 60 * 60_000);
+    const working = credential('working', { expiresAt: NOW + 60 * 60_000 });
     const cases: Array<{ outcome: RefreshOutcome; code: number; source?: string; error?: string }> = [
       { outcome: { outcome: 'posted', working }, code: 0, source: 'refreshed' },
       { outcome: { outcome: 'posted-slot-unwritten', working }, code: 0, source: 'refreshed' },

@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential as claudeCredential } from './support/claude-fixtures';
+
 import { pollAnthropic } from '../src/auto/anthropic';
 import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { claudePaths } from '../src/cc-paths';
@@ -14,10 +16,7 @@ import { CANDIDATE_DEFAULT_INTERVAL_S, JITTER_FRAC, MIN_INTERVAL_S } from '../sr
 import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000;
-
-function credential(tag: string, expiresAt = (NOW + 60 * 60) * 1000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
-}
+const credential = (tag: string, expiresAt = (NOW + 3600) * 1000) => claudeCredential(tag, { expiresAt });
 
 async function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-auto-anthropic-'));

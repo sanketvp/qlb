@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential as claudeCredential } from './support/claude-fixtures';
+
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
@@ -33,7 +35,7 @@ import { openStore } from '../src/store';
 
 const NOW = 1_000_000;
 const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
-const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 3_600_000 } });
+const credential = (tag: string) => claudeCredential(tag, { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 3_600_000 });
 
 type Subject = Awaited<ReturnType<typeof fixture>>;
 

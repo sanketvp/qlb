@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { credentialWithFixtureAccess } from './support/claude-fixtures';
+
 import { runExecutingCommand } from '../src/app';
 import { runAuto } from '../src/auto';
 import { pollAnthropic } from '../src/auto/anthropic';
@@ -55,8 +57,6 @@ function root(prefix: string): string {
   return mkdtempSync(join(tmpdir(), `qlb-ac41-${prefix}-`));
 }
 
-const credential = (tag: string, expiresAt: number) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt } });
-
 /** Row 1: a Claude switch whose step-7 live credential write throws the AC41 body. */
 export async function runSwitchStep7(): Promise<ScenarioArtifacts> {
   const now = 1_000_000;
@@ -74,9 +74,9 @@ export async function runSwitchStep7(): Promise<ScenarioArtifacts> {
     try {
       const slots = new ClaudeSlots({ backend, repository, stashDir: join(dir, 'unclaimed'), now: () => now });
       for (const id of ['a', 'b']) {
-        await slots.createSlot({ accountId: id, credential: credential(id, now + 3_600_000), email: `${id}@example.test`, orgUuid: `org-${id}`, configJson: JSON.stringify({ oauthAccount: { accountUuid: id } }), source: 'cswap-import' });
+        await slots.createSlot({ accountId: id, credential: credentialWithFixtureAccess(id, `fixture-refresh-${id}`, now + 3_600_000), email: `${id}@example.test`, orgUuid: `org-${id}`, configJson: JSON.stringify({ oauthAccount: { accountUuid: id } }), source: 'cswap-import' });
       }
-      await backend.set(paths.keychainService, 'fixture-user', credential('a', now + 3_600_000));
+      await backend.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('a', 'fixture-refresh-a', now + 3_600_000));
       store.setActiveLogin('anthropic', 'a', 'manual', now);
       let thrown = false;
       const live: ClaudeSwitchDeps['live']['backend'] = {
@@ -121,8 +121,8 @@ export async function runPoll4xx(): Promise<ScenarioArtifacts> {
     const env = { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
     const backend = new MockKeychain();
     const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(home, 'unclaimed'), now: () => nowS * 1000 });
-    await slots.createSlot({ accountId: 'active', credential: credential('active', (nowS + 3600) * 1000), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
-    await slots.createSlot({ accountId: 'inactive', credential: credential('inactive', (nowS + 3600) * 1000), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
+    await slots.createSlot({ accountId: 'active', credential: credentialWithFixtureAccess('active', 'fixture-refresh-active', (nowS + 3600) * 1000), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
+    await slots.createSlot({ accountId: 'inactive', credential: credentialWithFixtureAccess('inactive', 'fixture-refresh-inactive', (nowS + 3600) * 1000), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
     store.setActiveLogin('anthropic', 'active', 'fixture', nowS);
     store.writeUsagePollPlans('anthropic', { active: { nextDueAt: nowS + 300, pollIntervalS: 300 } });
     const paths = claudePaths({ home, env });
@@ -554,7 +554,7 @@ export async function runUndoRecordDrill(): Promise<ScenarioArtifacts> {
     const { ctx, take } = commandContext(home, dbPath);
     const recordCtx = { ...ctx, env: { ...ctx.env, QLB_FAULT_INJECTION: '1' } };
     const keychain = new MockKeychain();
-    await keychain.set(qlbKeychainService('anthropic', 'ac41-slot'), QLB_KEYCHAIN_ACCOUNT, credential('ac41-slot', 3_600_000));
+    await keychain.set(qlbKeychainService('anthropic', 'ac41-slot'), QLB_KEYCHAIN_ACCOUNT, credentialWithFixtureAccess('ac41-slot', 'fixture-refresh-ac41-slot', 3_600_000));
     const deps = {
       keychain, backupDir: join(home, 'cswap'), now: () => 123,
     };
@@ -580,7 +580,7 @@ export async function runJournalResolve(): Promise<ScenarioArtifacts> {
     mkdirSync(paths.configHome, { recursive: true });
     writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'a' } })}\n`);
     const backend = new MockKeychain();
-    await backend.set(paths.keychainService, 'fixture-user', credential('a', now + 3_600_000));
+    await backend.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('a', 'fixture-refresh-a', now + 3_600_000));
     const dbPath = join(dir, 'qlb.sqlite');
     const store = cutoverStore(dbPath);
     const repository = SqliteClaudeSlotRepository.open(dbPath);
