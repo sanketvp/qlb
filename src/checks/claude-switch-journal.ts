@@ -23,8 +23,6 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 export interface ClaudeSwitchJournalCheckOptions {
   journal?: ClaudeSwitchJournalOptions;
   ownerIsLive?: (owner: ClaudeSwitchJournal['owner']) => Promise<boolean>;
-  /** Test seam for the complete live and historical Claude-slot inventory. */
-  slotInventory?: () => Iterable<{ accountId: string }>;
 }
 
 function journalOptions(options: ClaudeSwitchJournalCheckOptions): ClaudeSwitchJournalOptions {
@@ -46,8 +44,7 @@ export function isClaudeSwitchJournalCommitted(dbPath: string, attemptId: string
   }
 }
 
-function claudeSlotInventory(dbPath: string, options: ClaudeSwitchJournalCheckOptions): Iterable<{ accountId: string }> {
-  if (options.slotInventory) return options.slotInventory();
+function claudeSlotInventory(dbPath: string): Iterable<{ accountId: string }> {
   const db = openStoreConnection(dbPath, true);
   try {
     return db.prepare('SELECT account_id AS accountId FROM claude_slots').all() as { accountId: string }[];
@@ -79,7 +76,7 @@ export async function claudeSwitchJournalCheck(
   if (read.state === 'malformed') return { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' };
 
   try {
-    if (!validateClaudeSwitchJournalIdentity(read.journal, claudeSlotInventory(dbPath, options))) {
+    if (!validateClaudeSwitchJournalIdentity(read.journal, claudeSlotInventory(dbPath))) {
       return { name: 'claude:switch-journal', level: 'FAIL', message: 'invalid journal' };
     }
     if (read.journal.committed !== undefined || read.journal.closed !== null || isClaudeSwitchJournalCommitted(dbPath, read.journal.attemptId)) {

@@ -9,7 +9,7 @@ import { credential as claudeCredential } from './support/claude-fixtures';
 
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
-import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import {
   claudeSwitchJournalPath,
   createClaudeSwitchJournal,
@@ -105,6 +105,15 @@ function journalExists(subject: Subject): boolean {
   return existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json'));
 }
 
+function seedDoctorSlotInventory(dbPath: string): void {
+  const repository = SqliteClaudeSlotRepository.open(dbPath);
+  try {
+    for (const accountId of ['a', 'b']) {
+      repository.createSlot({ accountId, fingerprint: null, prevFingerprint: null, addedAt: NOW });
+    }
+  } finally { repository.close(); }
+}
+
 function wrappedBackend(backend: MockKeychain, overrides: Partial<ClaudeSwitchDeps['live']['backend']>): ClaudeSwitchDeps['live']['backend'] {
   return {
     kind: 'test-memory',
@@ -141,10 +150,10 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => false,
-      slotInventory: () => subject.slots.listSlots(),
     };
     await withClaudeSwitchJournalOwner(options.journal, async () => {
       assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
@@ -159,10 +168,10 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => true,
-      slotInventory: () => subject.slots.listSlots(),
     };
     assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
       name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
@@ -188,9 +197,9 @@ describe('Claude switch journal reconciliation (G10)', () => {
     } finally {
       store.close();
     }
+    seedDoctorSlotInventory(dbPath);
     assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      slotInventory: () => subject.slots.listSlots(),
     }), {
       name: 'claude:switch-journal', level: 'PASS', message: 'finished',
     });
@@ -214,12 +223,12 @@ describe('Claude switch journal reconciliation (G10)', () => {
     } finally {
       store.close();
     }
+    seedDoctorSlotInventory(dbPath);
     const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
     const before = createHash('sha256').update(readFileSync(path)).digest('hex');
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => false,
-      slotInventory: () => subject.slots.listSlots(),
     };
     const result = await claudeSwitchJournalCheck(dbPath, 'cutover', options);
     assert.equal(result.level, 'FAIL');
@@ -307,10 +316,10 @@ describe('Claude switch journal reconciliation (G10)', () => {
     await install(subject, journal(subject, injected));
     const dbPath = join(subject.root, 'qlb.sqlite');
     openStore(dbPath).close();
+    seedDoctorSlotInventory(dbPath);
 
     const result = await claudeSwitchJournalCheck(dbPath, 'cutover', {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
-      slotInventory: () => subject.slots.listSlots(),
     });
 
     assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'invalid journal' });
@@ -846,6 +855,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
 
     assert.equal(await runPiGate('anthropic', {
       dbPath, env: subject.env, guard: () => true, admitted: () => ({ ok: true }),
