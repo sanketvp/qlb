@@ -17,8 +17,14 @@ import { claudePaths } from '../src/cc-paths';
 import { ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
-import { createClaudeSwitchJournal } from '../src/cc-switch-journal';
+import { claudeSwitchJournalPath, createClaudeSwitchJournal, deleteClaudeSwitchJournal, updateClaudeSwitchJournal } from '../src/cc-switch-journal';
 import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
+import { runAutoCommand } from '../src/commands/auto';
+import { createClaudeJournalResolveCommand } from '../src/commands/claude-journal-resolve';
+import importCswapCommand from '../src/commands/import-cswap';
+import lifecycleCommand from '../src/commands/lifecycle';
+import { runUndoCswapCommand } from '../src/commands/undo-cswap';
+import { beginCutover, transition } from '../src/lifecycle';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
 import { MockKeychain } from '../src/keychain';
@@ -85,7 +91,14 @@ export async function runSwitchStep7(): Promise<ScenarioArtifacts> {
         getSync: (service, account) => backend.getSync(service, account),
         deleteSync: (service, account) => backend.deleteSync(service, account),
       };
+      // Capture the switch journal exactly as written, just before the rollback removes it.
+      let journal: string | null = null;
+      const journalPath = claudeSwitchJournalPath({ home, env });
       const result = await switchClaude({
+        journalOps: {
+          update: updateClaudeSwitchJournal,
+          remove: (held, options) => { journal = readFileSync(journalPath, 'utf8'); return deleteClaudeSwitchJournal(held, options); },
+        },
         store, slots, live: { backend: live, paths, account: 'fixture-user' },
         readConfig: (path) => JSON.parse(readFileSync(path, 'utf8')),
         resolveProfile: async () => ({ uuid: 'a', email: 'a@example.test', organizationUuid: 'org-a' }),
@@ -94,7 +107,7 @@ export async function runSwitchStep7(): Promise<ScenarioArtifacts> {
       }, { to: 'b', trigger: 'manual' });
       const row = new DatabaseSync(dbPath).prepare("SELECT error, detail, steps_json FROM switch_log WHERE outcome = 'rolled-back'").get() as
         { error: string | null; detail: string | null; steps_json: string | null } | undefined;
-      return { outcome: result.outcome, thrown: String(thrown), error: row?.error ?? null, detail: row?.detail ?? null, stepsJson: row?.steps_json ?? null };
+      return { outcome: result.outcome, thrown: String(thrown), error: row?.error ?? null, detail: row?.detail ?? null, stepsJson: row?.steps_json ?? null, journal };
     } finally { repository.close(); store.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -245,9 +258,11 @@ export type DoctorArtifacts = { level: string | null; message: string | null; te
 
 /**
  * Seeds an isolated test-mode store at lifecycle `phase`, lets `seed` plant the
- * AC41 input, then runs the real `qlb doctor` CLI for text and for --json. Each
- * run appends health history; the newest failing_json row is returned. Test mode
- * disables Keychain clients, so no credential store is read.
+ * AC41 input, then runs the real `qlb doctor` CLI for text. Without `seams` the
+ * --json report also comes from the CLI; with `seams` it comes from an in-process
+ * doctorQlb call that injects them. Each run appends health history; the newest
+ * failing_json row is returned. Test mode disables Keychain clients, so no
+ * credential store is read.
  */
 async function runDoctorRow(
   name: string,
@@ -432,4 +447,198 @@ export function runDoctorVersionDrift(): Promise<DoctorArtifacts> {
     const store = openStore(dbPath);
     try { store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0'); } finally { store.close(); }
   }, { claudeVersionRunner: () => AC41_BODY });
+}
+
+/**
+ * Row 15: the Claude switch journal written by the row-1 step-7 failure. Returns
+ * every journal field except `configText`, which is verbatim rollback material
+ * and deliberately outside the AC41 assertion.
+ */
+export async function runSwitchJournalFields(): Promise<ScenarioArtifacts> {
+  const { journal } = await runSwitchStep7();
+  if (journal === null) return { journal: null, detail: null, keys: null };
+  const parsed = JSON.parse(journal) as Record<string, unknown>;
+  delete parsed.configText;
+  return { journal: JSON.stringify(parsed), detail: parsed.detail === null ? null : String(parsed.detail), keys: Object.keys(parsed).sort().join(',') };
+}
+
+type CommandRun = { code: number | null; stdout: string; stderr: string };
+
+/** A test-mode command context rooted at `home`; every path stays inside it. */
+function commandContext(home: string, dbPath: string, extra: Partial<CommandContext> = {}): { ctx: CommandContext; take: (code: number | null) => CommandRun } {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const config = { ...defaultConfig(home), dbPath, cswapSequencePath: join(home, 'cswap', 'sequence.json') };
+  const ctx: CommandContext = {
+    stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+    env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home }, config, loadConfig: () => config, home,
+    registerSecret: () => {}, deliverSecret: () => {}, knownSecrets: () => [], ...extra,
+  };
+  return { ctx, take: (code) => ({ code, stdout: stdout.splice(0).join('\n'), stderr: stderr.splice(0).join('\n') }) };
+}
+
+function cutoverStore(dbPath: string): ReturnType<typeof openStore> {
+  const store = openStore(dbPath);
+  beginCutover(store, 10);
+  transition(store, 'cutover', 20);
+  return store;
+}
+
+function flatten(runs: Record<string, CommandRun>): ScenarioArtifacts {
+  return Object.fromEntries(Object.entries(runs).flatMap(([name, run]) => [
+    [`${name}Code`, String(run.code)], [`${name}Stdout`, run.stdout], [`${name}Stderr`, run.stderr],
+  ]));
+}
+
+/**
+ * Row 18: `qlb auto resume anthropic` (text and --json) with the AC41 body as the
+ * suspension marker, and `qlb auto drill-begin` whose agent bootout fails with the
+ * body as its message (status 3, the not-loaded result the command accepts).
+ */
+export async function runAutoResumeDrillBegin(): Promise<ScenarioArtifacts> {
+  const home = root('auto-cmd');
+  try {
+    const dbPath = join(home, 'qlb.db');
+    cutoverStore(dbPath).close();
+    const { ctx, take } = commandContext(home, dbPath);
+    const mark = () => { const store = openStore(dbPath); try { store.setConfig('auto.anthropic.suspendedUntil', AC41_BODY); } finally { store.close(); } };
+    const deps = {
+      runAuto: async () => { throw new Error('not used'); },
+      acquireFlock: async () => async () => {},
+      exec: () => { throw Object.assign(new Error(AC41_BODY), { status: 3 }); },
+      now: () => 30,
+    };
+    mark();
+    const resumeText = take(await runAutoCommand(['resume', 'anthropic'], ctx, deps));
+    mark();
+    const resumeJson = take(await runAutoCommand(['resume', 'anthropic', '--json'], ctx, deps));
+    const drillText = take(await runAutoCommand(['drill-begin'], ctx, deps));
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const marker = (db.prepare("SELECT value FROM config WHERE key = 'auto.anthropic.suspendedUntil'").get() as { value: string }).value;
+      const drillBeganAt = (db.prepare('SELECT drill_began_at AS value FROM lifecycle').get() as { value: number | null }).value;
+      return { ...flatten({ resumeText, resumeJson, drillText }), storedMarker: marker, storedDrillBeganAt: String(drillBeganAt) };
+    } finally { db.close(); }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+/** Row 19: `qlb lifecycle drill-done` refused while a non-drill injected switch row carries the AC41 body. */
+export async function runLifecycleDrillDone(): Promise<ScenarioArtifacts> {
+  const home = root('drill-done');
+  try {
+    const dbPath = join(home, 'qlb.db');
+    const store = cutoverStore(dbPath);
+    try {
+      store.recordSwitch({ ts: 25, provider: 'anthropic', toAccount: 'ac41', trigger: 'failover', outcome: 'refused', injected: true, detail: AC41_BODY, error: AC41_BODY });
+    } finally { store.close(); }
+    const { ctx, take } = commandContext(home, dbPath);
+    const text = take(await runExecutingCommand({ command: lifecycleCommand, args: ['drill-done'] }, ctx));
+    const json = take(await runExecutingCommand({ command: lifecycleCommand, args: ['drill-done', '--json'] }, ctx));
+    return flatten({ text, json });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+/** Row 20: `qlb undo cswap --dry-run --record-drill` (text and --json) with a Claude slot email holding the AC41 body. */
+export async function runUndoRecordDrill(): Promise<ScenarioArtifacts> {
+  const home = root('undo-drill');
+  try {
+    const dbPath = join(home, 'qlb.db');
+    cutoverStore(dbPath).close();
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source)
+        VALUES ('ac41-slot', 1, ?, '{}', 'sha256:ac41', 1, 'cswap-import')`).run(AC41_BODY);
+    } finally { db.close(); }
+    const { ctx, take } = commandContext(home, dbPath);
+    const recordCtx = { ...ctx, env: { ...ctx.env, QLB_FAULT_INJECTION: '1' } };
+    const deps = {
+      keychain: new MockKeychain(), backupDir: join(home, 'cswap'), now: () => 123,
+      plan: async () => ({ slots: [], deleteEnc: [], activeAccountNumber: null }),
+    };
+    const text = take(await runUndoCswapCommand(['--dry-run', '--record-drill'], recordCtx, deps));
+    const json = take(await runUndoCswapCommand(['--dry-run', '--record-drill', '--json'], recordCtx, deps));
+    const read = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const stored = (read.prepare("SELECT value FROM config WHERE key = 'drill.undoDryRunAt'").get() as { value: string } | undefined)?.value ?? null;
+      return { ...flatten({ text, json }), storedDryRunAt: stored };
+    } finally { read.close(); }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+/** Row 21: `qlb claude journal resolve --back` on an orphaned journal whose `from` and `to` carry the AC41 body. */
+export async function runJournalResolve(): Promise<ScenarioArtifacts> {
+  const now = 1_000_000;
+  const dir = root('resolve');
+  try {
+    const home = join(dir, 'home');
+    const env = { QLB_TEST_MODE: '1', HOME: home, QLB_HOME: home };
+    const paths = claudePaths({ home, env });
+    mkdirSync(paths.configHome, { recursive: true });
+    writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: 'a' } })}\n`);
+    const backend = new MockKeychain();
+    await backend.set(paths.keychainService, 'fixture-user', credential('a', now + 3_600_000));
+    const dbPath = join(dir, 'qlb.sqlite');
+    const store = cutoverStore(dbPath);
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    try {
+      const slots = new ClaudeSlots({ backend, repository, stashDir: join(dir, 'unclaimed'), now: () => now });
+      const options = { home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService };
+      createClaudeSwitchJournal({
+        v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: AC41_BODY, to: AC41_BODY, trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
+        decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: null, bindingJson: null, step: 7,
+        stagedBlobService: 'qlb:anthropic:staged-rollback:ac41', stagedAccount: 'qlb', stagedWritten: false,
+        keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null,
+        credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false,
+        closed: null, startedAt: now, owner: { pid: 999_999, lstart: 'ac41-dead-owner' },
+      }, options);
+      const deps: ClaudeSwitchDeps = {
+        store, slots, live: { backend, paths, account: 'fixture-user' },
+        readConfig: (path) => JSON.parse(readFileSync(path, 'utf8')),
+        resolveProfile: async () => null,
+        consume: { postRefresh: async () => ({ status: 500, body: '' }), withConsumeLock: async (fn) => fn(), withSwitchLock: async (fn) => fn() },
+        env, home, now: () => now, by: 'qlb-cli', attempt: 'ac41-resolve', journalOwner: { pid: process.pid, lstart: '' },
+        stillTheSameProcess: async () => false, cswapProcesses: () => [],
+      };
+      const { ctx, take } = commandContext(home, dbPath);
+      const command = createClaudeJournalResolveCommand({ makeSwitchDeps: async () => ({ deps }) });
+      const back = take(await runExecutingCommand({ command, args: ['--back'] }, ctx));
+      const rows = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        return { ...flatten({ back }), switchRows: JSON.stringify(rows.prepare('SELECT detail, error, steps_json FROM switch_log').all()) };
+      } finally { rows.close(); }
+    } finally { repository.close(); store.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** Row 22: `qlb import cswap --reconcile` (text and --json) with an orphaned import journal whose file is the AC41 body. */
+export async function runImportReconcile(): Promise<ScenarioArtifacts> {
+  const home = root('import');
+  try {
+    const dbPath = join(home, 'qlb.db');
+    cutoverStore(dbPath).close();
+    const journal = join(home, '.qlb', 'backups', 'cswap-import-ac41-run');
+    mkdirSync(journal, { recursive: true });
+    writeFileSync(join(journal, 'journal.json'), AC41_BODY);
+    const { ctx, take } = commandContext(home, dbPath);
+    const text = take(await runExecutingCommand({ command: importCswapCommand, args: ['--reconcile'] }, ctx));
+    const json = take(await runExecutingCommand({ command: importCswapCommand, args: ['--reconcile', '--json'] }, ctx));
+    return flatten({ text, json });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+/** Row 23: `qlb lifecycle sentinels record` (text and --json) whose Claude version probe prints the AC41 body. */
+export async function runSentinelsRecord(): Promise<ScenarioArtifacts> {
+  const home = root('sentinels');
+  try {
+    const dbPath = join(home, 'qlb.db');
+    openStore(dbPath).close();
+    const { ctx, take } = commandContext(home, dbPath, { claudeVersionRunner: () => AC41_BODY });
+    const text = take(await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record'] }, ctx));
+    const json = take(await runExecutingCommand({ command: lifecycleCommand, args: ['sentinels', 'record', '--json'] }, ctx));
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const stored = (db.prepare("SELECT value FROM config WHERE key = 'sentinel.claudeCodeVersion'").get() as { value: string } | undefined)?.value ?? null;
+      return { ...flatten({ text, json }), storedVersion: stored };
+    } finally { db.close(); }
+  } finally { rmSync(home, { recursive: true, force: true }); }
 }

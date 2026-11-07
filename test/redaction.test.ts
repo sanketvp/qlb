@@ -6,6 +6,8 @@ import {
   AC41_BODY, AC41_FIXTURES, leakedFixtures, runAutoThrownTick, runDoctorClaudeActive, runDoctorJournalInProgress, runDoctorSwitchJournal,
   runDoctorUndoIncomplete, runDoctorUndoLineage, runDoctorUnpersistedToken, runPoll4xx, runReportCutover, runStatusHistory, runSwitchStep7,
   AC41_STASH_ID, runDoctorAutoParked, runDoctorLoginExpiry, runDoctorStrayTemps, runDoctorUnclaimed, runDoctorVersionDrift,
+  runAutoResumeDrillBegin, runImportReconcile, runJournalResolve, runLifecycleDrillDone, runSentinelsRecord, runSwitchJournalFields,
+  runUndoRecordDrill,
   type DoctorArtifacts,
 } from './ac41-writer-scenarios';
 
@@ -351,7 +353,15 @@ describe('AC41 writer sweep', () => {
   });
 
   it('sweep: no fixture secret survives in any writer', async (t) => {
-    await t.test('row 1 Claude switch step-7 failure: switch_log.error and steps_json (non-propagation control)', async () => {
+    // Every inventory row runs as one named subtest; the parent checks at the end
+    // that all 23 AC41 inventory rows ran (HP-H3-12D completeness).
+    const covered: number[] = [];
+    const sweepRow = async (title: string, fn: () => Promise<void>): Promise<void> => {
+      covered.push(Number(/^row (\d+) /.exec(title)?.[1]));
+      await t.test(title, fn);
+    };
+
+    await sweepRow('row 1 Claude switch step-7 failure: switch_log.error and steps_json (non-propagation control)', async () => {
       const artifacts = await runSwitchStep7();
       assert.equal(artifacts.thrown, 'true');
       assert.equal(artifacts.outcome, 'rolled-back');
@@ -361,7 +371,7 @@ describe('AC41 writer sweep', () => {
       for (const key of ['error', 'detail', 'stepsJson']) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
     });
 
-    await t.test('row 2 Anthropic poll 4xx: usage_polls.last_status (non-propagation control)', async () => {
+    await sweepRow('row 2 Anthropic poll 4xx: usage_polls.last_status (non-propagation control)', async () => {
       const artifacts = await runPoll4xx();
       assert.equal(artifacts.bodyServed, 'true');
       assert.equal(artifacts.lastStatus, 'http-403');
@@ -370,7 +380,7 @@ describe('AC41 writer sweep', () => {
 
     // Two stacked boundaries guard this line (the tick's redactError and the
     // loop's redactedLog); the proof fails only when both are bypassed.
-    await t.test('row 14 auto thrown tick: auto log line (redaction proof)', async () => {
+    await sweepRow('row 14 auto thrown tick: auto log line (redaction proof)', async () => {
       const { log } = await runAutoThrownTick();
       assert.match(log ?? '', /^auto: tick error: ac41-failure-pad /);
       assert.deepEqual(leakedFixtures(log), []);
@@ -379,7 +389,7 @@ describe('AC41 writer sweep', () => {
     // Two stacked boundaries: the report's pre-serialization redactJson and
     // runExecutingCommand's output redaction. The five-family control-character
     // regression in report-cutover.test.ts separately pins the redactJson boundary.
-    await t.test('row 16 report cutover: text and --json output (redaction proof)', async () => {
+    await sweepRow('row 16 report cutover: text and --json output (redaction proof)', async () => {
       const artifacts = await runReportCutover();
       assert.ok(JSON.parse((artifacts.json ?? '').split('\n')[0] ?? 'null'));
       assert.match(artifacts.json ?? '', /ac41-failure-pad/);
@@ -388,7 +398,7 @@ describe('AC41 writer sweep', () => {
     });
 
     // Stored rows prove the write boundary; command output proves write and read boundaries together.
-    await t.test('row 17 status switches, relogins and AC33 JSON (redaction proof)', async () => {
+    await sweepRow('row 17 status switches, relogins and AC33 JSON (redaction proof)', async () => {
       const artifacts = await runStatusHistory();
       assert.match(artifacts.storedSwitchError ?? '', /ac41-failure-pad/);
       assert.match(artifacts.storedUsageStatus ?? '', /ac41-failure-pad/);
@@ -409,7 +419,7 @@ describe('AC41 writer sweep', () => {
       for (const key of ['message', 'text', 'json', 'history'] as const) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
     };
 
-    await t.test('row 4 doctor claude:switch-journal: text/JSON and failing_json (redaction proof)', async () => {
+    await sweepRow('row 4 doctor claude:switch-journal: text/JSON and failing_json (redaction proof)', async () => {
       const artifacts = await runDoctorSwitchJournal();
       assert.equal(artifacts.level, 'FAIL');
       assert.match(artifacts.message ?? '', /^unfinished Claude switch journal .*attemptId=ac41-attempt step=7 from=.*ac41-failure-pad.* to=.*ac41-failure-pad.*; run qlb claude journal resolve --forward or qlb claude journal resolve --back$/);
@@ -417,7 +427,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'claude:switch-journal');
     });
 
-    await t.test('row 5 doctor journal:in-progress: text/JSON (redaction proof); INFO row absent from failing_json (control)', async () => {
+    await sweepRow('row 5 doctor journal:in-progress: text/JSON (redaction proof); INFO row absent from failing_json (control)', async () => {
       const artifacts = await runDoctorJournalInProgress();
       assert.equal(artifacts.level, 'INFO');
       assert.match(artifacts.message ?? '', /^C-swap import lock is fresh; phases=\[redacted\]:invalid, \[redacted\]:invalid, \[redacted\]:invalid$/);
@@ -425,7 +435,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'journal:in-progress');
     });
 
-    await t.test('row 6 doctor undo:incomplete: fixed text/JSON and failing_json (non-propagation control)', async () => {
+    await sweepRow('row 6 doctor undo:incomplete: fixed text/JSON and failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorUndoIncomplete();
       assert.equal(artifacts.level, 'FAIL');
       assert.equal(artifacts.message, 'undo-unfinished: undo_began_at=1234; run qlb undo cswap --resume');
@@ -433,7 +443,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'undo:incomplete');
     });
 
-    await t.test('row 7 doctor undo:lineage-match: fixed text/JSON and failing_json (non-propagation control)', async () => {
+    await sweepRow('row 7 doctor undo:lineage-match: fixed text/JSON and failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorUndoLineage();
       assert.equal(artifacts.level, 'FAIL');
       assert.equal(artifacts.message, 'refused: active-slot-missing');
@@ -441,7 +451,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'undo:lineage-match');
     });
 
-    await t.test('row 8 doctor claude:active: fixed text/JSON and failing_json (non-propagation control)', async () => {
+    await sweepRow('row 8 doctor claude:active: fixed text/JSON and failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorClaudeActive();
       assert.equal(artifacts.level, 'FAIL');
       assert.equal(artifacts.message, 'active Claude login names a dead or archived slot');
@@ -449,7 +459,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'claude:active');
     });
 
-    await t.test('row 11 doctor claude:unpersisted-token: text/JSON and failing_json (redaction proof)', async () => {
+    await sweepRow('row 11 doctor claude:unpersisted-token: text/JSON and failing_json (redaction proof)', async () => {
       const artifacts = await runDoctorUnpersistedToken();
       assert.equal(artifacts.level, 'FAIL');
       assert.match(artifacts.message ?? '', /^unpersisted Claude token evidence without later recovery: ac41-failure-pad .*; re-login affected slot\(s\)$/);
@@ -457,13 +467,14 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'claude:unpersisted-token');
     });
 
-    // Doctor advisory rows (HP-H3-12C). Every one is a non-propagation control:
-    // the AC41 body sits at the row's real input but the check normalizes or never
-    // reads it, so these assert the fixed artifact and zero forwarding and do not
-    // claim a redactor ran. These rows are advisory (WARN outside the S64 blocking
-    // list, or claude:login-expiry, which S64 always excludes), so their history
-    // assertion is exact absence from failing_json, never persistence.
-    await t.test('row 3 doctor auto:parked: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+    // Doctor advisory rows (HP-H3-12C). Rows 3, 9, 10 and 12 are non-propagation
+    // controls: the AC41 body sits at the row's real input but the check normalizes
+    // or never reads it, so they assert the fixed artifact and zero forwarding and
+    // do not claim a redactor ran. Row 13 differs: the body does reach its message,
+    // behind two stacked redaction boundaries. All five rows are advisory (WARN
+    // outside the S64 blocking list, or claude:login-expiry, which S64 always
+    // excludes), so their history assertion is exact absence from failing_json.
+    await sweepRow('row 3 doctor auto:parked: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorAutoParked();
       assert.equal(artifacts.level, 'WARN');
       assert.equal(artifacts.message, 'parked marker unreadable');
@@ -471,7 +482,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'auto:parked');
     });
 
-    await t.test('row 9 doctor claude:login-expiry: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+    await sweepRow('row 9 doctor claude:login-expiry: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorLoginExpiry();
       assert.equal(artifacts.level, 'WARN');
       assert.equal(artifacts.message, 'Claude credential unreadable for slot ac41-slot');
@@ -479,7 +490,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'claude:login-expiry');
     });
 
-    await t.test('row 10 doctor claude:unclaimed: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+    await sweepRow('row 10 doctor claude:unclaimed: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorUnclaimed();
       assert.equal(artifacts.level, 'WARN');
       assert.equal(artifacts.message, `1 unclaimed Claude stash(es) older than 30 days: qlb claude restore-unclaimed ${AC41_STASH_ID} ac41-slot`);
@@ -487,7 +498,7 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'claude:unclaimed');
     });
 
-    await t.test('row 12 doctor fs:stray-temps: path-only text/JSON; absent from failing_json (non-propagation control)', async () => {
+    await sweepRow('row 12 doctor fs:stray-temps: path-only text/JSON; absent from failing_json (non-propagation control)', async () => {
       const artifacts = await runDoctorStrayTemps();
       assert.equal(artifacts.level, 'WARN');
       assert.match(artifacts.message ?? '', /^1 stray temporary file found: \/.*\/\.qlb-ac41\.999999999\.aaaaaaaaaaaaaaaa\.tmp$/);
@@ -495,14 +506,93 @@ describe('AC41 writer sweep', () => {
       assertDoctorClean(artifacts, 'fs:stray-temps');
     });
 
-    await t.test('row 13 doctor claude:version-drift: text/JSON; absent from failing_json (non-propagation control)', async () => {
-      // readClaudeVersion redacts the probe output before this row is built, so a
-      // single bypass of the doctor boundary cannot expose a fixture here.
+    await sweepRow('row 13 doctor claude:version-drift: text/JSON (stacked redaction proof); absent from failing_json', async () => {
+      // The probe output reaches the message, guarded by two stacked boundaries:
+      // readClaudeVersion's redaction, then the doctor report boundary. The proof
+      // fails only when both are bypassed.
       const artifacts = await runDoctorVersionDrift();
       assert.equal(artifacts.level, 'WARN');
       assert.match(artifacts.message ?? '', /^Claude Code version drift: recorded Claude Code 1\.0\.0; installed ac41-failure-pad /);
       assert.equal(artifacts.historyHasRow, false);
       assertDoctorClean(artifacts, 'claude:version-drift');
     });
+
+    // Remaining writers (HP-H3-12D). Commands run through their real entrypoints
+    // against isolated test-mode stores.
+    const assertClean = (artifacts: Record<string, string | null>): void => {
+      for (const [key, value] of Object.entries(artifacts)) assert.deepEqual(leakedFixtures(value), [], key);
+    };
+
+    await sweepRow('row 15 Claude switch journal error, steps and detail (non-propagation control; configText excluded)', async () => {
+      // The v1 journal has no error or steps field and the switch never copies a
+      // thrown body into it. configText is verbatim rollback material and is
+      // deliberately left out of this assertion.
+      const artifacts = await runSwitchJournalFields();
+      assert.notEqual(artifacts.journal, null);
+      assert.equal(artifacts.detail, null);
+      const keys = (artifacts.keys ?? '').split(',');
+      assert.equal(keys.includes('error'), false);
+      assert.equal(keys.includes('steps'), false);
+      assert.equal(keys.includes('configText'), false);
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 18 auto resume and drill-begin output (non-propagation control)', async () => {
+      const artifacts = await runAutoResumeDrillBegin();
+      assert.equal(artifacts.resumeTextCode, '0');
+      assert.equal(artifacts.resumeTextStdout, 'cleared-invalid');
+      assert.deepEqual(JSON.parse(artifacts.resumeJsonStdout ?? ''), { provider: 'anthropic', resumed: 'cleared-invalid', suspendedUntil: null });
+      assert.equal(artifacts.drillTextCode, '0');
+      assert.equal(artifacts.drillTextStdout, 'auto drill began');
+      assert.equal(artifacts.storedMarker, '');
+      assert.equal(artifacts.storedDrillBeganAt, '30');
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 19 lifecycle drill-done refusal (non-propagation control)', async () => {
+      const artifacts = await runLifecycleDrillDone();
+      assert.equal(artifacts.textCode, '3');
+      assert.equal(artifacts.textStderr, 'lifecycle drill refused: drill-rows-missing: usage-5xx,fail-step-8,breaker-rows,undo-dry-run');
+      const json = JSON.parse(artifacts.jsonStdout ?? '') as { ok: boolean; code: string; missing: string[] };
+      assert.deepEqual({ ok: json.ok, code: json.code, missing: json.missing }, { ok: false, code: 'drill-rows-missing', missing: ['usage-5xx', 'fail-step-8', 'breaker-rows', 'undo-dry-run'] });
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 20 undo C-swap --dry-run --record-drill (non-propagation control)', async () => {
+      const artifacts = await runUndoRecordDrill();
+      assert.equal(artifacts.textCode, '0');
+      assert.equal(artifacts.textStdout, 'activeAccountNumber=none');
+      assert.deepEqual(JSON.parse(artifacts.jsonStdout ?? ''), { slots: [], deleteEnc: [], activeAccountNumber: null, dryRun: true });
+      assert.equal(artifacts.storedDryRunAt, '123');
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 21 Claude journal resolve output and switch_log row (non-propagation control)', async () => {
+      const artifacts = await runJournalResolve();
+      assert.equal(artifacts.backCode, '0');
+      assert.equal(artifacts.backStdout, 'Claude journal resolved back');
+      assert.deepEqual(JSON.parse(artifacts.switchRows ?? ''), [{ detail: 'journal-back', error: null, steps_json: JSON.stringify({ attempt: 'ac41-attempt' }) }]);
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 22 C-swap import --reconcile text and --json (non-propagation control)', async () => {
+      const artifacts = await runImportReconcile();
+      for (const mode of ['text', 'json']) {
+        assert.equal(artifacts[`${mode}Code`], '3');
+        assert.equal(artifacts[`${mode}Stderr`], 'import cswap refused: import-journal-unclassifiable ac41-run');
+      }
+      assertClean(artifacts);
+    });
+
+    await sweepRow('row 23 lifecycle sentinels record output and stored sentinel (redaction proof)', async () => {
+      const artifacts = await runSentinelsRecord();
+      assert.equal(artifacts.textCode, '0');
+      assert.match(artifacts.textStderr ?? '', /^lifecycle sentinel recorded: ac41-failure-pad /);
+      assert.match(artifacts.storedVersion ?? '', /^ac41-failure-pad /);
+      assert.equal((JSON.parse(artifacts.jsonStdout ?? '') as { claudeCodeVersion: string }).claudeCodeVersion, artifacts.storedVersion);
+      assertClean(artifacts);
+    });
+
+    assert.deepEqual([...covered].sort((left, right) => left - right), Array.from({ length: 23 }, (_, index) => index + 1));
   });
 });
