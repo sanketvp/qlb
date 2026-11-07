@@ -128,7 +128,7 @@ describe('qlb retire cswap (AC22 retire)', () => {
       try { db.prepare('UPDATE lifecycle SET drill_began_at = ?').run(NOW - 10); } finally { db.close(); }
       f.store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
       for (const [accountId, usedPct] of [['active', 20], ['next', 10]] as const) {
-        f.store.upsertSnapshot(accountId, '5h', { usedPct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+        f.store.upsertSnapshot(accountId, '5h', { usedPct, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' });
       }
       const slots = { listSlots: () => [{ accountId: 'active', dead: false }, { accountId: 'next', dead: false }] } as unknown as ClaudeSlots;
       const drill = anthropicBreakerRowsDrill({ store: f.store, slots, now: () => NOW });

@@ -23,7 +23,7 @@ import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '..
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
 import { redactSecrets } from '../redact';
 import { Store, type UsagePollRow } from '../store';
-import { projectAnthropicUsageReadings } from '../anthropic-usage-view';
+import { failedProviderAttemptAfterReadings, isProviderAuthoritativeReading } from '../routing-authority';
 import type { BucketReading } from '../types';
 
 const PROVIDER = 'anthropic';
@@ -114,14 +114,18 @@ export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots'
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
     const snapshot = store.getAllSnapshots(slot.accountId);
-    const trusted = projectAnthropicUsageReadings(
-      snapshot, row, nowS,
-      (label) => !label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))),
-    );
-    const buckets = Object.fromEntries(Object.entries(trusted).map(([label, reading]) => [label, {
-      usedPct: reading.usedPct,
-      ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
-    }]));
+    const buckets = failedProviderAttemptAfterReadings(snapshot, row)
+      ? {}
+      : Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
+        if ((!label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))))
+          && isProviderAuthoritativeReading(reading, nowS * 1000)) {
+          return [[label, {
+            usedPct: reading.usedPct,
+            ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
+          }]];
+        }
+        return [];
+      }));
     return {
       accountId: slot.accountId, buckets, dead: slot.dead,
       ...(slot.threshold == null ? {} : { threshold: slot.threshold }),

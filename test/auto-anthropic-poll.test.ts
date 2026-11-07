@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 
 import { credential as claudeCredential } from './support/claude-fixtures';
 
-import { pollAnthropic } from '../src/auto/anthropic';
+import { anthropicTick, pollAnthropic } from '../src/auto/anthropic';
 import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { claudePaths } from '../src/cc-paths';
 import { credentialLineage, ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
@@ -89,7 +89,65 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(getUsage, false);
     assert.equal(f.store.listUsagePolls('anthropic').active?.lastStatus, 'http-500');
     assert.equal(f.store.getAllSnapshots('active')['5h']?.usedPct, 42);
-    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 42);
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
+  });
+
+  it('keeps auto quota verdicts provider-authoritative', async () => {
+    for (const reading of [
+      { source: 'provider-poll' as const, confidence: 'authoritative' as const, fetchedAt: (NOW - 301) * 1000 },
+      { source: 'poll' as const, confidence: 'authoritative' as const, fetchedAt: NOW * 1000 },
+      { source: 'poll' as const, confidence: 'unknown' as const, fetchedAt: NOW * 1000 },
+      { source: 'headers' as const, confidence: 'advisory' as const, fetchedAt: NOW * 1000 },
+    ]) {
+      const f = await fixture();
+      for (const accountId of ['active', 'inactive']) {
+        f.store.upsertSnapshot(accountId, '5h', {
+          usedPct: 100, resetAt: (NOW + 60) * 1000, ...reading,
+        });
+      }
+      const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+      assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    }
+  });
+
+  it('switches at a fresh provider-reported limit', async () => {
+    const f = await fixture();
+    for (const [accountId, usedPct] of [['active', 100], ['inactive', 0]] as const) {
+      f.store.upsertSnapshot(accountId, '5h', {
+        usedPct, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
+      });
+    }
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+    assert.equal(result.decision.kind, 'switch');
+    if (result.decision.kind === 'switch') assert.equal(result.decision.reason, 'at-limit');
+  });
+
+  it('parks a fresh provider-reported exhausted fleet', async () => {
+    const f = await fixture();
+    f.store.upsertSnapshot('active', '5h', {
+      usedPct: 100, resetAt: (NOW + 120) * 1000, fetchedAt: NOW * 1000,
+      source: 'provider-poll', confidence: 'authoritative',
+    });
+    f.store.upsertSnapshot('inactive', '5h', {
+      usedPct: 100, resetAt: (NOW + 60) * 1000, fetchedAt: NOW * 1000,
+      source: 'provider-poll', confidence: 'authoritative',
+    });
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+    assert.equal(result.decision.kind, 'switch');
+    if (result.decision.kind === 'switch') assert.equal(result.decision.reason, 'parked');
+  });
+
+  it('makes a failed provider poll unknown instead of reusing its prior quota', async () => {
+    const f = await fixture();
+    for (const accountId of ['active', 'inactive']) {
+      f.store.upsertSnapshot(accountId, '5h', {
+        usedPct: accountId === 'active' ? 100 : 0, fetchedAt: NOW * 1000,
+        source: 'provider-poll', confidence: 'authoritative',
+      });
+    }
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-500' });
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
   });
 
   it('an expired inactive slot is refreshed through the consume gate once', async () => {
@@ -107,7 +165,7 @@ describe('auto anthropic poll (G8)', () => {
     f.response({ status: 500, body: 'unavailable' });
     const accounts = await pollAnthropic(f.deps());
     assert.equal(f.store.getAllSnapshots('inactive')['5h']?.usedPct, 42);
-    assert.equal(accounts.find((account) => account.accountId === 'inactive')?.buckets['5h']?.usedPct, 42);
+    assert.equal(accounts.find((account) => account.accountId === 'inactive')?.buckets['5h'], undefined);
     assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'http-500');
   });
 
@@ -146,14 +204,16 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(status, 'usage-unreadable');
   });
 
-  it('keeps scheduled readings known across steady 60-second ticks', async () => {
+  it('does not extend auto authority across scheduled-poll gaps', async () => {
     const f = await fixture();
+    let observedUnknown = false;
     await f.slots.writeSlot('active', credential('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
     for (let tick = 0; tick < 60; tick += 1) {
       f.now(NOW + tick * 60);
       const accounts = await pollAnthropic(f.deps());
-      assert.ok(accounts.every((account) => account.buckets['5h']?.usedPct !== undefined));
+      observedUnknown ||= accounts.some((account) => account.buckets['5h'] === undefined);
     }
+    assert.equal(observedUnknown, true);
   });
 
   it('two simulated hours with fresh tokens make 0 POSTs and poll only on schedule', async () => {
@@ -407,7 +467,7 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'ok');
   });
 
-  it('a throttled healthy active does not fail over during a 4500 s block', async () => {
+  it('a throttled active becomes unknown during its provider backoff', async () => {
     const f = await fixture();
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
     await pollAnthropic(f.deps());
@@ -420,7 +480,7 @@ describe('auto anthropic poll (G8)', () => {
     assert.ok(blockUntil !== undefined);
     f.now(blockUntil! - 1);
     const accounts = await pollAnthropic(f.deps());
-    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h']?.usedPct, 20);
+    assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
   });
 
   it('an active hard sentinel does not extend the last reading past 180 s', async () => {
@@ -515,7 +575,7 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(f.store.listUsagePolls('anthropic').inactive?.lastStatus, 'invalid_client');
   });
 
-  it('an unconfigured 7d:<model> row resetting during a 429 hold does not drop 5h and 7d for auto', async () => {
+  it('a 429 hold makes every auto quota bucket unknown', async () => {
     const f = await fixture();
     f.store.writeUsagePollPlans('anthropic', {
       active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
@@ -526,11 +586,11 @@ describe('auto anthropic poll (G8)', () => {
     f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-429', http429: true });
 
     const active = (await pollAnthropic({ ...f.deps(), models: ['opus'] })).find((account) => account.accountId === 'active');
-    assert.equal(active?.buckets['5h']?.usedPct, 20);
-    assert.equal(active?.buckets['7d']?.usedPct, 20);
+    assert.equal(active?.buckets['5h'], undefined);
+    assert.equal(active?.buckets['7d'], undefined);
   });
 
-  it('a stale scoped row with a past resetAt does not drop fresh 5h and 7d for auto or status', async () => {
+  it('keeps failed-poll snapshots for status but not auto', async () => {
     const f = await fixture();
     f.store.writeUsagePollPlans('anthropic', {
       active: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 }, inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 10_000 },
@@ -542,8 +602,8 @@ describe('auto anthropic poll (G8)', () => {
 
     const auto = (await pollAnthropic({ ...f.deps(), models: ['all'] })).find((account) => account.accountId === 'active');
     const status = anthropicStoreSnapshots(f.slots.listSlots(), f.store, NOW).snapshots.find((snapshot) => snapshot.accountId === 'active');
-    assert.equal(auto?.buckets['5h']?.usedPct, 20);
-    assert.equal(auto?.buckets['7d']?.usedPct, 10);
+    assert.equal(auto?.buckets['5h'], undefined);
+    assert.equal(auto?.buckets['7d'], undefined);
     assert.equal(auto?.buckets['7d:Fable'], undefined);
     assert.equal(status?.buckets['5h']?.usedPct, 20);
     assert.equal(status?.buckets['7d']?.usedPct, 10);

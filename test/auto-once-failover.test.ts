@@ -37,7 +37,7 @@ function liveBinding(overrides: Partial<{
   };
 }
 
-const AUTO_NOW = 1_000_000;
+const AUTO_NOW = Math.floor(Date.now() / 1000) * 1000;
 
 function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null, nextFablePct = 10, fallbackFablePct?: number) {
   const root = mkdtempSync(join(tmpdir(), 'qlb-auto-model-scope-'));
@@ -54,11 +54,11 @@ function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null,
   const repository = SqliteClaudeSlotRepository.open(config.dbPath);
   try { for (const slot of slots) repository.createSlot(slot); } finally { repository.close(); }
   store.setActiveLogin('anthropic', 'active', 'fixture', AUTO_NOW);
-  const fetchedAt = Date.now();
+  const fetchedAt = AUTO_NOW;
   for (const slot of slots) {
     const pct = slot.accountId === 'active' ? fablePct : slot.accountId === 'next' ? nextFablePct : fallbackFablePct!;
-    store.upsertSnapshot(slot.accountId, '7d', { usedPct: slot.accountId === 'active' ? 85 : 10, fetchedAt, source: 'poll', confidence: 'authoritative' });
-    store.upsertSnapshot(slot.accountId, '7d:Fable', { usedPct: pct, fetchedAt, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot(slot.accountId, '7d', { usedPct: slot.accountId === 'active' ? 85 : 10, fetchedAt, source: 'provider-poll', confidence: 'authoritative' });
+    store.upsertSnapshot(slot.accountId, '7d:Fable', { usedPct: pct, fetchedAt, source: 'provider-poll', confidence: 'authoritative' });
   }
   if (modelConfig !== null) store.setConfig('auto.anthropic.models', modelConfig);
   return { root, home, config, store, slots };
@@ -571,8 +571,8 @@ describe('auto once failover (G11)', () => {
     repository.createSlot(slot('next', 2));
     repository.close();
     store.setActiveLogin('anthropic', 'active', 'fixture', now);
-    store.upsertSnapshot('active', '5h', { usedPct: 100, fetchedAt: now, source: 'poll', confidence: 'authoritative' });
-    store.upsertSnapshot('next', '5h', { usedPct: 0, fetchedAt: now, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot('active', '5h', { usedPct: 100, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
+    store.upsertSnapshot('next', '5h', { usedPct: 0, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
     for (let index = 0; index < 3; index += 1) store.recordSwitch({
       ts: now - index, provider: 'anthropic', fromAccount: 'active', toAccount: 'next', trigger: 'at-limit', outcome: 'ok', committedAt: now - index,
     });

@@ -4,6 +4,7 @@ import { CodexProcessCheckFailed, accessFingerprint, activeCodexRenewers, classi
 import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
 import { reconcileCodexRecovery, runDueCodexWatches, type CodexSwitchDeps } from '../codex-switch';
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
+import { isProviderAuthoritativeReading } from '../routing-authority';
 import type { Store, UsagePollRow } from '../store';
 import { probeCodexUsage, type CodexUsageProbeDeps, type CodexUsageProbeResult } from '../usage/openai-codex';
 import type { BucketReading } from '../types';
@@ -58,6 +59,10 @@ function readingsFrom(result: CodexUsageProbeResult, nowMs: number): Record<stri
 
 function currentReadings(store: PollStore, accountId: string | null): Record<string, BucketReading> {
   return accountId === null ? {} : store.getAllSnapshots(accountId);
+}
+
+function authoritativeReadings(readings: Record<string, BucketReading>, nowMs: number): Record<string, BucketReading> {
+  return Object.fromEntries(Object.entries(readings).filter(([, reading]) => isProviderAuthoritativeReading(reading, nowMs)));
 }
 
 function usageFrom(readings: Record<string, BucketReading>): Usage | null {
@@ -138,9 +143,9 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   const nowS = Math.floor(nowMs / 1000);
   const polls = store.listUsagePolls(PROVIDER);
   const previous = usageFrom(currentReadings(store, accountId));
-  const base = (activeCredentialExpired = false, idleHoldSinceMs: number | null = null, refresh?: CodexActiveOutcome): CodexAutoPollResult => ({
+  const base = (activeCredentialExpired = false, idleHoldSinceMs: number | null = null, refresh?: CodexActiveOutcome, retainQuota = true): CodexAutoPollResult => ({
     accountId,
-    readings: currentReadings(store, accountId),
+    readings: retainQuota ? authoritativeReadings(currentReadings(store, accountId), nowMs) : {},
     activeCredentialExpired,
     idleHoldSinceMs,
     ...(refresh ? { refresh: refreshReceipt(refresh) } : {}),
@@ -286,11 +291,11 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
       trigger: 'unauthorized', accessFp: accessFingerprint(live.doc),
     });
     const afterRefresh = await stillOwns();
-    if (!afterRefresh) return base(false, null, refresh);
+    if (!afterRefresh) return base(false, null, refresh, false);
     const result = await stopped(refresh);
     if (result) return result;
-    if (!(await record('usage-unknown'))) return base(false, null, refresh);
-    return base(false, null, refresh);
+    if (!(await record('usage-unknown'))) return base(false, null, refresh, false);
+    return base(false, null, refresh, false);
   }
 
   // A switch/adopt may finish while the HTTP request is pending. The response
@@ -298,21 +303,25 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   if (!(await stillOwns())) return base(false, null, refresh);
   // A rate limit remains a rate limit even if rollout snapshots provide readings.
   if (usage.status === 429) {
-    const readings = usage.windows && usage.windows.length > 0 ? readingsFrom(usage, nowMs) : undefined;
-    // Preserve rate-limit backoff; rollout readings are advisory for this tick only.
-    if (!(await record('http-429', undefined, true, usage.retryAfterS))) return base(false, null, refresh);
-    return readings
-      ? { accountId, readings, activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) }
-      : base(false, null, refresh);
+    // A rate-limit response is health metadata, not a fresh quota receipt.
+    if (!(await record('http-429', undefined, true, usage.retryAfterS))) return base(false, null, refresh, false);
+    return base(false, null, refresh, false);
   }
   if (usage.windows && usage.windows.length > 0) {
     const readings = readingsFrom(usage, nowMs);
-    if (!(await record('ok', readings))) return base(false, null, refresh);
-    return { accountId, readings, activeCredentialExpired: false, idleHoldSinceMs: null, ...(refresh ? { refresh: refreshReceipt(refresh) } : {}) };
+    const direct = authoritativeReadings(readings, nowMs);
+    if (!(await record(Object.keys(direct).length > 0 ? 'ok' : 'usage-unknown', readings))) return base(false, null, refresh, false);
+    return {
+      accountId,
+      readings: direct,
+      activeCredentialExpired: false,
+      idleHoldSinceMs: null,
+      ...(refresh ? { refresh: refreshReceipt(refresh) } : {}),
+    };
   }
 
-  if (!(await record('usage-unknown', undefined, false, usage.retryAfterS))) return base(false, null, refresh);
-  return base(false, null, refresh);
+  if (!(await record('usage-unknown', undefined, false, usage.retryAfterS))) return base(false, null, refresh, false);
+  return base(false, null, refresh, false);
 }
 
 /** C8 maintenance ordering: settle recovery, consume due watches, then poll. */

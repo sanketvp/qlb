@@ -21,7 +21,7 @@ function fixture() {
   assert.equal(transition(store, 'cutover', NOW - 9).ok, true);
   store.setActiveLogin('anthropic', 'active', 'fixture', NOW - 8);
   for (const [accountId, pct] of [['active', 20], ['next', 10]] as const) {
-    store.upsertSnapshot(accountId, '5h', { usedPct: pct, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot(accountId, '5h', { usedPct: pct, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' });
   }
   const repository = SqliteClaudeSlotRepository.open(config.dbPath);
   try {
@@ -140,13 +140,15 @@ describe('auto breaker-rows fault drill', () => {
       assert.equal(drill.decision.kind, 'stay');
       assert.equal(drill.decision.reason, 'breaker');
       store.setConfig('auto.anthropic.suspendedUntil', '');
-      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: NOW + 1, source: 'poll', confidence: 'authoritative' });
+      const now = Math.floor(Date.now() / 1000) * 1000;
+      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
+      store.upsertSnapshot('next', '5h', { usedPct: 10, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
       // The production dry-run binding is immutable when no live WAL exists;
       // close the fixture writer so its committed state is checkpointed first.
       store.close();
       closed = true;
       const output = await runAuto({ once: true, dryRun: true }, {
-        config, home: root, env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root }, now: () => NOW + 1, log: () => {},
+        config, home: root, env: { QLB_TEST_MODE: '1', QLB_HOME: root, HOME: root }, now: () => now, log: () => {},
       });
       assert.deepEqual(output.decisions, [{
         kind: 'switch', targetId: 'next', reason: 'proactive', unhealthyTicks: 0, parkedUntilMs: undefined,

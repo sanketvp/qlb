@@ -194,6 +194,20 @@ describe('C8 Codex poll and refresh', () => {
 
     const reading = h.records.at(-1)?.result.readings?.primary as { source: string; confidence: string };
     assert.deepEqual(reading, { source: 'poll', confidence: 'advisory', usedPct: 12, fetchedAt: NOW });
+    assert.deepEqual((await codexAutoTick(h.deps)).readings, {});
+    assert.equal(h.records.at(-1)?.result.status, 'usage-unknown');
+  });
+
+  it('does not return stale provider readings to Codex auto consumers', async () => {
+    const h = autoHarness();
+    h.snapshots['user-a:account-a'] = {
+      primary: { usedPct: 100, fetchedAt: NOW - 300_001, source: 'provider-poll', confidence: 'authoritative' },
+    };
+    h.polls['user-a:account-a'] = { nextDueAt: Math.floor(NOW / 1000) + 60, pollIntervalS: 60 };
+
+    const result = await codexAutoTick(h.deps);
+
+    assert.deepEqual(result.readings, {});
   });
 
   it('refreshes an active near-expiry login before its usage poll', async () => {
@@ -551,7 +565,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.ok((h.polls['user-a:account-a']?.backoffUntil ?? 0) > NOW / 1000);
   });
 
-  it('keeps rollout readings but records a 429 outcome and Retry-After backoff', async () => {
+  it('keeps rollout readings out of Codex auto authority during a 429', async () => {
     const h = autoHarness({
       probeUsage: async () => ({
         status: 429, source: 'codex-rollout', keys: ['rate_limits'], retryAfterS: 120,
@@ -561,7 +575,7 @@ describe('C8 Codex poll and refresh', () => {
 
     const result = await codexAutoTick(h.deps);
 
-    assert.equal(result.readings.primary?.usedPct, 20);
+    assert.equal(result.readings.primary, undefined);
     assert.equal(h.records.at(-1)?.result.status, 'http-429');
     assert.equal(h.records.at(-1)?.result.http429, true);
     assert.equal(h.records.at(-1)?.result.retryAfterS, 120);
