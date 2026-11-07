@@ -285,11 +285,20 @@ describe('claude-swap poll policy port', () => {
       POST_429_MAX_INTERVAL_S, EXHAUSTED_INTERVAL_S, JITTER_FRAC,
     }, {
       SERVE_TTL_S: 180, MIN_INTERVAL_S: 180, URGENT_INTERVAL_S: 60,
-      ACTIVE_MAX_INTERVAL_S: 240, CANDIDATE_MAX_INTERVAL_S: 600,
+      ACTIVE_MAX_INTERVAL_S: 270, CANDIDATE_MAX_INTERVAL_S: 600,
       EDGE_BACKOFF_S: 300, POST_429_MIN_INTERVAL_S: 360,
       POST_429_MAX_INTERVAL_S: 1800, EXHAUSTED_INTERVAL_S: 600, JITTER_FRAC: 0.1,
     });
     assert.equal(bindingPct({ five_hour: { pct: 80 }, seven_day: { pct: 20 } }), 80);
+  });
+
+  it('keeps jittered normal active polls inside provider authority', () => {
+    const [nextPoll, interval] = planAfterFetch({
+      prevIntervalS: ACTIVE_MAX_INTERVAL_S, prevUsage: usage(20), newUsage: usage(20),
+      isActive: true, threshold: 90, models: [], recent429: false, now: NOW, rng: () => 1,
+    });
+    assert.equal(interval, ACTIVE_MAX_INTERVAL_S);
+    assert.ok(nextPoll - NOW < 300);
   });
 });
 

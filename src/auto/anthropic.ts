@@ -23,7 +23,7 @@ import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '..
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
 import { redactSecrets } from '../redact';
 import { Store, type UsagePollRow } from '../store';
-import { failedProviderAttemptAfterReadings, isProviderAuthoritativeReading } from '../routing-authority';
+import { failedProviderAttemptAfterReadings, isProviderAuthoritativeReading, PROVIDER_READING_MAX_AGE_MS } from '../routing-authority';
 import type { BucketReading } from '../types';
 
 const PROVIDER = 'anthropic';
@@ -99,24 +99,29 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
   return row?.last429At !== null && row?.last429At !== undefined && nowS - row.last429At <= RECENT_429_WINDOW_S;
 }
 
-function needsCandidateRefresh(
-  activeId: string | null,
-  slots: ReturnType<ClaudeSlots['listSlots']>,
-  store: Store,
-  polls: Record<string, UsagePollRow>,
-  nowS: number,
-  settings: AutoswitchInput['settings'],
-  models: readonly string[],
-): boolean {
-  if (activeId === null) return false;
-  const decision = decideAutoswitch({
-    accounts: freshAnthropicAccounts(slots, store, polls, nowS, models),
-    activeAccountId: activeId,
-    nowMs: nowS * 1000,
-    settings,
-    provider: 'anthropic',
-  });
+function isAutoAuthoritativeReading(reading: BucketReading | undefined, nowMs: number): boolean {
+  return isProviderAuthoritativeReading(reading, nowMs)
+    && (reading.resetAt === undefined || reading.resetAt > nowMs);
+}
+
+function needsCandidateRefresh(input: AutoswitchInput): boolean {
+  const decision = decideAutoswitch(input);
   return decision.kind === 'stay' && decision.reason === 'no-comparison';
+}
+
+function activeAuthorityLapsed(
+  readings: Record<string, BucketReading>,
+  poll: UsagePollRow | undefined,
+  nowS: number,
+): boolean {
+  const nowMs = nowS * 1000;
+  if (poll?.lastStatus !== 'ok' || poll.nextDueAt == null || poll.nextDueAt <= nowS) return false;
+  const providerReadings = Object.values(readings).filter((reading) => reading.confidence === 'authoritative'
+    && (reading.source === 'provider-poll' || reading.source === 'provider-headers')
+    && Number.isFinite(reading.usedPct) && Number.isFinite(reading.fetchedAt)
+    && reading.fetchedAt <= nowMs && (reading.resetAt === undefined || reading.resetAt > nowMs));
+  return providerReadings.length > 0
+    && providerReadings.every((reading) => nowMs - reading.fetchedAt > PROVIDER_READING_MAX_AGE_MS);
 }
 
 function onDemandCandidate(ids: readonly string[], polls: Record<string, UsagePollRow>, nowS: number): string | null {
@@ -143,7 +148,7 @@ export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots'
       ? {}
       : Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
         if ((!label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))))
-          && isProviderAuthoritativeReading(reading, nowS * 1000)) {
+          && isAutoAuthoritativeReading(reading, nowS * 1000)) {
           return [[label, {
             usedPct: reading.usedPct,
             ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
@@ -239,7 +244,7 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
   const latestPolls = pollingState(slots, deps.store.listUsagePolls(PROVIDER));
   const inactiveIds = slots.filter((slot) => !slot.dead && slot.accountId !== activeId).map((slot) => slot.accountId);
   const inactiveId = dueCandidate(inactiveIds, latestPolls, nowS)
-    ?? (needsCandidateRefresh(activeId, slots, deps.store, latestPolls, nowS, settings, models)
+    ?? (needsCandidateRefresh(decisionInput({ store: deps.store, slots: deps.slots, now: () => nowS * 1000, models }))
       ? onDemandCandidate(inactiveIds, latestPolls, nowS)
       : null);
   if (inactiveId) {
@@ -412,6 +417,9 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     activeUsageUnknown: deps.activeUsageUnknown === true,
     activeUsagePollFailed: activeAccountId !== null && failedProviderAttemptAfterReadings(
       deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId],
+    ),
+    activeUsageAuthorityLapsed: activeAccountId !== null && activeAuthorityLapsed(
+      deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId], nowS,
     ),
     unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,
     idleHoldSinceMs: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}idleHoldSince`) : undefined,

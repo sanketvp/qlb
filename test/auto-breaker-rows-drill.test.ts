@@ -140,7 +140,7 @@ describe('auto breaker-rows fault drill', () => {
       assert.equal(drill.decision.kind, 'stay');
       assert.equal(drill.decision.reason, 'breaker');
       store.setConfig('auto.anthropic.suspendedUntil', '');
-      const now = Math.floor(Date.now() / 1000) * 1000;
+      const now = NOW;
       store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
       store.upsertSnapshot('next', '5h', { usedPct: 10, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
       // The production dry-run binding is immutable when no live WAL exists;

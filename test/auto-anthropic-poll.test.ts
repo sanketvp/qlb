@@ -238,7 +238,7 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(status, 'usage-unreadable');
   });
 
-  it('does not extend auto authority across scheduled-poll gaps', async () => {
+  it('keeps the active provider reading measured across scheduled gaps', async () => {
     const f = await fixture();
     let observedUnknown = false;
     await f.slots.writeSlot('active', credential('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
@@ -246,8 +246,25 @@ describe('auto anthropic poll (G8)', () => {
       f.now(NOW + tick * 60);
       const accounts = await pollAnthropic(f.deps());
       observedUnknown ||= accounts.some((account) => account.buckets['5h'] === undefined);
+      assert.notEqual(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
     }
     assert.equal(observedUnknown, true);
+  });
+
+  it('holds a stale scheduled active measurement instead of failing over', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.unhealthyTicks', '1');
+    f.store.recordUsagePollResult('anthropic', 'active', {
+      attemptedAt: NOW - 360,
+      status: 'ok',
+      readings: { '5h': { usedPct: 20, fetchedAt: (NOW - 301) * 1000, source: 'provider-poll', confidence: 'authoritative' } },
+    });
+    f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 60, pollIntervalS: 360 } });
+    f.store.upsertSnapshot('inactive', '5h', { usedPct: 10, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative' });
+
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+
+    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 });
   });
 
   it('two simulated hours with fresh tokens make 0 POSTs and poll only on schedule', async () => {

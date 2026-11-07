@@ -4,7 +4,7 @@ import { CodexProcessCheckFailed, accessFingerprint, activeCodexRenewers, classi
 import { codexIdentity, type CodexAuthDocument } from '../codex-auth';
 import { reconcileCodexRecovery, runDueCodexWatches, type CodexSwitchDeps } from '../codex-switch';
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
-import { isProviderAuthoritativeReading } from '../routing-authority';
+import { failedProviderAttemptAfterReadings, isProviderAuthoritativeReading } from '../routing-authority';
 import type { Store, UsagePollRow } from '../store';
 import { probeCodexUsage, type CodexUsageProbeDeps, type CodexUsageProbeResult } from '../usage/openai-codex';
 import type { BucketReading } from '../types';
@@ -62,7 +62,8 @@ function currentReadings(store: PollStore, accountId: string | null): Record<str
 }
 
 function authoritativeReadings(readings: Record<string, BucketReading>, nowMs: number): Record<string, BucketReading> {
-  return Object.fromEntries(Object.entries(readings).filter(([, reading]) => isProviderAuthoritativeReading(reading, nowMs)));
+  return Object.fromEntries(Object.entries(readings).filter(([, reading]) => isProviderAuthoritativeReading(reading, nowMs)
+    && (reading.resetAt === undefined || reading.resetAt > nowMs)));
 }
 
 function usageFrom(readings: Record<string, BucketReading>): Usage | null {
@@ -145,7 +146,8 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   const previous = usageFrom(currentReadings(store, accountId));
   const base = (activeCredentialExpired = false, idleHoldSinceMs: number | null = null, refresh?: CodexActiveOutcome, retainQuota = true): CodexAutoPollResult => ({
     accountId,
-    readings: retainQuota ? authoritativeReadings(currentReadings(store, accountId), nowMs) : {},
+    readings: retainQuota && !failedProviderAttemptAfterReadings(currentReadings(store, accountId), polls[accountId])
+      ? authoritativeReadings(currentReadings(store, accountId), nowMs) : {},
     activeCredentialExpired,
     idleHoldSinceMs,
     ...(refresh ? { refresh: refreshReceipt(refresh) } : {}),

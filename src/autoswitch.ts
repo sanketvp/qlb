@@ -60,6 +60,7 @@ export interface AutoswitchInput {
   /** A forced poll failure makes the active reading unknown for this tick. */
   activeUsageUnknown?: boolean;
   activeUsagePollFailed?: boolean;
+  activeUsageAuthorityLapsed?: boolean;
   idleHoldSinceMs?: number | null;
   /** Timestamp of the prior successful automatic switch. */
   lastSwitchAtMs?: number;
@@ -410,7 +411,8 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   let unhealthyTicks = input.unhealthyTicks ?? 0;
   let trigger: Trigger;
   if (rawActive === null) {
-    if (input.activeUsagePollFailed === true && !activeAccount.dead && !expiredPastIdleHold && input.activeUsageUnknown !== true) {
+    if ((input.activeUsagePollFailed === true || input.activeUsageAuthorityLapsed === true)
+      && !activeAccount.dead && !expiredPastIdleHold && input.activeUsageUnknown !== true) {
       return { kind: 'stay', reason: 'unknown', unhealthyTicks };
     }
     unhealthyTicks += 1;
