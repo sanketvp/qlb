@@ -5,7 +5,7 @@
  * artifacts; nothing here calls a redactor.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -246,7 +246,7 @@ export type DoctorArtifacts = { level: string | null; message: string | null; te
  * run appends health history; the newest failing_json row is returned. Test mode
  * disables Keychain clients, so no credential store is read.
  */
-async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbPath: string, cliEnv: NodeJS.ProcessEnv) => void): Promise<DoctorArtifacts> {
+async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbPath: string, cliEnv: NodeJS.ProcessEnv) => (() => void) | void): Promise<DoctorArtifacts> {
   const dir = root('doctor');
   try {
     mkdirSync(join(dir, 'plugins'));
@@ -264,8 +264,9 @@ async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbP
     try {
       db.prepare('INSERT INTO lifecycle (state, began_at, cutover_at, window_end) VALUES (?, 1, 1, 2)').run(phase);
     } finally { db.close(); }
-    seed(dir, dbPath, cliEnv);
+    const refresh = seed(dir, dbPath, cliEnv);
     const doctor = (args: string[]): string => {
+      refresh?.();
       const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', ...args], { encoding: 'utf8', env: cliEnv, timeout: 120_000 });
       if (result.status !== 0 && result.status !== 1) throw new Error(`qlb doctor exited ${String(result.status)}: ${result.stderr}`);
       return result.stdout;
@@ -310,7 +311,9 @@ export function runDoctorJournalInProgress(): Promise<DoctorArtifacts> {
       mkdirSync(join(backups, `cswap-import-${fixture}`), { recursive: true });
       writeFileSync(join(backups, `cswap-import-${fixture}`, 'journal.json'), AC41_BODY);
     }
-    writeFileSync(join(backups, 'cswap-import.lock'), '');
+    const lock = join(backups, 'cswap-import.lock');
+    writeFileSync(lock, '');
+    return () => utimesSync(lock, new Date(), new Date());
   });
 }
 
