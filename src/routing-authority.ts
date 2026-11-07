@@ -42,7 +42,7 @@ export function failedProviderAttemptAfterReadings(
     .filter((reading) => reading.confidence === 'authoritative'
       && (reading.source === 'provider-poll' || reading.source === 'provider-headers'))
     .map((reading) => reading.fetchedAt));
-  return Number.isFinite(newestReading) && poll.lastAttemptAt * 1000 > newestReading;
+  return Number.isFinite(newestReading) && poll.lastAttemptAt >= Math.floor(newestReading / 1000);
 }
 
 /**

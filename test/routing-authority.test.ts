@@ -44,12 +44,16 @@ describe('provider routing authority', () => {
     ['synthetic source', anthropic('synthetic', { ...direct(), source: 'error' })],
     ['failed-probe fallback', anthropic('failed', direct(), { probe: { outcome: 'cached-after-failure' } })],
   ] as const) {
-    it(`returns UNAVAILABLE for ${name}`, () => {
+    it(`resolve and why reject ${name}`, () => {
       const decision = resolveFromSnapshots({ model: 'claude-sonnet-5', snapshots: [snapshot] });
       assert.equal(decision.ok, false);
       if (decision.ok) return;
       assert.equal(decision.error, 'UNAVAILABLE');
       assert.match(decision.reason, /fresh Anthropic provider quota reading required/);
+      const report = explainWhy({ model: 'claude-sonnet-5', snapshots: [snapshot] });
+      assert.equal(report.accountId, null);
+      assert.equal(report.error, 'UNAVAILABLE');
+      assert.match(report.losers[0]?.detail ?? '', /non-actionable/);
     });
   }
 

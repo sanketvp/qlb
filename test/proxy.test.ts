@@ -286,49 +286,70 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
     }
   });
 
-  it('rejects cached quota evidence without contacting the upstream', async () => {
-    const store = openStore(':memory:');
-    store.upsertAccount('acct-a', 'anthropic', 'acct-a');
-    for (const bucket of ['5h', '7d']) {
-      store.upsertSnapshot('acct-a', bucket, {
-        usedPct: 10,
-        source: 'poll',
-        confidence: 'authoritative',
-        fetchedAt: Date.now(),
+  for (const [name, override] of [
+    ['cached/imported', { source: 'poll' as const }],
+    ['advisory', { confidence: 'advisory' as const }],
+    ['unknown', { confidence: 'unknown' as const }],
+    ['stale/expired', { fetchedAt: Date.now() - 300_001 }],
+    ['synthetic', { source: 'error' as const }],
+    ['cached-after-failure', { failedPoll: true }],
+  ] as const) {
+    it(`rejects ${name} evidence without contacting the upstream`, async () => {
+      const store = openStore(':memory:');
+      store.upsertAccount('acct-a', 'anthropic', 'acct-a');
+      const fetchedAt = 'fetchedAt' in override ? override.fetchedAt : Date.now() - 10_000;
+      for (const bucket of ['5h', '7d']) {
+        store.upsertSnapshot('acct-a', bucket, {
+          usedPct: 10,
+          source: 'source' in override ? override.source : 'provider-poll',
+          confidence: 'confidence' in override ? override.confidence : 'authoritative',
+          fetchedAt,
+        });
+      }
+      if ('failedPoll' in override) {
+        store.recordUsagePollResult('anthropic', 'acct-a', {
+          attemptedAt: Math.floor(Date.now() / 1000), status: 'http-500',
+        });
+      }
+      setPolicy(store, {
+        harness: 'claude-code',
+        virtualModel: 'claude-sonnet-5--qlb-high',
+        realModel: 'claude-sonnet-5',
+        effort: 'high',
       });
-    }
-    setPolicy(store, {
-      harness: 'claude-code',
-      virtualModel: 'claude-sonnet-5--qlb-high',
-      realModel: 'claude-sonnet-5',
-      effort: 'high',
-    });
-    let hits = 0;
-    const mock = await listenMock((_req, res) => {
-      hits += 1;
-      res.writeHead(200);
-      res.end('{}');
-    });
-    const proxy = await startProxy({ store, mockUrl: mock.url });
-    try {
-      const response = await post(
-        proxy.proxyInfo.port,
-        '/v1/messages',
-        { model: 'claude-sonnet-5--qlb-high', messages: [] },
-        proxy.proxyInfo.token,
-      );
-      assert.equal(response.status, 503);
-      assert.deepEqual(response.json, {
-        error: 'UNAVAILABLE',
-        reason: 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available (anthropic claude-sonnet-5 pool requires a fresh provider reading)',
+      let hits = 0;
+      let creds = 0;
+      const mock = await listenMock((_req, res) => {
+        hits += 1;
+        res.writeHead(200);
+        res.end('{}');
       });
-      assert.equal(hits, 0);
-    } finally {
-      await proxy.stop();
-      mock.server.close();
-      store.close();
-    }
-  });
+      const proxy = new LoopbackProxy({
+        store,
+        infoPath: join(tmp(), 'proxy.json'),
+        idleTimeoutMs: 60_000,
+        getCredentialForAccount: async () => { creds += 1; return 'secret'; },
+        upstreams: { anthropicBase: mock.url, codexBase: mock.url },
+      });
+      await proxy.start();
+      try {
+        const response = await post(
+          proxy.proxyInfo.port,
+          '/v1/messages',
+          { model: 'claude-sonnet-5--qlb-high', messages: [] },
+          proxy.proxyInfo.token,
+        );
+        assert.equal(response.status, 503);
+        assert.equal((response.json as { error?: string }).error, 'UNAVAILABLE');
+        assert.equal(hits, 0);
+        assert.equal(creds, 0);
+      } finally {
+        await proxy.stop();
+        mock.server.close();
+        store.close();
+      }
+    });
+  }
 
   it('claude-code harness: generic client gets Claude Code OAuth identity injected upstream', async () => {
     const store = openStore(':memory:');
