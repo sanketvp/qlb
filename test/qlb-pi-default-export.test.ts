@@ -21,6 +21,11 @@ interface SmokeResult {
   poolStillRegistered: boolean;
   xaiStillRegistered: boolean;
   events: Array<{ type?: string; error?: { errorMessage?: string } }>;
+  outcomes: Array<Record<string, unknown>>;
+  qlbCalls: number;
+  gateCalls: number;
+  transportCalls: number;
+  securityCalls: number;
 }
 
 function load(opts: {
@@ -48,10 +53,17 @@ function load(opts: {
     QLB_CLI: join(FIXTURES, 'fake-qlb-cli.js'),
     SMOKE_STATES: opts.states,
     SMOKE_COUNTER: join(home, 'qlb-calls'),
+    SMOKE_TRANSPORT_COUNTER: join(home, 'transport-calls'),
+    SMOKE_SECURITY_COUNTER: join(home, 'security-calls'),
+    SMOKE_GATE_COUNTER: join(home, 'gate-calls'),
     SMOKE_CALL: opts.call ? '1' : '0',
     ...opts.env,
   };
-  const r = spawnSync(process.execPath, [join(FIXTURES, 'load-extension.mjs')], {
+  const r = spawnSync(process.execPath, [
+    '--require',
+    join(FIXTURES, 'fake-security-preload.cjs'),
+    join(FIXTURES, 'load-extension.mjs'),
+  ], {
     env,
     encoding: 'utf8',
     timeout: 60_000,
@@ -83,13 +95,20 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
   });
 
-  it('consume mode replaces the pool and re-checks the journal per request before any credential read', () => {
-    // Load sees CONSUMED; the request sees NATIVE, so it must stop before the Keychain.
-    const r = load({ states: 'CONSUMED,NATIVE', call: true, marker: true }); // enable writes the marker
+  it('consume mode without a fresh provider reading fails unavailable through the production entrypoint', () => {
+    const r = load({ states: 'CONSUMED', call: true, marker: true });
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
     assert.equal(r.events.length, 1);
-    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.disabled);
+    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.quotaUnavailable);
+    assert.deepEqual(r.outcomes, [{
+      accountId: 'cswap-active', provider: 'anthropic', model: 'claude-sonnet-5',
+      outcome: 'unavailable', error: CONSUME_ERRORS.quotaUnavailable,
+    }]);
+    assert.equal(r.qlbCalls, 1);
+    assert.equal(r.gateCalls, 0);
+    assert.equal(r.transportCalls, 0);
+    assert.equal(r.securityCalls, 0);
   });
 
   it('owner file + CONSUMED is a conflict: pool replaced by an error-only stub', () => {

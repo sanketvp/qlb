@@ -18,7 +18,7 @@ function reading(
 ): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };
@@ -417,22 +417,22 @@ describe('qlb why CLI', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-why-model-'));
     const dbPath = join(dir, 'qlb.db');
     const store = openStore(dbPath);
-    store.upsertAccount('B', 'xai', 'B');
+    store.upsertAccount('B', 'openai-codex', 'B');
     store.upsertAccount('A', 'anthropic', 'A');
-    store.upsertSnapshot('B', 'tokens', {
+    store.upsertSnapshot('B', 'primary', {
       usedPct: 10,
-      source: 'headers',
-      confidence: 'advisory',
+      source: 'provider-poll',
+      confidence: 'authoritative',
       fetchedAt: Date.now(),
     });
-    store.upsertSnapshot('B', 'requests', {
+    store.upsertSnapshot('B', 'secondary', {
       usedPct: 10,
-      source: 'headers',
-      confidence: 'advisory',
+      source: 'provider-poll',
+      confidence: 'authoritative',
       fetchedAt: Date.now(),
     });
     resolveFromSnapshots({
-      model: 'grok-4.6',
+      model: 'gpt-5.4',
       snapshots: snapshotsFromStore(store),
       store,
     });
@@ -441,7 +441,59 @@ describe('qlb why CLI', () => {
     const result = runCli(['why', '--json'], env);
     assert.equal(result.status, 0, result.stderr);
     const body = JSON.parse(result.stdout) as { model: string; modelSource: string };
-    assert.equal(body.model, 'grok-4.6');
+    assert.equal(body.model, 'gpt-5.4');
+    assert.equal(body.modelSource, 'last routing decision');
+  });
+
+  it('uses persisted Codex readings despite an empty Codex observation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-why-codex-store-'));
+    const dbPath = join(dir, 'qlb.db');
+    const store = openStore(dbPath);
+    store.upsertAccount('user:account', 'openai-codex', 'Codex');
+    for (const bucket of ['primary', 'secondary']) {
+      store.upsertSnapshot('user:account', bucket, {
+        usedPct: 10,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+        fetchedAt: Date.now(),
+      });
+    }
+    store.setConfig('observed:openai-codex', JSON.stringify({
+      at: new Date().toISOString(), source: 'status', generation: 1, persisted: true, outcome: 'ok',
+      accounts: [{ accountId: 'user:account', provider: 'openai-codex', label: 'Codex', buckets: {} }],
+    }));
+    store.close();
+    const env = isolatedEnv(dbPath);
+    const resolve = runCli(['resolve', '--model', 'gpt-5.4', '--json'], env);
+    const why = runCli(['why', '--model', 'gpt-5.4', '--json'], env);
+    assert.equal(resolve.status, 0, resolve.stderr);
+    assert.equal(why.status, 0, why.stderr);
+    assert.equal((JSON.parse(resolve.stdout) as { accountId: string }).accountId, 'user:account');
+    assert.equal((JSON.parse(why.stdout) as { accountId: string }).accountId, 'user:account');
+  });
+
+  it('omitted --model uses an unavailable routing decision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-why-unavailable-'));
+    const dbPath = join(dir, 'qlb.db');
+    const store = openStore(dbPath);
+    resolveFromSnapshots({
+      model: 'grok-4',
+      snapshots: [{
+        accountId: 'xai',
+        provider: 'xai',
+        label: 'xAI',
+        buckets: {
+          tokens: { usedPct: 10, source: 'headers', confidence: 'advisory', fetchedAt: Date.now() },
+          requests: { usedPct: 10, source: 'headers', confidence: 'advisory', fetchedAt: Date.now() },
+        },
+      }],
+      store,
+    });
+    store.close();
+    const result = runCli(['why', '--json'], isolatedEnv(dbPath));
+    assert.equal(result.status, 0, result.stderr);
+    const body = JSON.parse(result.stdout) as { model: string; modelSource: string };
+    assert.equal(body.model, 'grok-4');
     assert.equal(body.modelSource, 'last routing decision');
   });
 

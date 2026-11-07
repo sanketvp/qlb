@@ -16,7 +16,7 @@ function reading(
 ): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };
@@ -38,11 +38,17 @@ function anthropic(
 }
 
 function codex(accountId: string): AccountSnapshot {
+  const reading: BucketReading = {
+    usedPct: 10,
+    source: 'provider-poll',
+    confidence: 'authoritative',
+    fetchedAt: Date.now(),
+  };
   return {
     accountId,
     provider: 'openai-codex',
     label: accountId,
-    buckets: {},
+    buckets: { primary: reading, secondary: { ...reading } },
   };
 }
 

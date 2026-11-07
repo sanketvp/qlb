@@ -56,7 +56,7 @@ import {
   validateRawMigratePath,
   type MigratePathKind,
 } from './migrate-paths';
-import { resolveFromSnapshots, providerForModel } from './resolve';
+import { resolveFromSnapshots, providerForModel, snapshotsFromStore } from './resolve';
 import { isStrategy, STRATEGIES, type Strategy } from './scoring';
 import {
   checkRetirementEligibility,
@@ -1402,6 +1402,11 @@ function printResolveHuman(decision: ReturnType<typeof resolveFromSnapshots>): v
       console.log(decision.reason);
       return;
     }
+    if (decision.error === 'UNAVAILABLE') {
+      console.log('UNAVAILABLE');
+      console.log(decision.reason);
+      return;
+    }
     console.log('EXHAUSTED');
     if (decision.earliestReset) {
       console.log(
@@ -1448,6 +1453,21 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
       );
       return;
     }
+    if (decision.error === 'UNAVAILABLE') {
+      console.log(
+        JSON.stringify(
+          {
+            error: 'UNAVAILABLE',
+            requestedModel: decision.requestedModel,
+            reason: decision.reason,
+            decisionId: decision.decisionId,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
     console.log(
       JSON.stringify(
         {
@@ -1482,6 +1502,28 @@ function printResolveJson(decision: ReturnType<typeof resolveFromSnapshots>): vo
   );
 }
 
+async function collectRoutingCandidates(
+  store: Store,
+  models: string[],
+  probe: boolean,
+  recordAs?: 'resolve',
+) {
+  const usesCodex = models.some((model) => providerForModel(model) === 'openai-codex');
+  const collected = await collectCandidates({
+    adapters,
+    store,
+    models: models.filter((model) => providerForModel(model) !== 'openai-codex'),
+    probe,
+    ...(recordAs === undefined ? {} : { recordAs }),
+  });
+  return {
+    ...collected,
+    snapshots: usesCodex
+      ? [...collected.snapshots, ...snapshotsFromStore(store, 'openai-codex')]
+      : collected.snapshots,
+  };
+}
+
 async function runResolve(opts: ResolveOpts): Promise<number> {
   if (!providerForModel(opts.model)) {
     console.error(`qlb resolve: unknown model '${opts.model}' (cannot map to a provider)`);
@@ -1489,13 +1531,7 @@ async function runResolve(opts: ResolveOpts): Promise<number> {
   }
   const store = getStore();
   const models = [opts.model, ...opts.fallback];
-  const { snapshots } = await collectCandidates({
-    adapters,
-    store,
-    models,
-    probe: true,
-    recordAs: 'resolve',
-  });
+  const { snapshots } = await collectRoutingCandidates(store, models, true, 'resolve');
   const decision = resolveFromSnapshots({
     model: opts.model,
     fallback: opts.fallback,
@@ -1534,12 +1570,7 @@ async function runWhy(opts: WhyOpts): Promise<number> {
   }
   const strategy: Strategy = opts.strategy
     ?? (isStrategy(config.defaultStrategy) ? config.defaultStrategy : 'headroom');
-  const { snapshots, observations } = await collectCandidates({
-    adapters,
-    store,
-    models: [model, ...opts.fallback],
-    probe: false,
-  });
+  const { snapshots, observations } = await collectRoutingCandidates(store, [model, ...opts.fallback], false);
   const report = explainWhy({
     model,
     modelSource,

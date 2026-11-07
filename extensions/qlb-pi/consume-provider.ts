@@ -241,3 +241,42 @@ export function registerConsumeProvider(
     streamSimple,
   });
 }
+
+export interface ConsumeUnavailableDeps {
+  createStream: () => EventSink;
+  models?: readonly ModelLike[];
+  baseUrl?: string;
+  recordOutcome: (entry: Record<string, unknown>) => void;
+}
+
+/** Consume mode has no credential-attributable provider quota reading: fail unavailable
+ *  before any credential read. Body identical to HEAD's stub (54133816). The deps type
+ *  carries no credential-reading capability by construction. */
+export function registerUnavailableConsumeProvider(
+  pi: ProviderApi,
+  deps: ConsumeUnavailableDeps,
+): void {
+  const streamSimple = (model: ModelLike) => {
+    const output = deps.createStream();
+    deps.recordOutcome({
+      accountId: CSWAP_ACTIVE_ID,
+      provider: "anthropic",
+      model: model.id,
+      outcome: "unavailable",
+      error: CONSUME_ERRORS.quotaUnavailable,
+    });
+    output.push(errorEvent(model, CONSUME_ERRORS.quotaUnavailable));
+    output.end();
+    return output;
+  };
+  pi.unregisterProvider("anthropic");
+  pi.registerProvider({
+    id: "anthropic",
+    name: "Anthropic (QLB consume unavailable)",
+    ...(deps.baseUrl ? { baseUrl: deps.baseUrl } : {}),
+    auth: qlbManagedAuth(),
+    getModels: () => deps.models ?? [],
+    stream: streamSimple,
+    streamSimple,
+  });
+}

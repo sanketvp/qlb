@@ -12,7 +12,7 @@ function reading(
 ): BucketReading {
   return {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };

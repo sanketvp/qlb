@@ -28,6 +28,8 @@ export { redactEvent, redactSecrets } from "../../src/redact.js";
 // Stable, value-free messages for every consume failure sink (audit, Pi error
 // event, console). Raw diagnostics never cross these boundaries.
 export const CONSUME_ERRORS = {
+  quotaUnavailable:
+    "QLB Anthropic consume unavailable: no fresh provider-attributable quota reading",
   unreadable: "cswap-active credential unavailable (Claude Code login unreadable)",
   expired: "cswap-active credential expired; switch or re-login in Claude Code/cswap",
   disabled:

@@ -865,7 +865,7 @@ describe('qlb refresh observation recording', () => {
         observations: recalled.observations,
         store,
       });
-      assert.equal(why.accountId, 'healthy');
+      assert.equal(why.accountId, null);
       const sick = why.losers.find((l) => l.accountId === 'sick');
       assert.ok(sick);
       assert.equal(sick!.reason, 'unavailable');

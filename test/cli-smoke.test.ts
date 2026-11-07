@@ -157,12 +157,12 @@ describe('CLI smoke — documented commands', () => {
     assert.ok(Array.isArray(body.losers));
   });
 
-  it('resolve --model --json returns valid JSON (0 or EXHAUSTED 1)', () => {
+  it('resolve --model --json returns valid JSON (0 or EXHAUSTED/UNAVAILABLE 1)', () => {
     const result = runCli(['resolve', '--model', 'claude-sonnet-5', '--json']);
     assert.ok(result.status === 0 || result.status === 1, result.stderr);
     const body = parseJson(result.stdout) as { error?: string; requestedModel?: string };
     if (result.status === 1) {
-      assert.equal(body.error, 'EXHAUSTED');
+      assert.ok(body.error === 'EXHAUSTED' || body.error === 'UNAVAILABLE');
     } else {
       assert.equal(typeof body.requestedModel, 'string');
     }
