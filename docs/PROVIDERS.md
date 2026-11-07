@@ -5,8 +5,6 @@ QLB ships with five built-in provider adapters (`src/adapters/`). Each one is re
 - **Polled** — the provider exposes a usage endpoint, so QLB can refresh a reading through an authorized probe (coalesced through the single-flight claim; see [ARCHITECTURE.md](ARCHITECTURE.md)).
 - **Header-observed** — the provider only reports usage on real requests, so readings come from response headers of traffic that actually went through QLB's proxy/transport.
 
-Routing accepts a bucket only when it is an `authoritative`, direct provider reading (`provider-poll` or `provider-headers`) no more than five minutes old. Cached, imported, plugin, advisory, unknown, or stale readings remain available for display and cross-checking, but cannot select an account or establish exhaustion. A failed provider probe also makes its account unavailable until a later direct provider reading succeeds.
-
 An adapter must never throw: failures become an error snapshot on the account (visible in `qlb status`), so one unavailable provider never breaks the overall status command.
 
 Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent means `true`:
@@ -33,7 +31,7 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 - **Credential source:** Codex CLI's own `~/.codex/auth.json` (`tokens.access_token`; account id and label parsed from the `id_token` JWT claims). Configurable via `QLB_CODEX_AUTH_JSON_PATH`.
 - **Usage signal:** `qlb refresh --provider openai-codex --allow-probe` calls Codex's supported usage endpoint with the locally stored authorization and persists its provider-reported `primary` and `secondary` windows. Its limited redacted diagnostic is documented in the [CLI reference](CLI.md#qlb-codex-usage-diagnostic). Response headers on real requests remain a second source: `x-codex-primary-used-percent` (5-hour), `x-codex-secondary-used-percent` (weekly), and related reset/pool headers populate the same snapshot cache through `qlb proxy`. An unscoped refresh only reports the authenticated account with **no buckets**.
 - **Buckets:** `primary` (5-hour), `secondary` (weekly).
-- **Confidence:** scoped usage probes and proxy header readings are `authoritative` direct provider readings. An account without one is unavailable for routing, rather than a cold-start candidate.
+- **Confidence:** `authoritative` once a header-derived reading exists; `unknown` before that (which makes the account a cold-start candidate only, never excluded by a missing number).
 - **Caveats:** the explicit scoped probe makes a real authorized request; unscoped refresh does not call it. Otherwise Codex data is as fresh as the last request that went through the proxy. QLB never exposes credentials, request headers, or usage response bodies in this path.
 
 ### Pi OAuth source compatibility (P3)
@@ -45,7 +43,7 @@ Pi's `pi-ai/auth/oauth/openai-codex.js` was not present in this repository's `no
 - **Credential source:** the `xai` entry (OAuth `access`/`expires`) in Pi's `auth.json` (configurable via `QLB_PI_AUTH_JSON_PATH`). Read-only: if the grant is expired, the adapter reports `xai grant expired — run pi once to refresh it` rather than refreshing it itself.
 - **Usage signal:** response headers of a minimal real request — a single 1-token `POST https://api.x.ai/v1/chat/completions` (hard 15-second timeout, no retries), with `x-ratelimit-limit-tokens` / `x-ratelimit-remaining-tokens` and the request-counter equivalents parsed into percentages. There is no free gauge endpoint.
 - **Buckets:** `tokens`, `requests`.
-- **Confidence:** always `advisory`. This is a deliberate, documented choice: xAI's headers describe a *refilling* developer-API bucket with no reset timestamp, and it is not proven that the numbers match the SuperGrok in-app meter a user actually sees. Advisory buckets are displayed (as `~NN%`) but cannot admit, select, or exclude an account; with its current signals, xAI is unavailable for routing.
+- **Confidence:** always `advisory`. This is a deliberate, documented choice: xAI's headers describe a *refilling* developer-API bucket with no reset timestamp, and it is not proven that the numbers match the SuperGrok in-app meter a user actually sees. Advisory buckets are displayed (as `~NN%`) and used only as tie-breakers — they never exclude an account, and a reactive `429` from xAI is treated as the authoritative exhaustion signal.
 - **Caveats:** each refresh of the reading consumes a (tiny) real request. Concurrent callers share one probe through the single-flight claim, and readings are cached so repeated `status`/`resolve` calls do not re-probe.
 
 ## Kimi Coding (`kimi-coding`)
@@ -75,6 +73,6 @@ Additional providers can be added as local JavaScript plugins in `~/.qlb/plugins
 The design doc's provider matrix (verified against live endpoints before implementation) is the template for onboarding a provider:
 
 1. Identify a **real gauge**: a free usage GET (best), or response headers on real requests (acceptable — but the reading is then only as fresh as the traffic), or nothing (then the account can only be managed reactively, via 429s).
-2. Decide the **confidence** honestly: if the gauge cannot be proven to be the billing meter, mark it `advisory`; only direct provider readings labelled `provider-poll` or `provider-headers` can admit an account for routing.
+2. Decide the **confidence** honestly: if the gauge cannot be proven to be the billing meter, mark it `advisory` so it can never exclude an account.
 3. Map buckets to **window classes** (5-hour vs weekly) so the scarcity discount weights them correctly.
 4. Never write credentials; report errors as snapshots, never as throws.
