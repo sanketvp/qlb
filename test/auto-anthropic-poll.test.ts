@@ -18,14 +18,14 @@ import { openStore } from '../src/store';
 const NOW = 1_700_000_000;
 const credential = (tag: string, expiresAt = (NOW + 3600) * 1000) => claudeCredential(tag, { expiresAt });
 
-async function fixture() {
+async function fixture(activeThreshold?: number) {
   const home = mkdtempSync(join(tmpdir(), 'qlb-auto-anthropic-'));
   const env = { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
   const store = openStore(':memory:');
   const backend = new MockKeychain();
   let now = NOW;
   const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(home, 'unclaimed'), now: () => now * 1000 });
-  await slots.createSlot({ accountId: 'active', credential: credential('active'), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
+  await slots.createSlot({ accountId: 'active', credential: credential('active'), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, threshold: activeThreshold, source: 'fixture' });
   await slots.createSlot({ accountId: 'inactive', credential: credential('inactive'), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
   store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
   let gets = 0;
@@ -169,9 +169,9 @@ describe('auto anthropic poll (G8)', () => {
   });
 
   it('refreshes an unmeasured candidate when the active provider reading needs one', async () => {
-    const f = await fixture();
+    const f = await fixture(80);
     f.store.upsertSnapshot('active', '5h', {
-      usedPct: 100, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
+      usedPct: 85, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
     });
     f.store.writeUsagePollPlans('anthropic', {
       active: { nextDueAt: NOW + 10_000, pollIntervalS: 240 },

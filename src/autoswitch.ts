@@ -410,7 +410,9 @@ export function decideAutoswitch(input: AutoswitchInput): AutoswitchDecision {
   let unhealthyTicks = input.unhealthyTicks ?? 0;
   let trigger: Trigger;
   if (rawActive === null) {
-    if (input.activeUsagePollFailed === true) return { kind: 'stay', reason: 'unknown', unhealthyTicks };
+    if (input.activeUsagePollFailed === true && !activeAccount.dead && !expiredPastIdleHold && input.activeUsageUnknown !== true) {
+      return { kind: 'stay', reason: 'unknown', unhealthyTicks };
+    }
     unhealthyTicks += 1;
     if (unhealthyTicks < settings.unhealthyTicks) return { kind: 'stay', reason: 'unknown', unhealthyTicks };
     trigger = 'failover';

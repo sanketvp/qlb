@@ -105,17 +105,18 @@ function needsCandidateRefresh(
   store: Store,
   polls: Record<string, UsagePollRow>,
   nowS: number,
-  settings: { threshold: number; weeklyThreshold: number | null },
+  settings: AutoswitchInput['settings'],
   models: readonly string[],
 ): boolean {
   if (activeId === null) return false;
-  const activeNeedsCandidate = Object.entries(store.getAllSnapshots(activeId)).some(([label, reading]) =>
-    isProviderAuthoritativeReading(reading, nowS * 1000)
-    && reading.usedPct >= (label === '5h' ? settings.threshold : settings.weeklyThreshold ?? settings.threshold),
-  );
-  if (!activeNeedsCandidate) return false;
-  return !freshAnthropicAccounts(slots, store, polls, nowS, models)
-    .some((account) => account.accountId !== activeId && Object.keys(account.buckets).length > 0);
+  const decision = decideAutoswitch({
+    accounts: freshAnthropicAccounts(slots, store, polls, nowS, models),
+    activeAccountId: activeId,
+    nowMs: nowS * 1000,
+    settings,
+    provider: 'anthropic',
+  });
+  return decision.kind === 'stay' && decision.reason === 'no-comparison';
 }
 
 function onDemandCandidate(ids: readonly string[], polls: Record<string, UsagePollRow>, nowS: number): string | null {
