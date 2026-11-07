@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { credential } from './support/claude-fixtures';
+import { credential, credentialWithFixtureAccess } from './support/claude-fixtures';
 
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
@@ -191,9 +191,9 @@ describe('qlb switch anthropic command (K5-6)', () => {
     const backend = new MockKeychain();
     const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed'), now: () => 1 });
     try {
-      await slots.createSlot({ accountId: 'account-a', credential: credential('a', { accessToken: 'fixture-access-a', refreshToken: 'fixture-refresh-a', expiresAt: 3_600_001 }), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
-      await slots.createSlot({ accountId: 'account-b', credential: credential('b', { accessToken: 'fixture-access-b', refreshToken: 'fixture-refresh-b', expiresAt: 3_600_001 }), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
-      await backend.set(paths.keychainService, 'fixture-user', credential('a', { accessToken: 'fixture-access-a', refreshToken: 'fixture-refresh-a', expiresAt: 3_600_001 }));
+      await slots.createSlot({ accountId: 'account-a', credential: credentialWithFixtureAccess('a', 'fixture-refresh-a', 3_600_001), email: 'a@example.test', orgUuid: 'org-a', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-a' } }), source: 'cswap-import' });
+      await slots.createSlot({ accountId: 'account-b', credential: credentialWithFixtureAccess('b', 'fixture-refresh-b', 3_600_001), email: 'b@example.test', orgUuid: 'org-b', configJson: JSON.stringify({ oauthAccount: { accountUuid: 'account-b' } }), source: 'cswap-import' });
+      await backend.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('a', 'fixture-refresh-a', 3_600_001));
       store.setActiveLogin('anthropic', 'account-a', 'manual', 1);
     } finally {
       store.close();
