@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -20,6 +20,7 @@ describe('Codex usage diagnostic', () => {
       fallbackAttempted: null, parserShape: null, backoffUntil: null,
       authoritativeWindowObserved: false, stale: true,
     });
+    assert.equal(existsSync(path), false);
   });
 
   it('reads only finite persisted metadata without changing the database', () => {
