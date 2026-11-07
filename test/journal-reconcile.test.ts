@@ -144,6 +144,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => false,
+      slotInventory: () => subject.slots.listSlots(),
     };
     await withClaudeSwitchJournalOwner(options.journal, async () => {
       assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
@@ -161,6 +162,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => true,
+      slotInventory: () => subject.slots.listSlots(),
     };
     assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', options), {
       name: 'claude:switch-journal', level: 'PASS', message: 'in progress',
@@ -188,6 +190,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     }
     assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      slotInventory: () => subject.slots.listSlots(),
     }), {
       name: 'claude:switch-journal', level: 'PASS', message: 'finished',
     });
@@ -216,6 +219,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => false,
+      slotInventory: () => subject.slots.listSlots(),
     };
     const result = await claudeSwitchJournalCheck(dbPath, 'cutover', options);
     assert.equal(result.level, 'FAIL');
@@ -231,6 +235,71 @@ describe('Claude switch journal reconciliation (G10)', () => {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
     });
     assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' });
+  });
+
+  it('rejects unknown journal identities before forward, back, or crash reconciliation writes', async () => {
+    const invalidFields: Array<Partial<ClaudeSwitchJournal>> = [
+      { from: 'sk-ant-token-like-journal-identity' },
+      { from: 'prose-like journal identity that must not be persisted' },
+      { to: 'sk-ant-token-like-journal-target' },
+      { to: 'prose-like journal target that must not be persisted' },
+      { trigger: 'sk-ant-token-like-journal-trigger' },
+      { trigger: 'prose-like journal trigger that must not be persisted' },
+    ];
+
+    for (const patch of invalidFields) {
+      for (const direction of ['back', 'forward'] as const) {
+        const subject = await fixture();
+        await install(subject, journal(subject, patch));
+        const before = readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8');
+        assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, direction), {
+          outcome: 'refused', reason: 'journal-identity-invalid',
+        });
+        assert.deepEqual(subject.rows, []);
+        assert.deepEqual(subject.commits, []);
+        assert.equal(readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'), before);
+      }
+
+      const subject = await fixture();
+      await install(subject, journal(subject, patch));
+      const before = readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8');
+      await reconcileClaudeSwitch(subject.deps);
+      assert.deepEqual(subject.rows, []);
+      assert.deepEqual(subject.commits, []);
+      assert.equal(readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'), before);
+    }
+  });
+
+  it('allows archived slots and the parked autoswitch compatibility trigger in recovery journals', async () => {
+    const subject = await fixture();
+    await install(subject, journal(subject, { trigger: 'parked' }));
+    const listSlots = subject.slots.listSlots.bind(subject.slots);
+    subject.slots.listSlots = () => listSlots().map((slot) => (
+      slot.accountId === 'b' ? { ...slot, archivedAt: NOW } : slot
+    ));
+
+    assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
+    assert.deepEqual(subject.rows.map((row) => [row.fromAccount, row.toAccount, row.trigger]), [['a', 'b', 'parked']]);
+  });
+
+  it('doctor reports an invalid journal without exposing its identity fields', async () => {
+    const subject = await fixture();
+    const injected = {
+      from: 'sk-ant-token-like-doctor-from',
+      to: 'prose-like doctor target that must not be displayed',
+      trigger: 'prose-like doctor trigger that must not be displayed',
+    };
+    await install(subject, journal(subject, injected));
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    openStore(dbPath).close();
+
+    const result = await claudeSwitchJournalCheck(dbPath, 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+      slotInventory: () => subject.slots.listSlots(),
+    });
+
+    assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'invalid journal' });
+    for (const value of Object.values(injected)) assert.equal(result.message.includes(value), false);
   });
 
   it('journal resolve reports lock contention as a refusal instead of usage failure', async () => {

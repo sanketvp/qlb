@@ -3,6 +3,7 @@ import {
   claudeSwitchJournalPath,
   probeClaudeSwitchJournalOwner,
   readClaudeSwitchJournal,
+  validateClaudeSwitchJournalIdentity,
   type ClaudeSwitchJournal,
   type ClaudeSwitchJournalOptions,
 } from '../cc-switch-journal';
@@ -22,6 +23,8 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 export interface ClaudeSwitchJournalCheckOptions {
   journal?: ClaudeSwitchJournalOptions;
   ownerIsLive?: (owner: ClaudeSwitchJournal['owner']) => Promise<boolean>;
+  /** Test seam for the complete live and historical Claude-slot inventory. */
+  slotInventory?: () => Iterable<{ accountId: string }>;
 }
 
 function journalOptions(options: ClaudeSwitchJournalCheckOptions): ClaudeSwitchJournalOptions {
@@ -38,6 +41,16 @@ export function isClaudeSwitchJournalCommitted(dbPath: string, attemptId: string
       WHERE provider = 'anthropic' AND committed_at IS NOT NULL
         AND CASE WHEN json_valid(steps_json) THEN json_extract(steps_json, '$.attempt') END = ?
       LIMIT 1`).get(attemptId) !== undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function claudeSlotInventory(dbPath: string, options: ClaudeSwitchJournalCheckOptions): Iterable<{ accountId: string }> {
+  if (options.slotInventory) return options.slotInventory();
+  const db = openStoreConnection(dbPath, true);
+  try {
+    return db.prepare('SELECT account_id AS accountId FROM claude_slots').all() as { accountId: string }[];
   } finally {
     db.close();
   }
@@ -66,6 +79,9 @@ export async function claudeSwitchJournalCheck(
   if (read.state === 'malformed') return { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' };
 
   try {
+    if (!validateClaudeSwitchJournalIdentity(read.journal, claudeSlotInventory(dbPath, options))) {
+      return { name: 'claude:switch-journal', level: 'FAIL', message: 'invalid journal' };
+    }
     if (read.journal.committed !== undefined || read.journal.closed !== null || isClaudeSwitchJournalCommitted(dbPath, read.journal.attemptId)) {
       return { name: 'claude:switch-journal', level: 'PASS', message: 'finished' };
     }

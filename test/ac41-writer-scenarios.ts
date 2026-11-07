@@ -586,6 +586,9 @@ export async function runJournalResolve(): Promise<ScenarioArtifacts> {
     const repository = SqliteClaudeSlotRepository.open(dbPath);
     try {
       const slots = new ClaudeSlots({ backend, repository, stashDir: join(dir, 'unclaimed'), now: () => now });
+      for (const id of ['ac41-from-slot', 'ac41-to-slot']) {
+        await slots.createSlot({ accountId: id, credential: credentialWithFixtureAccess(id, `fixture-refresh-${id}`, now + 3_600_000), email: `${id}@example.test`, orgUuid: `org-${id}`, configJson: JSON.stringify({ oauthAccount: { accountUuid: id } }), source: 'cswap-import' });
+      }
       const options = { home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService };
       createClaudeSwitchJournal({
         v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: 'ac41-from-slot', to: 'ac41-to-slot', trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: AC41_BODY,

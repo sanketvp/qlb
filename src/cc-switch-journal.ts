@@ -2,7 +2,7 @@ import { chmodSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSy
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { type JsonObject } from './anthropic-oauth';
-import { type ClaudeSlotBackend } from './cc-slots';
+import { type ClaudeSlot, type ClaudeSlotBackend } from './cc-slots';
 import { withProperLockfile, type HeldProperLockfile } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
 import { atomicWriteText, errno, fsyncDirSync } from './fsutil';
@@ -13,6 +13,15 @@ const JOURNAL_FILE = 'switch-anthropic.json';
 const OWNER_LOCK_STALENESS_MS = 300_000;
 const OWNER_LOCK_TIMEOUT_MS = 10_000;
 const STAGED_PREFIX = 'qlb:anthropic:staged-rollback:';
+const JOURNAL_TRIGGER_ALLOWLIST = new Set([
+  'manual',
+  'proactive',
+  'at-limit',
+  'failover',
+  'consume-first',
+  // Kept for journals written when autoswitch parked a switch decision.
+  'parked',
+]);
 const journalOwnerHandle = Symbol('claude-switch-journal-owner');
 
 export type ClaudeSwitchDecision = {
@@ -64,6 +73,17 @@ export type ClaudeSwitchJournalRead =
 export interface ClaudeSwitchJournalExpected {
   configPath: string;
   keychainService: string;
+}
+
+/** Validate recovery identities against the complete persisted Claude-slot inventory. */
+export function validateClaudeSwitchJournalIdentity(
+  journal: Pick<ClaudeSwitchJournal, 'from' | 'to' | 'trigger'>,
+  slots: Iterable<Pick<ClaudeSlot, 'accountId'>>,
+): boolean {
+  if (!JOURNAL_TRIGGER_ALLOWLIST.has(journal.trigger)) return false;
+  const accountIds = new Set<string>();
+  for (const slot of slots) accountIds.add(slot.accountId);
+  return accountIds.has(journal.from) && accountIds.has(journal.to);
 }
 
 export interface ClaudeSwitchJournalPathOptions {
