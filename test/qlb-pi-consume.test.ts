@@ -94,7 +94,10 @@ describe('qlb-pi mode decision', () => {
       CONSUME_ERRORS.stateInconsistent,
     );
     assert.equal(parseConsumeStatus(0, '{"state":"CONSUMED"}'), 'CONSUMED');
+    assert.equal(parseConsumeStatus(0, '{"state":"NATIVE"}'), 'NATIVE');
     assert.equal(parseConsumeStatus(1, '{"state":"CONSUMED"}'), 'unknown');
+    assert.equal(parseConsumeStatus(0, 'garbage'), 'unknown');
+    assert.equal(parseConsumeStatus(0, '{"state":"QLB_OWNED"}'), 'unknown');
   });
 
   it('consults the journal unless QLB was never used', () => {
@@ -119,6 +122,8 @@ describe('qlb-pi mode decision', () => {
     assert.equal(readOwnerFileState(join(dir, 'valid.json')), 'valid');
     writeFileSync(join(dir, 'invalid.json'), '{not json');
     assert.equal(readOwnerFileState(join(dir, 'invalid.json')), 'malformed');
+    writeFileSync(join(dir, 'array.json'), '[]');
+    assert.equal(readOwnerFileState(join(dir, 'array.json')), 'malformed');
     mkdirSync(join(dir, 'directory.json'));
     assert.equal(readOwnerFileState(join(dir, 'directory.json')), 'malformed');
   });

@@ -18,8 +18,6 @@ export { redactEvent, redactSecrets } from "../../src/redact.js";
 export const CONSUME_ERRORS = {
   quotaUnavailable:
     "QLB Anthropic consume unavailable: no fresh provider-attributable quota reading",
-  disabled:
-    "QLB cswap consume is no longer enabled; restart Pi to return to its own Anthropic provider",
   conflict:
     "QLB ownership conflict: Pi's Anthropic accounts are QLB-owned (or unknown) while cswap consume is enabled. " +
     "Run `qlb consume disable --provider anthropic` or `qlb migrate rollback --provider anthropic`, then restart Pi.",
