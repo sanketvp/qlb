@@ -20,9 +20,12 @@ import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
 import { createClaudeSwitchJournal } from '../src/cc-switch-journal';
 import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
 import { defaultConfig } from '../src/config';
+import { doctorQlb } from '../src/diagnostics';
 import { MockKeychain } from '../src/keychain';
 import type { CommandContext } from '../src/registry';
 import { recordRelogin } from '../src/relogin';
+import { recordStash } from '../src/unclaimed-index';
+import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { openStore } from '../src/store';
 
 /** The three synthetic AC41 fixtures. They are fake and never read from the environment. */
@@ -246,7 +249,12 @@ export type DoctorArtifacts = { level: string | null; message: string | null; te
  * run appends health history; the newest failing_json row is returned. Test mode
  * disables Keychain clients, so no credential store is read.
  */
-async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbPath: string, cliEnv: NodeJS.ProcessEnv) => (() => void) | void): Promise<DoctorArtifacts> {
+async function runDoctorRow(
+  name: string,
+  phase: string,
+  seed: (dir: string, dbPath: string, cliEnv: NodeJS.ProcessEnv) => (() => void) | void | Promise<void>,
+  seams?: Pick<NonNullable<Parameters<typeof doctorQlb>[1]>, 'keychain' | 'claudeVersionRunner'>,
+): Promise<DoctorArtifacts> {
   const dir = root('doctor');
   try {
     mkdirSync(join(dir, 'plugins'));
@@ -264,7 +272,7 @@ async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbP
     try {
       db.prepare('INSERT INTO lifecycle (state, began_at, cutover_at, window_end) VALUES (?, 1, 1, 2)').run(phase);
     } finally { db.close(); }
-    const refresh = seed(dir, dbPath, cliEnv);
+    const refresh = await seed(dir, dbPath, cliEnv);
     const doctor = (args: string[]): string => {
       refresh?.();
       const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', ...args], { encoding: 'utf8', env: cliEnv, timeout: 120_000 });
@@ -272,7 +280,16 @@ async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbP
       return result.stdout;
     };
     const text = doctor([]);
-    const json = doctor(['--json']);
+    // Test mode disables Keychain clients and the Claude version process, so a
+    // row that reads either receives the AC41 body only through doctorQlb's
+    // injection seams. Its JSON report and health append then come from that
+    // in-process call; the CLI text above is still the real command output.
+    const json = seams === undefined
+      ? doctor(['--json'])
+      : JSON.stringify(await doctorQlb({ ...defaultConfig(dir), dbPath }, {
+        ...seams, appendHealthLog: true, command: () => '', hostCommand: () => '', hostPlatform: 'linux',
+        claudeUnclaimedStashDir: join(dir, '.qlb', 'unclaimed'), piProcessList: () => '',
+      }));
     const row = (JSON.parse(json) as { checks: Array<{ name: string; level: string; message: string }> }).checks.find((check) => check.name === name);
     const history = new DatabaseSync(dbPath, { readOnly: true });
     try {
@@ -362,4 +379,57 @@ export function runDoctorUnpersistedToken(): Promise<DoctorArtifacts> {
         VALUES (?, 1, 'ac41@example.test', '{}', 'sha256:ac41', 1)`).run(AC41_BODY);
     } finally { db.close(); }
   });
+}
+
+/** Row 3: the automatic-switching park marker holds the AC41 body. */
+export function runDoctorAutoParked(): Promise<DoctorArtifacts> {
+  return runDoctorRow('auto:parked', 'cutover', (_dir, dbPath) => {
+    const store = openStore(dbPath);
+    try { store.setConfig('auto.anthropic.parkedUntil', AC41_BODY); } finally { store.close(); }
+  });
+}
+
+/** Row 9: a live Claude slot whose stored credential is the AC41 body (via the injected Keychain). */
+export function runDoctorLoginExpiry(): Promise<DoctorArtifacts> {
+  const keychain = new MockKeychain();
+  keychain.setSync(qlbKeychainService('anthropic', 'ac41-slot'), QLB_KEYCHAIN_ACCOUNT, AC41_BODY);
+  return runDoctorRow('claude:login-expiry', 'cutover', (_dir, dbPath) => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at)
+        VALUES ('ac41-slot', 1, 'ac41@example.test', '{}', 'sha256:ac41', 1)`).run();
+    } finally { db.close(); }
+  }, { keychain });
+}
+
+export const AC41_STASH_ID = '2025-01-01T00-00-00.000Z-ac41';
+
+/** Row 10: a 30-day-old unclaimed Claude stash whose stored body file holds the AC41 body. */
+export function runDoctorUnclaimed(): Promise<DoctorArtifacts> {
+  return runDoctorRow('claude:unclaimed', 'cutover', async (dir) => {
+    const stashRoot = join(dir, '.qlb', 'unclaimed');
+    await recordStash(stashRoot, {
+      provider: 'anthropic', accountId: 'ac41-slot', stashId: AC41_STASH_ID, consumedFp: 'sha256:ac41', location: 'file', createdAt: Date.UTC(2025, 0, 1),
+    });
+    mkdirSync(join(stashRoot, 'anthropic'), { recursive: true });
+    writeFileSync(join(stashRoot, 'anthropic', `${AC41_STASH_ID}.json`), AC41_BODY);
+  });
+}
+
+/** Row 12: an abandoned QLB atomic-write temp whose contents are the AC41 body. */
+export function runDoctorStrayTemps(): Promise<DoctorArtifacts> {
+  return runDoctorRow('fs:stray-temps', 'cutover', (dir) => {
+    const path = join(dir, '.qlb-ac41.999999999.aaaaaaaaaaaaaaaa.tmp');
+    writeFileSync(path, AC41_BODY);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(path, old, old);
+  });
+}
+
+/** Row 13: a recorded Claude version sentinel and an installed-version probe that prints the AC41 body. */
+export function runDoctorVersionDrift(): Promise<DoctorArtifacts> {
+  return runDoctorRow('claude:version-drift', 'cutover', (_dir, dbPath) => {
+    const store = openStore(dbPath);
+    try { store.setConfig('sentinel.claudeCodeVersion', 'Claude Code 1.0.0'); } finally { store.close(); }
+  }, { claudeVersionRunner: () => AC41_BODY });
 }

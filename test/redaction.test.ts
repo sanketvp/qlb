@@ -5,6 +5,7 @@ import { redactError, redactEvent, redactJson, redactKeyValueText, redactSecrets
 import {
   AC41_BODY, AC41_FIXTURES, leakedFixtures, runAutoThrownTick, runDoctorClaudeActive, runDoctorJournalInProgress, runDoctorSwitchJournal,
   runDoctorUndoIncomplete, runDoctorUndoLineage, runDoctorUnpersistedToken, runPoll4xx, runReportCutover, runStatusHistory, runSwitchStep7,
+  AC41_STASH_ID, runDoctorAutoParked, runDoctorLoginExpiry, runDoctorStrayTemps, runDoctorUnclaimed, runDoctorVersionDrift,
   type DoctorArtifacts,
 } from './ac41-writer-scenarios';
 
@@ -454,6 +455,54 @@ describe('AC41 writer sweep', () => {
       assert.match(artifacts.message ?? '', /^unpersisted Claude token evidence without later recovery: ac41-failure-pad .*; re-login affected slot\(s\)$/);
       assert.equal(artifacts.historyHasRow, true);
       assertDoctorClean(artifacts, 'claude:unpersisted-token');
+    });
+
+    // Doctor advisory rows (HP-H3-12C). Every one is a non-propagation control:
+    // the AC41 body sits at the row's real input but the check normalizes or never
+    // reads it, so these assert the fixed artifact and zero forwarding and do not
+    // claim a redactor ran. These rows are advisory (WARN outside the S64 blocking
+    // list, or claude:login-expiry, which S64 always excludes), so their history
+    // assertion is exact absence from failing_json, never persistence.
+    await t.test('row 3 doctor auto:parked: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorAutoParked();
+      assert.equal(artifacts.level, 'WARN');
+      assert.equal(artifacts.message, 'parked marker unreadable');
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'auto:parked');
+    });
+
+    await t.test('row 9 doctor claude:login-expiry: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorLoginExpiry();
+      assert.equal(artifacts.level, 'WARN');
+      assert.equal(artifacts.message, 'Claude credential unreadable for slot ac41-slot');
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'claude:login-expiry');
+    });
+
+    await t.test('row 10 doctor claude:unclaimed: fixed text/JSON; absent from failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorUnclaimed();
+      assert.equal(artifacts.level, 'WARN');
+      assert.equal(artifacts.message, `1 unclaimed Claude stash(es) older than 30 days: qlb claude restore-unclaimed ${AC41_STASH_ID} ac41-slot`);
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'claude:unclaimed');
+    });
+
+    await t.test('row 12 doctor fs:stray-temps: path-only text/JSON; absent from failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorStrayTemps();
+      assert.equal(artifacts.level, 'WARN');
+      assert.match(artifacts.message ?? '', /^1 stray temporary file found: \/.*\/\.qlb-ac41\.999999999\.aaaaaaaaaaaaaaaa\.tmp$/);
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'fs:stray-temps');
+    });
+
+    await t.test('row 13 doctor claude:version-drift: text/JSON; absent from failing_json (non-propagation control)', async () => {
+      // readClaudeVersion redacts the probe output before this row is built, so a
+      // single bypass of the doctor boundary cannot expose a fixture here.
+      const artifacts = await runDoctorVersionDrift();
+      assert.equal(artifacts.level, 'WARN');
+      assert.match(artifacts.message ?? '', /^Claude Code version drift: recorded Claude Code 1\.0\.0; installed ac41-failure-pad /);
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'claude:version-drift');
     });
   });
 });
