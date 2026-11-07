@@ -37,6 +37,7 @@ import {
   probeClaudeSwitchJournalOwner,
   readClaudeSwitchJournal,
   stagedRollbackService,
+  validateClaudeSwitchJournalIdentity,
   updateClaudeSwitchJournal,
   withClaudeSwitchJournalOwner,
   writeStagedRollback,
@@ -58,7 +59,7 @@ import type { Store } from './store';
 export type ClaudeSwitchPreconditionReason =
   | 'active-login-unset' | 'target-missing' | 'target-dead' | 'target-archived'
   | 'breaker-open' | 'cswap-process-alive' | 'cswap-process-check-failed'
-  | 'republish-not-active' | 'republish-live-not-own';
+  | 'republish-not-active' | 'republish-live-not-own' | 'journal-identity-invalid';
 
 export type ClaudeSwitchPhaseAReason = ClaudeSwitchPreconditionReason | 'claude:config-file'
   | 'live-credential-empty' | 'live-credential-unreadable' | 'target-unreadable' | `freshen-${string}`;
@@ -445,6 +446,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
   const options = journalOptions(deps, paths);
   const before = readClaudeSwitchJournal(options);
   if (before.state === 'malformed') return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-malformed');
+  if (before.state === 'ok' && !validateClaudeSwitchJournalIdentity(before.journal, deps.slots.listSlots())) {
+    return refusal(deps, input, attempt, activeAccount(deps), 'journal-identity-invalid');
+  }
   if (before.state === 'ok') {
     const probe = (deps.probeOwner ?? probeClaudeSwitchJournalOwner)({ journalDir: deps.journalDir, home: deps.home, env: deps.env });
     const same = probe === 'held' ? true : await (deps.stillTheSameProcess ?? stillTheSameProcess)(before.journal.owner);
@@ -474,6 +478,9 @@ async function switchClaudeAttempt(deps: ClaudeSwitchDeps, input: SwitchClaudeIn
           // Step 4: lock-authoritative journal cleanup and all mutable re-reads.
           const inside = readClaudeSwitchJournal(options);
           if (inside.state === 'malformed') return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-malformed');
+          if (inside.state === 'ok' && !validateClaudeSwitchJournalIdentity(inside.journal, deps.slots.listSlots())) {
+            return refusal(deps, input, attempt, activeAccount(deps), 'journal-identity-invalid');
+          }
           if (inside.state === 'ok') {
             const done = inside.journal.committed !== undefined || inside.journal.closed !== null || deps.store.findCommittedSwitchByAttempt('anthropic', inside.journal.attemptId) !== null;
             if (!done) return refusal(deps, input, attempt, activeAccount(deps), 'switch-journal-present');

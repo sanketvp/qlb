@@ -9,7 +9,7 @@ import { credential as claudeCredential } from './support/claude-fixtures';
 
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
-import { ClaudeSlots, InMemoryClaudeSlotRepository } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import {
   claudeSwitchJournalPath,
   createClaudeSwitchJournal,
@@ -105,6 +105,15 @@ function journalExists(subject: Subject): boolean {
   return existsSync(join(subject.deps.journalDir!, 'switch-anthropic.json'));
 }
 
+function seedDoctorSlotInventory(dbPath: string): void {
+  const repository = SqliteClaudeSlotRepository.open(dbPath);
+  try {
+    for (const accountId of ['a', 'b']) {
+      repository.createSlot({ accountId, fingerprint: null, prevFingerprint: null, addedAt: NOW });
+    }
+  } finally { repository.close(); }
+}
+
 function wrappedBackend(backend: MockKeychain, overrides: Partial<ClaudeSwitchDeps['live']['backend']>): ClaudeSwitchDeps['live']['backend'] {
   return {
     kind: 'test-memory',
@@ -141,6 +150,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => false,
@@ -158,6 +168,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
     const options = {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
       ownerIsLive: async () => true,
@@ -186,6 +197,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     } finally {
       store.close();
     }
+    seedDoctorSlotInventory(dbPath);
     assert.deepEqual(await claudeSwitchJournalCheck(dbPath, 'cutover', {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
     }), {
@@ -211,6 +223,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     } finally {
       store.close();
     }
+    seedDoctorSlotInventory(dbPath);
     const path = claudeSwitchJournalPath({ journalDir: subject.deps.journalDir });
     const before = createHash('sha256').update(readFileSync(path)).digest('hex');
     const options = {
@@ -231,6 +244,86 @@ describe('Claude switch journal reconciliation (G10)', () => {
       journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
     });
     assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'malformed' });
+  });
+
+  it('rejects unknown journal identities before forward, back, or crash reconciliation writes', async () => {
+    const invalidFields: Array<Partial<ClaudeSwitchJournal>> = [
+      { from: 'sk-ant-token-like-journal-identity' },
+      { from: 'prose-like journal identity that must not be persisted' },
+      { to: 'sk-ant-token-like-journal-target' },
+      { to: 'prose-like journal target that must not be persisted' },
+      { trigger: 'sk-ant-token-like-journal-trigger' },
+      { trigger: 'prose-like journal trigger that must not be persisted' },
+    ];
+
+    for (const patch of invalidFields) {
+      for (const direction of ['back', 'forward'] as const) {
+        const subject = await fixture();
+        await install(subject, journal(subject, patch));
+        const before = readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8');
+        assert.deepEqual(await resolveClaudeSwitchJournal(subject.deps, direction), {
+          outcome: 'refused', reason: 'journal-identity-invalid',
+        });
+        assert.deepEqual(subject.rows, []);
+        assert.deepEqual(subject.commits, []);
+        assert.equal(readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'), before);
+      }
+
+      const subject = await fixture();
+      await install(subject, journal(subject, patch));
+      const before = readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8');
+      await reconcileClaudeSwitch(subject.deps);
+      assert.deepEqual(subject.rows, []);
+      assert.deepEqual(subject.commits, []);
+      assert.equal(readFileSync(claudeSwitchJournalPath({ journalDir: subject.deps.journalDir }), 'utf8'), before);
+    }
+  });
+
+  it('allows archived slots and the current parked autoswitch trigger in recovery journals', async () => {
+    const subject = await fixture();
+    await install(subject, journal(subject, { trigger: 'parked' }));
+    const listSlots = subject.slots.listSlots.bind(subject.slots);
+    subject.slots.listSlots = () => listSlots().map((slot) => (
+      slot.accountId === 'b' ? { ...slot, archivedAt: NOW } : slot
+    ));
+
+    assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
+    assert.deepEqual(subject.rows.map((row) => [row.fromAccount, row.toAccount, row.trigger]), [['a', 'b', 'parked']]);
+  });
+
+  it('propagates slot inventory failures rather than treating them as invalid journals', async () => {
+    for (const recover of [
+      (subject: Subject) => resolveClaudeSwitchJournal(subject.deps, 'back'),
+      (subject: Subject) => reconcileClaudeSwitch(subject.deps),
+    ]) {
+      const subject = await fixture();
+      await install(subject);
+      subject.slots.listSlots = () => { throw new Error('slot inventory unavailable'); };
+
+      await assert.rejects(recover(subject), /slot inventory unavailable/);
+      assert.deepEqual(subject.rows, []);
+      assert.deepEqual(subject.commits, []);
+    }
+  });
+
+  it('doctor reports an invalid journal without exposing its identity fields', async () => {
+    const subject = await fixture();
+    const injected = {
+      from: 'sk-ant-token-like-doctor-from',
+      to: 'prose-like doctor target that must not be displayed',
+      trigger: 'prose-like doctor trigger that must not be displayed',
+    };
+    await install(subject, journal(subject, injected));
+    const dbPath = join(subject.root, 'qlb.sqlite');
+    openStore(dbPath).close();
+    seedDoctorSlotInventory(dbPath);
+
+    const result = await claudeSwitchJournalCheck(dbPath, 'cutover', {
+      journal: { journalDir: subject.deps.journalDir, home: subject.home, env: subject.env, configPath: subject.paths.globalConfigPath, keychainService: subject.paths.keychainService },
+    });
+
+    assert.deepEqual(result, { name: 'claude:switch-journal', level: 'FAIL', message: 'invalid journal' });
+    for (const value of Object.values(injected)) assert.equal(result.message.includes(value), false);
   });
 
   it('journal resolve reports lock contention as a refusal instead of usage failure', async () => {
@@ -762,6 +855,7 @@ describe('Claude switch journal reconciliation (G10)', () => {
     const dbPath = join(subject.root, 'qlb.sqlite');
     const store = openStore(dbPath);
     store.close();
+    seedDoctorSlotInventory(dbPath);
 
     assert.equal(await runPiGate('anthropic', {
       dbPath, env: subject.env, guard: () => true, admitted: () => ({ ok: true }),

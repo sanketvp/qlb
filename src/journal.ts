@@ -12,6 +12,7 @@ import {
   probeClaudeSwitchJournalOwner,
   updateClaudeSwitchJournal,
   readClaudeSwitchJournal,
+  validateClaudeSwitchJournalIdentity,
   withClaudeSwitchJournalOwner,
   type ClaudeSwitchJournal,
   type ClaudeSwitchJournalOptions,
@@ -43,6 +44,10 @@ async function ownerIsLive(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal)
   return (deps.stillTheSameProcess ?? stillTheSameProcess)(journal.owner);
 }
 
+function journalIdentityValid(deps: ClaudeSwitchDeps, journal: ClaudeSwitchJournal): boolean {
+  return validateClaudeSwitchJournalIdentity(journal, deps.slots.listSlots());
+}
+
 export type ClaudeJournalResolveDirection = 'forward' | 'back';
 export type ClaudeJournalResolveResult = { outcome: 'resolved' | 'refused'; reason?: string; fingerprints?: string[]; cleanup?: string[] };
 
@@ -70,6 +75,7 @@ export async function resolveClaudeSwitchJournal(
   const options = optionsFor(deps);
   const initial = readClaudeSwitchJournal(options);
   if (initial.state !== 'ok') return { outcome: 'refused', reason: initial.state === 'absent' ? 'journal-absent' : 'journal-malformed' };
+  if (!journalIdentityValid(deps, initial.journal)) return { outcome: 'refused', reason: 'journal-identity-invalid' };
   if (finished(deps, initial.journal)) return { outcome: 'refused', reason: 'journal-finished' };
   if (probeClaudeSwitchJournalOwner(options) === 'held' || await ownerIsLive(deps, initial.journal)) return { outcome: 'refused', reason: 'owner-alive' };
   const paths = deps.live.paths ?? claudePaths({ home: deps.live.home ?? deps.home, env: deps.live.env ?? deps.env });
@@ -85,6 +91,7 @@ export async function resolveClaudeSwitchJournal(
     const reread = readClaudeSwitchJournal(options);
     if (reread.state !== 'ok') return { outcome: 'refused', reason: reread.state === 'absent' ? 'journal-absent' : 'journal-malformed' };
     const journal = reread.journal;
+    if (!journalIdentityValid(deps, journal)) return { outcome: 'refused', reason: 'journal-identity-invalid' };
     if (finished(deps, journal)) return { outcome: 'refused', reason: 'journal-finished' };
     if (await ownerIsLive(deps, journal)) return { outcome: 'refused', reason: 'owner-alive' };
     const lockedCswap = checkClaudeCswapProcessPrecondition(deps);
@@ -195,7 +202,7 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
   const initial = readClaudeSwitchJournal(options);
   // An absent, malformed, completed, or live-owned journal is left for the
   // normal switch path. In particular, malformed journals remain fail-closed.
-  if (initial.state !== 'ok' || finished(deps, initial.journal)
+  if (initial.state !== 'ok' || !journalIdentityValid(deps, initial.journal) || finished(deps, initial.journal)
     || probeClaudeSwitchJournalOwner(options) === 'held'
     || await ownerIsLive(deps, initial.journal)) return;
 
@@ -211,7 +218,8 @@ export async function reconcileClaudeSwitch(deps: ClaudeSwitchDeps): Promise<voi
     await credentialLock({ configDir: paths.configHome, env: deps.env }, async (credentialHeld) => {
       await ownerLock(options, async (ownerHeld) => {
         const reread = readClaudeSwitchJournal(options);
-        if (reread.state !== 'ok' || finished(deps, reread.journal) || await ownerIsLive(deps, reread.journal)) return;
+        if (reread.state !== 'ok' || !journalIdentityValid(deps, reread.journal)
+          || finished(deps, reread.journal) || await ownerIsLive(deps, reread.journal)) return;
         const journal = reread.journal;
         const lockedCswapProcessReason = checkClaudeCswapProcessPrecondition(deps);
         if (lockedCswapProcessReason !== null) {

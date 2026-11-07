@@ -419,10 +419,10 @@ describe('AC41 writer sweep', () => {
       for (const key of ['message', 'text', 'json', 'history'] as const) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
     };
 
-    await sweepRow('row 4 doctor claude:switch-journal: text/JSON and failing_json (redaction proof)', async () => {
+    await sweepRow('row 4 doctor claude:switch-journal: unfinished journals redact text/JSON and failing_json', async () => {
       const artifacts = await runDoctorSwitchJournal();
       assert.equal(artifacts.level, 'FAIL');
-      assert.match(artifacts.message ?? '', /^unfinished Claude switch journal .*attemptId=ac41-attempt step=7 from=.*ac41-failure-pad.* to=.*ac41-failure-pad.*; run qlb claude journal resolve --forward or qlb claude journal resolve --back$/);
+      assert.match(artifacts.message ?? '', /^unfinished Claude switch journal .*attemptId=.*ac41-failure-pad.* step=7 from=ac41-from-slot to=ac41-to-slot; run qlb claude journal resolve --forward or qlb claude journal resolve --back$/);
       assert.equal(artifacts.historyHasRow, true);
       assertDoctorClean(artifacts, 'claude:switch-journal');
     });
@@ -574,7 +574,7 @@ describe('AC41 writer sweep', () => {
     await sweepRow('row 21 Claude journal rollback output and switch_log row (non-propagation control)', async () => {
       const artifacts = await runJournalResolve();
       assert.equal(artifacts.backCode, '0');
-      assert.equal(artifacts.backStdout, 'Claude journal resolved back');
+      assert.match(artifacts.backStdout ?? '', /^Claude journal resolved back \([0-9a-f]{12}\)$/);
       assert.deepEqual(JSON.parse(artifacts.switchRows ?? ''), [{ from_account: 'ac41-from-slot', to_account: 'ac41-to-slot', detail: 'journal-back', error: null, steps_json: JSON.stringify({ attempt: 'ac41-attempt' }) }]);
       assertClean(artifacts);
     });

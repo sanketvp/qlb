@@ -108,7 +108,7 @@ async function reconcileFixture(owner: ClaudeSwitchJournal['owner'], sameProcess
       recordSwitch: (row: Record<string, unknown>) => { rows.push(row); return rows.length; },
     } as unknown as ClaudeSwitchDeps['store'],
 
-    slots: {} as ClaudeSwitchDeps['slots'],
+    slots: { listSlots: () => [{ accountId: 'a' }, { accountId: 'b' }] } as ClaudeSwitchDeps['slots'],
     live: { backend: new MockKeychain(), paths, account: 'fixture' },
     readConfig: () => ({}), resolveProfile: async () => null,
     consume: { postRefresh: async () => ({ status: 500, body: '' }) },
