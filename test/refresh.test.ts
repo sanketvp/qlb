@@ -817,7 +817,7 @@ describe('qlb refresh observation recording', () => {
     }
   });
 
-  it('partial refresh keeps the healthy account selectable and labels the failed one', async () => {
+  it('partial refresh leaves accounts unavailable without provider-authoritative readings', async () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-refresh-partial-'));
     const pluginsDir = join(root, 'plugins');
     mkdirSync(pluginsDir);
