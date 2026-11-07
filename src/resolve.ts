@@ -2,10 +2,12 @@ import type { AccountSnapshot } from './types';
 import {
   ALL_IN_CEILING,
   providerForModel,
+  relevantBuckets,
   scoreAccount,
   type Strategy,
 } from './scoring';
 import { findUniqueCodexAlias, isFullyExhausted, pickAccount } from './strategies';
+import { currentProviderObservation, failedProviderAttemptAfterReadings, routingAuthority } from './routing-authority';
 import { ROUTING_DECISION_MODES, type Store } from './store';
 
 export { ROUTING_DECISION_MODES };
@@ -54,6 +56,15 @@ export interface ResolveExhausted {
   decisionId?: number;
 }
 
+export interface ResolveUnavailable {
+  ok: false;
+  error: 'UNAVAILABLE';
+  requestedModel: string;
+  reason: string;
+  candidates: AccountSnapshot[];
+  decisionId?: number;
+}
+
 export interface ResolvePinnedUnavailable {
   ok: false;
   error: 'PINNED_UNAVAILABLE';
@@ -63,12 +74,32 @@ export interface ResolvePinnedUnavailable {
   decisionId?: number;
 }
 
-export type ResolveDecision = ResolveOk | ResolveExhausted | ResolvePinnedUnavailable;
+export type ResolveDecision = ResolveOk | ResolveExhausted | ResolveUnavailable | ResolvePinnedUnavailable;
 
-export function findEarliestReset(snapshots: AccountSnapshot[]): EarliestReset | null {
+export const PROVIDER_REFRESH_REQUIRED = 'fresh provider quota reading required; run qlb refresh --allow-probe';
+
+function unavailableReason(model: string): string {
+  switch (providerForModel(model)) {
+    case 'xai':
+      return 'xAI quota readings are advisory and unavailable for routing';
+    case 'anthropic':
+      return 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available';
+    case 'openai-codex':
+      return 'fresh Codex provider quota reading required; wait for its auto poll or a quota-bearing proxy response';
+    default:
+      return PROVIDER_REFRESH_REQUIRED;
+  }
+}
+
+export function findEarliestReset(snapshots: AccountSnapshot[], model?: string): EarliestReset | null {
   let best: EarliestReset | null = null;
   for (const snap of snapshots) {
-    for (const [limitType, reading] of Object.entries(snap.buckets)) {
+    const buckets = model === undefined ? Object.entries(snap.buckets) : relevantBuckets(snap, model)
+      .flatMap((limitType) => {
+        const reading = snap.buckets[limitType];
+        return reading === undefined ? [] : [[limitType, reading] as const];
+      });
+    for (const [limitType, reading] of buckets) {
       if (reading.resetAt == null || !Number.isFinite(reading.resetAt)) continue;
       if (best === null || reading.resetAt < best.at) {
         best = { accountId: snap.accountId, at: reading.resetAt, limitType };
@@ -78,13 +109,53 @@ export function findEarliestReset(snapshots: AccountSnapshot[]): EarliestReset |
   return best;
 }
 
+function findEarliestResetForModels(candidates: Array<{ snapshot: AccountSnapshot; model: string }>): EarliestReset | null {
+  let best: EarliestReset | null = null;
+  for (const candidate of candidates) {
+    const reset = findEarliestReset([candidate.snapshot], candidate.model);
+    if (reset !== null && (best === null || reset.at < best.at)) best = reset;
+  }
+  return best;
+}
+
 export function snapshotsFromStore(store: Store, provider?: string): AccountSnapshot[] {
-  const accounts = store.listAccounts(provider);
-  return accounts.map((row) => ({
-    accountId: row.id,
-    provider: row.provider as AccountSnapshot['provider'],
-    label: row.label,
-    buckets: store.getAllSnapshots(row.id),
+  const accounts = store.listAccounts(provider).filter((row) =>
+    (row.status === 'active' || row.status === 'validated')
+    && store.isAccountLiveForRouting(row.provider, row.id) !== false);
+  const pollsByProvider = new Map<string, ReturnType<Store['listUsagePolls']>>();
+  return accounts.map((row) => {
+    const buckets = currentProviderObservation(store.getAllSnapshots(row.id));
+    let polls = pollsByProvider.get(row.provider);
+    if (!polls) {
+      polls = store.listUsagePolls(row.provider);
+      pollsByProvider.set(row.provider, polls);
+    }
+    return {
+      accountId: row.id,
+      provider: row.provider as AccountSnapshot['provider'],
+      label: row.label,
+      buckets,
+      ...(failedProviderAttemptAfterReadings(buckets, polls[row.id]) ? { failed: true } : {}),
+    };
+  });
+}
+
+function isLiveRoutingSnapshot(snapshot: AccountSnapshot): boolean {
+  return snapshot.error !== 'token_dead';
+}
+
+function serializeSnapshots(snapshots: AccountSnapshot[], now: number): Array<Record<string, unknown>> {
+  return snapshots.map((snapshot) => ({
+    accountId: snapshot.accountId,
+    provider: snapshot.provider,
+    buckets: Object.fromEntries(Object.entries(snapshot.buckets).map(([bucket, reading]) => [bucket, {
+      usedPct: reading.usedPct,
+      confidence: reading.confidence,
+      source: reading.source,
+      fetchedAt: reading.fetchedAt,
+      ageMs: reading.fetchedAt ? now - reading.fetchedAt : null,
+      resetAt: reading.resetAt,
+    }])),
   }));
 }
 
@@ -98,26 +169,17 @@ function snapshotJson(decision: ResolveDecision): string {
         reason: decision.reason,
       });
     }
+    if (decision.error === 'UNAVAILABLE') {
+      return JSON.stringify({
+        error: 'UNAVAILABLE',
+        reason: decision.reason,
+        candidates: serializeSnapshots(decision.candidates, now),
+      });
+    }
     return JSON.stringify({
       error: 'EXHAUSTED',
       earliestReset: decision.earliestReset,
-      candidates: decision.candidates.map((s) => ({
-        accountId: s.accountId,
-        provider: s.provider,
-        buckets: Object.fromEntries(
-          Object.entries(s.buckets).map(([k, v]) => [
-            k,
-            {
-              usedPct: v.usedPct,
-              confidence: v.confidence,
-              source: v.source,
-              fetchedAt: v.fetchedAt,
-              ageMs: v.fetchedAt ? now - v.fetchedAt : null,
-              resetAt: v.resetAt,
-            },
-          ]),
-        ),
-      })),
+      candidates: serializeSnapshots(decision.candidates, now),
     });
   }
   return JSON.stringify({
@@ -126,19 +188,7 @@ function snapshotJson(decision: ResolveDecision): string {
     label: decision.snapshot.label,
     score: decision.score,
     ceiling: decision.ceiling,
-    buckets: Object.fromEntries(
-      Object.entries(decision.snapshot.buckets).map(([k, v]) => [
-        k,
-        {
-          usedPct: v.usedPct,
-          confidence: v.confidence,
-          source: v.source,
-          fetchedAt: v.fetchedAt,
-          ageMs: v.fetchedAt ? now - v.fetchedAt : null,
-          resetAt: v.resetAt,
-        },
-      ]),
-    ),
+    buckets: serializeSnapshots([decision.snapshot], now)[0]!.buckets,
   });
 }
 
@@ -182,8 +232,8 @@ function record(store: Store | undefined, req: ResolveRequest, decision: Resolve
     effort: req.effort,
     served_model: null,
     account_id: null,
-    mode: 'exhausted',
-    reason: 'EXHAUSTED',
+    mode: decision.error === 'UNAVAILABLE' ? 'unavailable' : 'exhausted',
+    reason: decision.error === 'UNAVAILABLE' ? decision.reason : 'EXHAUSTED',
     snapshot_json: snapshotJson(decision),
     strategy: req.strategy ?? 'headroom',
     provider: providerForModel(req.model),
@@ -247,6 +297,10 @@ function resolvePinned(
     const candidateModel = chain[i];
     const provider = providerForModel(candidateModel);
     if (!provider || snap.provider !== provider) continue;
+    const authority = routingAuthority(snap, candidateModel);
+    if (!authority.eligible) {
+      return unavailable(`pinned account unavailable: ${pinnedId} ${unavailableReason(candidateModel)} (${authority.reason})`);
+    }
     if (isFullyExhausted(snap, candidateModel)) continue;
     const score = scoreAccount(snap, candidateModel, ALL_IN_CEILING);
     const substituted = i > 0;
@@ -291,7 +345,8 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
   if (pinned) return pinned;
 
   const { reserved, drainFirst } = activeOverrideSets(req.store);
-  let lastCandidates: AccountSnapshot[] = [];
+  let authorityCandidates: Array<{ snapshot: AccountSnapshot; model: string }> = [];
+  let blockingPool: { provider: string; model: string } | null = null;
 
   for (let i = 0; i < chain.length; i++) {
     const candidateModel = chain[i];
@@ -300,18 +355,24 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     const candidates = req.snapshots.filter(
       (s) =>
         s.provider === provider &&
+        isLiveRoutingSnapshot(s) &&
         !reserved.has(s.accountId) &&
         (req.store == null ||
           s.provider !== 'openai-codex' ||
           req.store.getAccount(s.accountId)?.provider === 'openai-codex'),
     );
-    lastCandidates = candidates;
+    const eligible = candidates.filter((snapshot) => routingAuthority(snapshot, candidateModel).eligible);
+    if (blockingPool === null && eligible.length !== candidates.length) {
+      blockingPool = { provider, model: candidateModel };
+    }
+    authorityCandidates = authorityCandidates.concat(eligible.map((snapshot) => ({ snapshot, model: candidateModel })));
     const picked = pickAccount(strategy, {
-      snapshots: candidates,
+      snapshots: eligible,
       model: candidateModel,
       session: req.session,
       store: req.store,
       drainFirstIds: drainFirst,
+      aliasSnapshots: candidates,
       persist: req.persist,
     });
     if (!picked) continue;
@@ -348,11 +409,25 @@ export function resolveFromSnapshots(req: ResolveRequest): ResolveDecision {
     return decision;
   }
 
+  if (authorityCandidates.length === 0 || blockingPool !== null) {
+    const unavailable: ResolveUnavailable = {
+      ok: false,
+      error: 'UNAVAILABLE',
+      requestedModel: req.model,
+      reason: blockingPool === null
+        ? unavailableReason(req.model)
+        : `${unavailableReason(blockingPool.model)} (${blockingPool.provider} ${blockingPool.model} pool requires a fresh provider reading)`,
+      candidates: req.snapshots,
+    };
+    unavailable.decisionId = record(req.store, req, unavailable);
+    return unavailable;
+  }
+
   const exhausted: ResolveExhausted = {
     ok: false,
     error: 'EXHAUSTED',
     requestedModel: req.model,
-    earliestReset: findEarliestReset(req.snapshots.length ? req.snapshots : lastCandidates),
+    earliestReset: findEarliestResetForModels(authorityCandidates),
     candidates: req.snapshots,
   };
   exhausted.decisionId = record(req.store, req, exhausted);

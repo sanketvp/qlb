@@ -39,7 +39,7 @@ interface StoredObservation {
 }
 
 const OBSERVATION_SOURCES: readonly ObservationSource[] = ['resolve', 'refresh', 'status'];
-const BUCKET_SOURCES = ['poll', 'headers', 'error'] as const;
+const BUCKET_SOURCES = ['provider-poll', 'provider-headers', 'poll', 'headers', 'plugin', 'error'] as const;
 const CONFIDENCES: readonly Confidence[] = ['authoritative', 'advisory', 'stale', 'unknown'];
 
 let observationWarnOnce = false;
@@ -79,6 +79,7 @@ function normalizeAccount(snapshot: AccountSnapshot): AccountSnapshot {
     out.failed = true;
     if (!out.error) out.error = 'failed';
   }
+  if (snapshot.probe) out.probe = { ...snapshot.probe };
   return out;
 }
 
@@ -160,6 +161,16 @@ function parseAccount(value: unknown, expectedProvider: string): AccountSnapshot
       snap.failed = true;
       if (!snap.error) snap.error = 'failed';
     }
+  }
+  if (a.probe !== undefined) {
+    if (!a.probe || typeof a.probe !== 'object') return null;
+    const outcome = (a.probe as { outcome?: unknown }).outcome;
+    if (outcome !== 'fetched' && outcome !== 'coalesced' && outcome !== 'cached-after-failure') return null;
+    const detail = (a.probe as { detail?: unknown }).detail;
+    if (detail !== undefined && typeof detail !== 'string') return null;
+    snap.probe = detail === undefined
+      ? { outcome }
+      : { outcome, detail };
   }
   return snap;
 }

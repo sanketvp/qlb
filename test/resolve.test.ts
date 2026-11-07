@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import type { AccountSnapshot, BucketReading, Confidence } from '../src/types';
 import { openStore } from '../src/store';
@@ -11,7 +15,7 @@ function reading(
 ): BucketReading {
   const r: BucketReading = {
     usedPct,
-    source: 'poll',
+    source: 'provider-poll',
     confidence,
     fetchedAt: Date.now(),
   };
@@ -32,15 +36,167 @@ function seed(
 }
 
 function codex(accountId: string): AccountSnapshot {
+  const reading: BucketReading = {
+    usedPct: 10,
+    source: 'provider-poll',
+    confidence: 'authoritative',
+    fetchedAt: Date.now(),
+  };
   return {
     accountId,
     provider: 'openai-codex',
     label: accountId,
-    buckets: {},
+    buckets: { primary: reading, secondary: { ...reading } },
   };
 }
 
 describe('qlb resolve — store-backed end-to-end', () => {
+  it('ignores an authoritative bucket superseded by a newer provider observation', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d:Opus', { ...reading(100), fetchedAt: now - 600_000 });
+    const decision = resolveFromSnapshots({
+      model: 'claude-opus-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, true);
+    if (decision.ok) assert.equal(decision.accountId, 'account');
+    store.close();
+  });
+
+  it('retains an older non-provider bucket as unavailable evidence', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now });
+    store.upsertSnapshot('account', '7d:Opus', { ...reading(10), source: 'poll', fetchedAt: now - 600_000 });
+    const decision = resolveFromSnapshots({
+      model: 'claude-opus-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
+    store.close();
+  });
+
+  it('keeps other fresh poll buckets after a partial provider header observation', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now - 60_000 });
+    store.upsertSnapshot('account', '7d', { ...reading(100), fetchedAt: now - 60_000 });
+    store.upsertSnapshot('account', '5h', { ...reading(10), source: 'provider-headers', fetchedAt: now });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('fails closed after a later failed provider poll and recovers after a reading', () => {
+    const store = openStore(':memory:');
+    const now = Date.now();
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: now - 10_000 });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: now - 10_000 });
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: Math.floor(now / 1000), status: 'http-500',
+    });
+    let decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
+    store.recordUsagePollResult('anthropic', 'account', {
+      attemptedAt: Math.floor(now / 1000),
+      status: 'ok',
+      readings: {
+        '5h': { ...reading(10), fetchedAt: now },
+        '7d': { ...reading(10), fetchedAt: now },
+      },
+    });
+    decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, true);
+    store.close();
+  });
+
+  it('excludes inactive accounts from store-backed pool measurement', () => {
+    const store = openStore(':memory:');
+    seed(store, 'active', { '5h': reading(100), '7d': reading(100) });
+    store.upsertAccount('handed-back', 'anthropic', 'handed-back', 'handed-back');
+    store.upsertSnapshot('handed-back', '5h', { ...reading(10), source: 'poll' });
+    store.upsertSnapshot('handed-back', '7d', { ...reading(10), source: 'poll' });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('excludes dead Anthropic slots from store-backed pool measurement', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-resolve-dead-')), 'qlb.db');
+    const initial = openStore(dbPath);
+    seed(initial, 'live', { '5h': reading(100), '7d': reading(100) });
+    seed(initial, 'dead', { '5h': { ...reading(10), source: 'poll' }, '7d': { ...reading(10), source: 'poll' } });
+    initial.close();
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT INTO claude_slots (account_id, config_json, dead, added_at) VALUES ('dead', '{}', 1, 1)").run();
+    db.close();
+    const store = openStore(dbPath);
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: snapshotsFromStore(store, 'anthropic'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('excludes dead Codex slots from store-backed pool measurement', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-resolve-codex-dead-')), 'qlb.db');
+    const initial = openStore(dbPath);
+    initial.upsertAccount('live', 'openai-codex', 'live');
+    initial.upsertAccount('dead', 'openai-codex', 'dead');
+    for (const accountId of ['live', 'dead']) {
+      initial.upsertSnapshot(accountId, 'primary', { ...reading(100), source: accountId === 'live' ? 'provider-poll' : 'poll' });
+      initial.upsertSnapshot(accountId, 'secondary', { ...reading(100), source: accountId === 'live' ? 'provider-poll' : 'poll' });
+    }
+    initial.close();
+    const db = new DatabaseSync(dbPath);
+    db.prepare("INSERT INTO codex_slots (account_id, chatgpt_user_id, chatgpt_account_id, dead, added_at) VALUES ('dead', 'u', 'a', 1, 1)").run();
+    db.close();
+    const store = openStore(dbPath);
+    const decision = resolveFromSnapshots({
+      model: 'gpt-5.1-codex',
+      snapshots: snapshotsFromStore(store, 'openai-codex'),
+      store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+    store.close();
+  });
+
+  it('excludes dead adapter snapshots from pool measurement', () => {
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5',
+      snapshots: [
+        { accountId: 'live', provider: 'anthropic', label: 'live', buckets: { '5h': reading(100), '7d': reading(100) } },
+        { accountId: 'dead', provider: 'anthropic', label: 'dead', buckets: {}, error: 'token_dead' },
+      ],
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'EXHAUSTED');
+  });
+
   it('normal resolve: picks the higher-scoring account (case 1 A vs B)', () => {
     const store = openStore(':memory:');
     seed(store, 'A', { '5h': reading(70), '7d': reading(20) }, 'account-A');
@@ -377,12 +533,7 @@ describe('qlb resolve — Codex bare-id aliases', () => {
 });
 
 describe('qlb resolve — Codex account ownership', () => {
-  const codexSnapshot: AccountSnapshot = {
-    accountId: 'fixture-user:fixture-account',
-    provider: 'openai-codex',
-    label: 'fixture-user:fixture-account',
-    buckets: {},
-  };
+  const codexSnapshot: AccountSnapshot = codex('fixture-user:fixture-account');
 
   it('resolve skips a Codex slot-id snapshot that has no accounts row', () => {
     const store = openStore(':memory:');
@@ -395,8 +546,10 @@ describe('qlb resolve — Codex account ownership', () => {
 
       assert.equal(decision.ok, false);
       if (decision.ok) return;
-      assert.equal(decision.error, 'EXHAUSTED');
-      assert.equal(store.listRoutingDecisions(1)[0]?.account_id, null);
+      assert.equal(decision.error, 'UNAVAILABLE');
+      const row = store.listRoutingDecisions(1)[0];
+      assert.equal(row?.mode, 'unavailable');
+      assert.equal(row?.account_id, null);
     } finally {
       store.close();
     }
@@ -447,7 +600,7 @@ describe('qlb resolve — Codex account ownership', () => {
     assert.equal(decision.accountId, codexSnapshot.accountId);
   });
 
-  it('non-Codex snapshots without an accounts row are unchanged', () => {
+  it('non-Codex snapshots without a provider quota reading are unavailable', () => {
     const store = openStore(':memory:');
     try {
       const xaiSnapshot: AccountSnapshot = {
@@ -462,9 +615,9 @@ describe('qlb resolve — Codex account ownership', () => {
         store,
       });
 
-      assert.equal(decision.ok, true);
-      if (!decision.ok) return;
-      assert.equal(decision.accountId, xaiSnapshot.accountId);
+      assert.equal(decision.ok, false);
+      if (decision.ok) return;
+      assert.equal(decision.error, 'UNAVAILABLE');
     } finally {
       store.close();
     }

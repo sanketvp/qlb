@@ -72,7 +72,7 @@ export function parseOpenRouterCredits(
       used: totalUsage,
       limit: totalCredits,
       remaining: totalCredits - totalUsage,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
       fetchedAt,
       detail: CREDIT_DETAIL,

@@ -85,7 +85,7 @@ function readingsFrom(parsed: ParsedUsageResponse, nowS: number): Record<string,
       usedPct: bucket.usedPct,
       ...(Number.isFinite(resetAt) ? { resetAt } : {}),
       fetchedAt,
-      source: 'poll' as const,
+      source: 'provider-poll' as const,
       confidence: 'authoritative' as const,
     }];
   }));

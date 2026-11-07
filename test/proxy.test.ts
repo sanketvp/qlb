@@ -65,6 +65,14 @@ async function startProxy(opts: {
 
 function seedAnthropic(store: ReturnType<typeof openStore>): void {
   store.upsertAccount('acct-a', 'anthropic', 'acct-a');
+  for (const bucket of ['5h', '7d']) {
+    store.upsertSnapshot('acct-a', bucket, {
+      usedPct: 10,
+      source: 'provider-poll',
+      confidence: 'authoritative',
+      fetchedAt: Date.now(),
+    });
+  }
   setPolicy(store, {
     harness: 'claude-code',
     virtualModel: 'claude-sonnet-5--qlb-high',
@@ -75,6 +83,14 @@ function seedAnthropic(store: ReturnType<typeof openStore>): void {
 
 function seedCodex(store: ReturnType<typeof openStore>, accountId = 'codex-acct'): void {
   store.upsertAccount(accountId, 'openai-codex', accountId);
+  for (const bucket of ['primary', 'secondary']) {
+    store.upsertSnapshot(accountId, bucket, {
+      usedPct: 10,
+      source: 'provider-poll',
+      confidence: 'authoritative',
+      fetchedAt: Date.now(),
+    });
+  }
   setPolicy(store, {
     harness: 'codex',
     virtualModel: 'gpt-5.4--qlb-high',
@@ -263,6 +279,50 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
       assert.ok(seenBody && typeof seenBody === 'object');
       assert.equal((seenBody as { model: string }).model, 'claude-sonnet-5');
       assert.deepEqual(r.json, { type: 'message', id: 'msg_mock' });
+    } finally {
+      await proxy.stop();
+      mock.server.close();
+      store.close();
+    }
+  });
+
+  it('rejects cached quota evidence without contacting the upstream', async () => {
+    const store = openStore(':memory:');
+    store.upsertAccount('acct-a', 'anthropic', 'acct-a');
+    for (const bucket of ['5h', '7d']) {
+      store.upsertSnapshot('acct-a', bucket, {
+        usedPct: 10,
+        source: 'poll',
+        confidence: 'authoritative',
+        fetchedAt: Date.now(),
+      });
+    }
+    setPolicy(store, {
+      harness: 'claude-code',
+      virtualModel: 'claude-sonnet-5--qlb-high',
+      realModel: 'claude-sonnet-5',
+      effort: 'high',
+    });
+    let hits = 0;
+    const mock = await listenMock((_req, res) => {
+      hits += 1;
+      res.writeHead(200);
+      res.end('{}');
+    });
+    const proxy = await startProxy({ store, mockUrl: mock.url });
+    try {
+      const response = await post(
+        proxy.proxyInfo.port,
+        '/v1/messages',
+        { model: 'claude-sonnet-5--qlb-high', messages: [] },
+        proxy.proxyInfo.token,
+      );
+      assert.equal(response.status, 503);
+      assert.deepEqual(response.json, {
+        error: 'UNAVAILABLE',
+        reason: 'fresh Anthropic provider quota reading required; cached or imported readings are display-only until direct usage polling is available (anthropic claude-sonnet-5 pool requires a fresh provider reading)',
+      });
+      assert.equal(hits, 0);
     } finally {
       await proxy.stop();
       mock.server.close();
@@ -568,11 +628,11 @@ describe('qlb-proxy — loopback helper §4.9.2 / §4.9.3', () => {
       const secondary = store.getSnapshot('codex-acct', 'secondary');
       assert.ok(primary);
       assert.equal(primary.usedPct, 41.5);
-      assert.equal(primary.source, 'headers');
+      assert.equal(primary.source, 'provider-headers');
       assert.equal(primary.confidence, 'authoritative');
       assert.ok(secondary);
       assert.equal(secondary.usedPct, 12);
-      assert.equal(secondary.source, 'headers');
+      assert.equal(secondary.source, 'provider-headers');
     } finally {
       await proxy.stop();
       mock.server.close();

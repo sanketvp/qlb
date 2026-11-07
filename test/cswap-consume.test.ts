@@ -51,7 +51,7 @@ describe('cswap consume inject', () => {
           buckets: {
             '5h': {
               usedPct: 1,
-              source: 'poll',
+              source: 'provider-poll',
               confidence: 'authoritative',
               fetchedAt: Date.now(),
             },
@@ -64,8 +64,8 @@ describe('cswap consume inject', () => {
       model: 'claude-sonnet-5',
       snapshots: consumed,
     });
-    assert.equal(decision.ok, true);
-    if (decision.ok) assert.equal(decision.accountId, CSWAP_ACTIVE_ID);
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
     console.log('SLOT_PICKS=0');
   });
 
@@ -112,7 +112,7 @@ describe('cswap consume inject', () => {
     assert.equal(second.access, 'access-two');
   });
 
-  it('anthropic-fallback-cross-provider', () => {
+  it('does not route consume mode without a fresh active provider reading', () => {
     const xai: AccountSnapshot = {
       accountId: 'xai-1',
       provider: 'xai',
@@ -132,22 +132,16 @@ describe('cswap consume inject', () => {
       fallback: ['grok-4'],
       snapshots: ok,
     });
-    assert.equal(primary.ok, true);
-    if (primary.ok) {
-      assert.equal(primary.accountId, CSWAP_ACTIVE_ID);
-      console.log(`PRIMARY=${primary.accountId} FALLBACK_OK=1`);
-    }
+    assert.equal(primary.ok, false);
+    if (!primary.ok) assert.equal(primary.error, 'UNAVAILABLE');
     const withError = [syntheticCswapActiveSnapshot({ error: 'unavailable' }), xai];
     const fb = resolveFromSnapshots({
       model: 'claude-sonnet-5',
       fallback: ['grok-4'],
       snapshots: withError,
     });
-    assert.equal(fb.ok, true);
-    if (fb.ok) {
-      assert.equal(fb.accountId, 'xai-1');
-      assert.ok(fb.mode === 'fallback' || fb.mode === 'fallback-all-in');
-    }
+    assert.equal(fb.ok, false);
+    if (!fb.ok) assert.equal(fb.error, 'UNAVAILABLE');
   });
 
   it('non-active-claude-pin', () => {
