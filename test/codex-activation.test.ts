@@ -172,9 +172,9 @@ describe('Codex S29 activation', () => {
         primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
         secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
       });
-      const snapshot = snapshotsFromStore(store, 'openai-codex')[0];
-      assert.ok(snapshot);
-      assert.deepEqual(routingAuthority(snapshot, 'gpt-5.4', 1_700_000_000_000), { eligible: true, reason: 'fresh direct provider reading' });
+      const storedSnapshot = snapshotsFromStore(store, 'openai-codex')[0];
+      assert.ok(storedSnapshot);
+      assert.deepEqual(routingAuthority(storedSnapshot, 'gpt-5.4', 1_700_000_000_000), { eligible: true, reason: 'fresh direct provider reading' });
     } finally {
       store.close();
     }
