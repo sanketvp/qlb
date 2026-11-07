@@ -118,6 +118,7 @@ const USAGE = `Usage:
   qlb policy list [--harness <h>] [--db <path>] [--json]
   qlb codex gate [--json] [--db <path>]
   qlb codex probe-claims --json
+  qlb codex usage-diagnostic [--json]
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
   qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]

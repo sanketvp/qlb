@@ -141,22 +141,25 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
           result = await deps.probeUsage({ auth: auth as CodexAuthDocument, authPath, readRollout: async () => [] });
         } catch {
           try {
-            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+            store.recordUsagePollResult(PROVIDER, accountId, {
+              attemptedAt, status: 'usage-unknown',
+            });
           } catch {
             return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
           }
           return [{ accountId, provider: PROVIDER, label, buckets: {}, error: 'Codex usage probe failed' }];
         }
         const buckets = readingsFrom(result, now());
+        const diagnostic = result.diagnostic === undefined ? {} : { codexDiagnostic: result.diagnostic };
         try {
           if (result.status === 429) {
             store.recordUsagePollResult(PROVIDER, accountId, {
-              attemptedAt, status: 'http-429', http429: true, retryAfterS: result.retryAfterS,
+              attemptedAt, status: 'http-429', http429: true, retryAfterS: result.retryAfterS, ...diagnostic,
             });
           } else if (Object.keys(buckets).length === 0) {
-            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown' });
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'usage-unknown', ...diagnostic });
           } else {
-            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'ok', readings: buckets });
+            store.recordUsagePollResult(PROVIDER, accountId, { attemptedAt, status: 'ok', readings: buckets, ...diagnostic });
           }
         } catch {
           return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];

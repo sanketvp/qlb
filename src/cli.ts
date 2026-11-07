@@ -11,6 +11,11 @@ function main(): void {
     process.exitCode = runCacheOnlyExport(process.argv.slice(3));
     return;
   }
+  if (process.argv[2] === 'codex' && process.argv[3] === 'usage-diagnostic') {
+    const { runCodexUsageDiagnostic } = require('./codex-usage-diagnostic') as typeof import('./codex-usage-diagnostic');
+    process.exitCode = runCodexUsageDiagnostic(process.argv.slice(4));
+    return;
+  }
   const { main: runApp } = require('./app') as typeof import('./app');
   void runApp().catch(reportError);
 }

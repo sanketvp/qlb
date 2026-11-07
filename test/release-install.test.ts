@@ -433,12 +433,12 @@ describe('release install (AC45)', () => {
     mkdirSync(join(appDir, 'previous'), { recursive: true });
     symlinkSync('previous', join(appDir, 'current'));
     const before = new DatabaseSync(dbPath);
-    before.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 6');
+    before.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version = 7');
     before.close();
 
     await assert.rejects(
       installRelease({ sourceDir, appDir, sha: 'pin-newer-schema-sha', dbPath, ...validHelperVerifier }),
-      /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+      /qlb\.db schema user_version=7 is newer than this binary \(6\); upgrade qlb/,
     );
 
     const after = new DatabaseSync(dbPath, { readOnly: true });
@@ -473,7 +473,7 @@ describe('release install (AC45)', () => {
       const timer = setInterval(() => {
         if (!existsSync(releasePath)) return;
         clearInterval(timer);
-        db.exec('PRAGMA user_version = 6; COMMIT');
+        db.exec('PRAGMA user_version = 7; COMMIT');
         db.close();
       }, 5);
     `, dbPath, readyPath, releasePath], {
@@ -503,7 +503,7 @@ describe('release install (AC45)', () => {
     try {
       const installRejection = assert.rejects(
         installRelease({ sourceDir, appDir, sha: 'pin-racing-schema-sha', dbPath, ...validHelperVerifier }),
-        /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/,
+        /qlb\.db schema user_version=7 is newer than this binary \(6\); upgrade qlb/,
       );
       const migratorFailure = migratorExit.then(
         () => new Promise<never>(() => {}),
@@ -518,7 +518,7 @@ describe('release install (AC45)', () => {
     assert.equal(releasedMigrator, true);
     const after = new DatabaseSync(dbPath, { readOnly: true });
     try {
-      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
+      assert.equal((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7);
       assert.equal(after.prepare('SELECT value FROM config WHERE key = ?').get('keychain.helperCheckIdentityHash'), undefined);
     } finally { after.close(); }
     assert.equal(existsSync(join(appDir, 'current')), false);

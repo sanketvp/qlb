@@ -209,7 +209,13 @@ describe('Codex usage adapter', () => {
       readRollout: async () => [],
     });
 
-    assert.deepEqual(result, { status: 200, source: 'unknown', keys: ['mystery'] });
+    assert.deepEqual(result, {
+      status: 200, source: 'unknown', keys: ['mystery'],
+      diagnostic: {
+        classification: 'success-unrecognized-shape', httpStatus: 200, endpoint: 'codex-api',
+        fallbackAttempted: true, parserShape: 'unrecognized-success', entitlementEvidence: 'unknown',
+      },
+    });
     assert.equal(JSON.stringify(result).includes(bodySecret), false);
   });
 });

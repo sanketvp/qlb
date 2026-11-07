@@ -11,6 +11,7 @@ import { parseCodexAuth } from '../src/codex-auth';
 import { importActiveCodexSlot } from '../src/codex-slots';
 import { CodexAdmissionRefused } from '../src/codex-rekey';
 import { checkRestorePrecondition } from '../src/codex-restore-baseline';
+import { readCodexUsageDiagnostic } from '../src/codex-usage-diagnostic';
 import { MockKeychain } from '../src/keychain';
 import { createSingleGrantMigration, defaultRehearseFn } from '../src/migration';
 import { backupBeforeMigrateSync, openStore } from '../src/store';
@@ -233,7 +234,8 @@ describe('Codex S29 activation', () => {
   });
 
   it('redacts Codex probe failures and retains existing snapshots', async () => {
-    const store = openStore(':memory:');
+    const path = join(mkdtempSync(join(tmpdir(), 'qlb-codex-activation-')), 'qlb.db');
+    const store = openStore(path);
     const secret = 'Bearer fixture-secret-token request-body-fixture';
     try {
       store.upsertAccount('fixture-user:fixture-account', 'openai-codex', 'fixture');
@@ -250,6 +252,7 @@ describe('Codex S29 activation', () => {
       assert.equal(snapshot?.error, 'Codex usage probe failed');
       assert.equal(JSON.stringify(snapshot).includes(secret), false);
       assert.equal(store.getAllSnapshots('fixture-user:fixture-account').primary?.usedPct, 55);
+      assert.equal(readCodexUsageDiagnostic(Date.now(), path).recorded, false);
     } finally {
       store.close();
     }

@@ -23,6 +23,7 @@ import {
   type HelperIdentityVerification,
   type HelperSigningState,
 } from './diagnostics';
+import { SCHEMA_VERSION } from './schema-version';
 import { backupBeforeMigrate } from './store';
 
 const BUILD_STAMP = '.build-sha';
@@ -325,10 +326,6 @@ function copyReleaseContents(
 }
 
 const HELPER_IDENTITY_CONFIG_KEY = 'keychain.helperCheckIdentityHash';
-// Keep this refusal in step with Store.migrateIfNeeded(). Pinning must not
-// permit an older release to write to a database created by a newer binary.
-const SUPPORTED_SCHEMA_VERSION = 5;
-
 /**
  * Establishes the release-verified leaf pin without running Store's migrations
  * or allowing a concurrent installer to rotate an already-established pin.
@@ -344,9 +341,9 @@ function recordHelperIdentityHash(dbPath: string, identityHash: string): void {
     const version = typeof versionRow === 'number'
       ? versionRow
       : typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
-    if (version > SUPPORTED_SCHEMA_VERSION) {
+    if (version > SCHEMA_VERSION) {
       throw new ReleaseIntegrityError(
-        `qlb.db schema user_version=${version} is newer than this binary (${SUPPORTED_SCHEMA_VERSION}); upgrade qlb`,
+        `qlb.db schema user_version=${version} is newer than this binary (${SCHEMA_VERSION}); upgrade qlb`,
       );
     }
     db.exec('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)');

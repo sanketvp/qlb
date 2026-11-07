@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { config } from '../config';
 import { readCodexAuthStable, type CodexAuthDocument } from '../codex-auth';
 import { buildUsageRequest, parseUsage, type UsageParseResult, type UsageWindow } from '../codex-oauth';
+import type { CodexUsageDiagnosticAttempt } from '../codex-usage-diagnostic-shared';
 
 export const CODEX_USAGE_WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 export const CODEX_USAGE_FALLBACK_URL = 'https://chatgpt.com/backend-api/api/codex/usage';
@@ -23,6 +24,8 @@ export interface CodexUsageProbeResult {
   windows?: UsageWindow[];
   /** Retry-After in seconds when the usage endpoint rate-limits the request. */
   retryAfterS?: number;
+  /** Redacted finite metadata for the explicitly authorized refresh path. */
+  diagnostic?: CodexUsageDiagnosticAttempt;
 }
 
 export interface RolloutSnapshot {
@@ -73,6 +76,39 @@ function retryAfterS(attempt: Attempt): number | undefined {
   return attempt.parsed !== undefined && !Array.isArray(attempt.parsed) && attempt.parsed.kind === 'rate-limited'
     ? attempt.parsed.retryAfter
     : undefined;
+}
+
+function diagnosticFor(attempt: Attempt, endpoint: 'wham' | 'codex-api', fallbackAttempted: boolean): CodexUsageDiagnosticAttempt {
+  if (attempt.status === null) return {
+    classification: 'transport-failure', httpStatus: null, endpoint, fallbackAttempted,
+    parserShape: 'not-applicable', entitlementEvidence: 'unknown',
+  };
+  if (Array.isArray(attempt.parsed) && attempt.parsed.length > 0) return {
+    classification: 'provider-gauge', httpStatus: attempt.status, endpoint, fallbackAttempted,
+    parserShape: 'recognized-primary-or-secondary', entitlementEvidence: 'provider-gauge-recognized',
+  };
+  if (attempt.parsed && !Array.isArray(attempt.parsed)) {
+    if (attempt.parsed.kind === 'unauthorized') return {
+      classification: 'unauthorized', httpStatus: 401, endpoint, fallbackAttempted,
+      parserShape: 'not-applicable', entitlementEvidence: 'unknown',
+    };
+    if (attempt.parsed.kind === 'rate-limited') return {
+      classification: 'rate-limited', httpStatus: 429, endpoint, fallbackAttempted,
+      parserShape: 'not-applicable', entitlementEvidence: 'unknown',
+    };
+    if (attempt.parsed.kind === 'unknown') return {
+      classification: 'success-unrecognized-shape', httpStatus: attempt.status, endpoint, fallbackAttempted,
+      parserShape: 'unrecognized-success', entitlementEvidence: 'unknown',
+    };
+  }
+  if (attempt.status === 403) return {
+    classification: 'forbidden-or-provider-ineligible', httpStatus: 403, endpoint, fallbackAttempted,
+    parserShape: 'not-applicable', entitlementEvidence: 'provider-forbidden-or-ineligible',
+  };
+  return {
+    classification: 'http-other', httpStatus: attempt.status, endpoint, fallbackAttempted,
+    parserShape: 'not-applicable', entitlementEvidence: 'unknown',
+  };
 }
 
 function accountId(doc: CodexAuthDocument): string | null {
@@ -245,18 +281,21 @@ export async function probeCodexUsage(deps: CodexUsageProbeDeps = {}): Promise<C
   }
   const activeAccountId = accountId(auth);
   if (!activeAccountId || typeof auth.tokens.access_token !== 'string' || auth.tokens.access_token.length === 0) {
-    return { status: null, source: 'unknown', keys: [] };
+    return {
+      status: null, source: 'unknown', keys: [],
+      diagnostic: { classification: 'preflight-no-bare-account-id', httpStatus: null, endpoint: 'none', fallbackAttempted: false, parserShape: 'not-applicable', entitlementEvidence: 'unknown' },
+    };
   }
 
   const fetchFn = deps.fetchFn ?? fetch;
   const wham = await attemptUsage(CODEX_USAGE_WHAM_URL, auth.tokens.access_token, activeAccountId, fetchFn);
-  if (isUsable(wham.parsed)) return { status: wham.status, source: 'wham', keys: wham.keys, windows: wham.parsed };
+  if (isUsable(wham.parsed)) return { status: wham.status, source: 'wham', keys: wham.keys, windows: wham.parsed, diagnostic: diagnosticFor(wham, 'wham', false) };
 
   let last = wham;
   if (wham.status === 404 || wham.status === 410 || isUnparseable(wham.parsed)) {
     const fallback = await attemptUsage(CODEX_USAGE_FALLBACK_URL, auth.tokens.access_token, activeAccountId, fetchFn);
     if (isUsable(fallback.parsed)) {
-      return { status: fallback.status, source: 'codex-api', keys: fallback.keys, windows: fallback.parsed };
+      return { status: fallback.status, source: 'codex-api', keys: fallback.keys, windows: fallback.parsed, diagnostic: diagnosticFor(fallback, 'codex-api', true) };
     }
     last = fallback;
   }
@@ -267,11 +306,11 @@ export async function probeCodexUsage(deps: CodexUsageProbeDeps = {}): Promise<C
     const windows = rolloutWindows(snapshot);
     if (windows) {
       const retryAfter = retryAfterS(last);
-      return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows, ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
+      return { status: last.status, source: 'codex-rollout', keys: ['rate_limits'], windows, diagnostic: diagnosticFor(last, last === wham ? 'wham' : 'codex-api', last !== wham), ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
     }
   }
   const retryAfter = retryAfterS(last);
-  return { status: last.status, source: 'unknown', keys: last.keys, ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
+  return { status: last.status, source: 'unknown', keys: last.keys, diagnostic: diagnosticFor(last, last === wham ? 'wham' : 'codex-api', last !== wham), ...(retryAfter === undefined ? {} : { retryAfterS: retryAfter }) };
 }
 
 /** Registry-loaded usage adapter entry point used by later provider bindings. */

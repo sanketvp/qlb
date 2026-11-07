@@ -230,7 +230,7 @@ describe('cache-only export', () => {
     const path = join(root, 'qlb.db');
     const db = new DatabaseSync(path);
     try {
-      db.exec('PRAGMA user_version = 6');
+      db.exec('PRAGMA user_version = 7');
     } finally {
       db.close();
     }
