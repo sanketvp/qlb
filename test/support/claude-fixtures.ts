@@ -1,6 +1,6 @@
 export interface CredentialOverrides {
-  accessToken?: string | null;
-  refreshToken?: string | null;
+  accessToken?: string;
+  refreshToken?: string;
   expiresAt?: number;
   extra?: Record<string, unknown>;
 }
@@ -8,8 +8,8 @@ export interface CredentialOverrides {
 /** Builds the minimal Claude OAuth credential blob used by slot fixtures. */
 export function credential(tag: string, overrides: CredentialOverrides = {}): string {
   const oauth = {
-    ...(overrides.accessToken === null ? {} : { accessToken: overrides.accessToken ?? `access-${tag}` }),
-    ...(overrides.refreshToken === null ? {} : { refreshToken: overrides.refreshToken ?? `refresh-${tag}` }),
+    accessToken: overrides.accessToken ?? `access-${tag}`,
+    refreshToken: overrides.refreshToken ?? `refresh-${tag}`,
     ...(overrides.expiresAt === undefined ? {} : { expiresAt: overrides.expiresAt }),
     ...overrides.extra,
   };
