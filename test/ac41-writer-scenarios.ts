@@ -17,6 +17,7 @@ import { claudePaths } from '../src/cc-paths';
 import { ProbeVerdictMemo, type LiveIdentity } from '../src/cc-resync';
 import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
 import { switchClaude, type ClaudeSwitchDeps } from '../src/cc-switch';
+import { createClaudeSwitchJournal } from '../src/cc-switch-journal';
 import { createReportCutoverCommand, type ReportCutoverCommandDeps } from '../src/commands/report-cutover';
 import { defaultConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
@@ -234,4 +235,128 @@ export async function runStatusHistory(): Promise<ScenarioArtifacts> {
       statusJson: runStatusCli(['status', '--json'], env),
     };
   } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** Doctor artifacts: the named row from `qlb doctor --json`, both outputs, and the newest `health_log.failing_json`. */
+export type DoctorArtifacts = { level: string | null; message: string | null; text: string; json: string; history: string; historyHasRow: boolean };
+
+/**
+ * Seeds an isolated test-mode store at lifecycle `phase`, lets `seed` plant the
+ * AC41 input, then runs the real `qlb doctor` CLI for text and for --json. Each
+ * run appends health history; the newest failing_json row is returned. Test mode
+ * disables Keychain clients, so no credential store is read.
+ */
+async function runDoctorRow(name: string, phase: string, seed: (dir: string, dbPath: string, cliEnv: NodeJS.ProcessEnv) => void): Promise<DoctorArtifacts> {
+  const dir = root('doctor');
+  try {
+    mkdirSync(join(dir, 'plugins'));
+    const dbPath = join(dir, 'qlb.db');
+    const cliEnv: NodeJS.ProcessEnv = {
+      QLB_TEST_MODE: '1', QLB_HOME: dir, HOME: dir, QLB_DB_PATH: dbPath,
+      QLB_PLUGINS_DIR: join(dir, 'plugins'), QLB_CONFIG_PATH: join(dir, 'config.json'),
+      QLB_ANTHROPIC_POOL_PATH: join(dir, 'missing-anthropic.json'), QLB_PI_AUTH_JSON_PATH: join(dir, 'missing-pi-auth.json'),
+      QLB_CODEX_AUTH_JSON_PATH: join(dir, 'missing-codex-auth.json'), QLB_KIMI_CREDENTIALS_FILE: join(dir, 'missing-kimi.md'),
+      QLB_CLAUDE_CODE_CREDENTIALS_PATH: join(dir, 'missing-claude-credentials'),
+      QLB_CSWAP_SEQUENCE_PATH: join(dir, 'cswap', 'sequence.json'), QLB_CSWAP_USAGE_PATH: join(dir, 'missing-usage.json'),
+    };
+    openStore(dbPath).close();
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare('INSERT INTO lifecycle (state, began_at, cutover_at, window_end) VALUES (?, 1, 1, 2)').run(phase);
+    } finally { db.close(); }
+    seed(dir, dbPath, cliEnv);
+    const doctor = (args: string[]): string => {
+      const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(__dirname, '..', 'src', 'cli.js'), 'doctor', ...args], { encoding: 'utf8', env: cliEnv, timeout: 120_000 });
+      if (result.status !== 0 && result.status !== 1) throw new Error(`qlb doctor exited ${String(result.status)}: ${result.stderr}`);
+      return result.stdout;
+    };
+    const text = doctor([]);
+    const json = doctor(['--json']);
+    const row = (JSON.parse(json) as { checks: Array<{ name: string; level: string; message: string }> }).checks.find((check) => check.name === name);
+    const history = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const failing = (history.prepare('SELECT failing_json FROM health_log ORDER BY id DESC LIMIT 1').get() as { failing_json: string } | undefined)?.failing_json ?? '';
+      const historyHasRow = (JSON.parse(failing || '[]') as Array<{ name?: string }>).some((entry) => entry.name === name);
+      return { level: row?.level ?? null, message: row?.message ?? null, text, json, history: failing, historyHasRow };
+    } finally { history.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** Row 4: an orphaned Claude switch journal whose `from` and `to` account fields carry the AC41 body. */
+export function runDoctorSwitchJournal(): Promise<DoctorArtifacts> {
+  return runDoctorRow('claude:switch-journal', 'cutover', (_dir, _dbPath, cliEnv) => {
+    const paths = claudePaths({ env: cliEnv });
+    const options = { env: cliEnv, configPath: paths.globalConfigPath, keychainService: paths.keychainService };
+    createClaudeSwitchJournal({
+      v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: AC41_BODY, to: AC41_BODY, trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
+      decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: null, bindingJson: null, step: 7,
+      stagedBlobService: 'qlb:anthropic:staged-rollback:ac41', stagedAccount: 'qlb', stagedWritten: false,
+      keychainService: options.keychainService, configPath: options.configPath, configText: null, configWrittenHash: null, fromOauthAccount: null,
+      credentialsWrittenHash: null, credentialsWriteStarted: false, credentialsWritten: false, configWriteStarted: false, configWritten: false,
+      closed: null, startedAt: 1, owner: { pid: 999_999, lstart: 'ac41-dead-owner' },
+    }, options);
+  });
+}
+
+/**
+ * Row 5: a fresh C-swap import lock with import journals whose run ids are the
+ * AC41 fixtures. A run id is a directory name, so each carries one fixture rather
+ * than the whole 2 KB body; each journal file holds the body.
+ */
+export function runDoctorJournalInProgress(): Promise<DoctorArtifacts> {
+  return runDoctorRow('journal:in-progress', 'cutover', (dir) => {
+    const backups = join(dir, '.qlb', 'backups');
+    for (const fixture of AC41_FIXTURES) {
+      mkdirSync(join(backups, `cswap-import-${fixture}`), { recursive: true });
+      writeFileSync(join(backups, `cswap-import-${fixture}`, 'journal.json'), AC41_BODY);
+    }
+    writeFileSync(join(backups, 'cswap-import.lock'), '');
+  });
+}
+
+/** Row 6: an unfinished undo whose lifecycle note carries the AC41 body. */
+export function runDoctorUndoIncomplete(): Promise<DoctorArtifacts> {
+  return runDoctorRow('undo:incomplete', 'undoing', (_dir, dbPath) => {
+    const db = new DatabaseSync(dbPath);
+    try { db.prepare('UPDATE lifecycle SET undo_began_at = 1234, note = ?').run(AC41_BODY); } finally { db.close(); }
+  });
+}
+
+/** Row 7: a rolled-back undo whose Claude slot email carries the AC41 body. */
+export function runDoctorUndoLineage(): Promise<DoctorArtifacts> {
+  return runDoctorRow('undo:lineage-match', 'rolled-back', (_dir, dbPath) => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare('UPDATE lifecycle SET undo_began_at = 1234').run();
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source)
+        VALUES ('ac41-slot', 1, ?, '{}', 'sha256:ac41', 1, 'cswap-import')`).run(AC41_BODY);
+    } finally { db.close(); }
+  });
+}
+
+/** Row 8: the active Claude login names a dead slot whose email carries the AC41 body. */
+export function runDoctorClaudeActive(): Promise<DoctorArtifacts> {
+  return runDoctorRow('claude:active', 'cutover', (_dir, dbPath) => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, dead, added_at)
+        VALUES ('ac41-slot', 1, ?, '{}', 'sha256:ac41', 1, 1)`).run(AC41_BODY);
+      db.prepare("INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', 'ac41-slot', 1, 'manual')").run();
+    } finally { db.close(); }
+  });
+}
+
+/** Row 11: unpersisted-token evidence for a live Claude slot whose account id is the AC41 body. */
+export function runDoctorUnpersistedToken(): Promise<DoctorArtifacts> {
+  return runDoctorRow('claude:unpersisted-token', 'cutover', (_dir, dbPath) => {
+    const store = openStore(dbPath);
+    try {
+      store.recordSwitch({ ts: 10, provider: 'anthropic', toAccount: AC41_BODY, trigger: 'automatic', outcome: 'refused', detail: 'freshen-consume-gate-unpersisted' });
+    } finally { store.close(); }
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at)
+        VALUES (?, 1, 'ac41@example.test', '{}', 'sha256:ac41', 1)`).run(AC41_BODY);
+    } finally { db.close(); }
+  });
 }
