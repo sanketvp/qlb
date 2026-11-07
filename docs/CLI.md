@@ -384,7 +384,7 @@ Flags: `[--json] [--dashboard|--flat]`.
 
 ## `qlb resolve`
 
-Ask QLB to pick an account (and possibly a fallback model) for a request. Purely advisory unless something consumes its output: it fetches fresh gauges for the relevant provider(s), scores candidates, records an audit row, and prints the decision.
+Ask QLB to pick an account (and possibly a fallback model) for a request. Purely advisory unless something consumes its output: it uses only fresh direct provider quota readings for the relevant provider(s), scores eligible candidates, records an audit row, and prints the decision. When no complete, fresh provider reading is available, it returns `UNAVAILABLE` rather than selecting from cached, imported, advisory, or other non-provider data. Run `qlb refresh --allow-probe` (or wait for a provider poll or eligible proxy header reading) before retrying.
 
 ```console
 $ qlb resolve --model claude-sonnet-5 --fallback claude-opus-4 --session <uuid> --harness dispatch --json
@@ -407,15 +407,15 @@ Successful JSON shape (from `src/resolve.ts`):
     "provider": "anthropic",
     "label": "alice@example.com",
     "buckets": {
-      "5h":     { "usedPct": 60, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 },
-      "7d":     { "usedPct": 30, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 },
-      "7d:Fable": { "usedPct": 45, "confidence": "authoritative", "source": "poll", "fetchedAt": 1788844834100 }
+      "5h":     { "usedPct": 60, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 },
+      "7d":     { "usedPct": 30, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 },
+      "7d:Fable": { "usedPct": 45, "confidence": "authoritative", "source": "provider-poll", "fetchedAt": 1788844834100 }
     }
   }
 }
 ```
 
-`mode` is one of `headroom`, `all-in`, `fallback`, `fallback-all-in` (or `exhausted` in the audit row). When the served model differs from the requested one, the human output prints `⚠ served by <model>` prominently — substitution is never silent.
+`mode` is one of `headroom`, `all-in`, `fallback`, `fallback-all-in` (or `unavailable` / `exhausted` in the audit row). When the served model differs from the requested one, the human output prints `⚠ served by <model>` prominently — substitution is never silent.
 
 When every candidate is exhausted:
 
@@ -437,11 +437,11 @@ $ qlb resolve --model claude-sonnet-5 --json
 
 Flags: `--model <modelId>` (required), `[--fallback m1,m2,...]`, `[--session <id>]`, `[--harness pi|claude-code|codex|dispatch]`, `[--effort <lvl>]`, `[--strategy headroom|spread|round-robin|failover]` (default `headroom`, or `defaultStrategy` from config), `[--json]`. Model → provider mapping is documented in `src/scoring.ts`: `claude*` → anthropic, `gpt-*`/`*sol*`/`*astra*`/`*luna*`/`*terra*` → openai-codex, `*grok*` → xai, `*k3*`/`*kimi*` → kimi-coding, `openrouter/*`, `z-ai/*`, `*glm*` → openrouter.
 
-Strategies:
+Strategies apply after the provider-reading admission gate:
 
 - `headroom` — existing Rule-S score, single best account, headroom-then-all-in (default; unchanged).
 - `spread` — same scoring, but near-tied candidates (within `SPREAD_MARGIN` = 10) are split across session ids via a deterministic hash of `--session`. No session id → falls back to `headroom`.
-- `round-robin` — ignore scores except to skip exhausted/error accounts; cycle in account-id order using a SQLite counter.
+- `round-robin` — ignore scores except to skip unavailable, exhausted, or errored accounts; cycle in account-id order using a SQLite counter.
 - `failover` — stick to the current account while every relevant bucket is under 100%; switch only when it is genuinely exhausted.
 
 ## `qlb why`
@@ -745,7 +745,7 @@ $ qlb consume disable --provider anthropic
 cswap-anthropic: NATIVE
 ```
 
-`--provider` must be `anthropic`. Enable writes `consume-anthropic.json` `{state:"CONSUMED"}` (no tokens) beside the QLB database (`~/.qlb/` by default; `QLB_DB_PATH` / config `dbPath` move it, and Pi resolves it the same way — a per-invocation `--db`/`--db-path` flag is not visible to Pi), then upserts journal store `cswap-anthropic=CONSUMED`. Disable journals `NATIVE` and deletes the marker. `qlb migrate status --provider anthropic` stays on the pi-pool ladder (`NATIVE` until a real migrate) — consume is a different store. `consume enable` refuses with `DUAL_OWNERSHIP_REFUSED` while Pi's Anthropic accounts are QLB-owned (pi-pool `MIRRORED`/`VALIDATED`/`QLB_OWNED`/`RETIRED`, or a Pi owner file exists), and forward `qlb migrate stage|rehearse|commit|resume --provider anthropic` refuses with the same code while consume is enabled (`status` and `rollback` still work). Pi chooses its Anthropic mode at startup, so restart running Pi sessions after `enable`/`disable`; a Pi that starts while the marker and journal disagree (mid-change or after a crash) refuses Anthropic until you re-run `enable` or `disable`. Pi follows the same journal: with `cswap-anthropic=CONSUMED` and no Pi owner file, the `qlb-pi` extension serves Anthropic from the active Claude Code login as `cswap-active` (read-only, one re-read on 401, never refreshed), so switching accounts in cswap takes effect on Pi's next request. A Pi owner file (or an unreadable journal/owner file) together with consume is a conflict: Anthropic is replaced by an error-only stub rather than falling back to `anthropic-pool`. cswap remains the Claude account brain; QLB does not attribute Claude credentials to a sequence slot.
+`--provider` must be `anthropic`. Enable writes `consume-anthropic.json` `{state:"CONSUMED"}` (no tokens) beside the QLB database (`~/.qlb/` by default; `QLB_DB_PATH` / config `dbPath` move it, and Pi resolves it the same way — a per-invocation `--db`/`--db-path` flag is not visible to Pi), then upserts journal store `cswap-anthropic=CONSUMED`. Disable journals `NATIVE` and deletes the marker. `qlb migrate status --provider anthropic` stays on the pi-pool ladder (`NATIVE` until a real migrate) — consume is a different store. `consume enable` refuses with `DUAL_OWNERSHIP_REFUSED` while Pi's Anthropic accounts are QLB-owned (pi-pool `MIRRORED`/`VALIDATED`/`QLB_OWNED`/`RETIRED`, or a Pi owner file exists), and forward `qlb migrate stage|rehearse|commit|resume --provider anthropic` refuses with the same code while consume is enabled (`status` and `rollback` still work). Pi chooses its Anthropic mode at startup, so restart running Pi sessions after `enable`/`disable`; a Pi that starts while the marker and journal disagree (mid-change or after a crash) refuses Anthropic until you re-run `enable` or `disable`. Because consume has no credential-attributable provider quota reading, both the proxy and Pi extension fail Anthropic requests as unavailable before reading a Claude Code credential. A Pi owner file (or an unreadable journal/owner file) together with consume is likewise an error-only stub rather than a fallback to `anthropic-pool`. cswap remains the Claude account brain; QLB does not attribute Claude credentials to a sequence slot.
 
 ## `/qlb` (Pi in-session command)
 
