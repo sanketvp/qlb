@@ -3,7 +3,9 @@ import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { redactError, redactEvent, redactJson, redactKeyValueText, redactSecrets } from '../src/redact';
 import {
-  AC41_BODY, AC41_FIXTURES, leakedFixtures, runAutoThrownTick, runPoll4xx, runReportCutover, runStatusHistory, runSwitchStep7,
+  AC41_BODY, AC41_FIXTURES, leakedFixtures, runAutoThrownTick, runDoctorClaudeActive, runDoctorJournalInProgress, runDoctorSwitchJournal,
+  runDoctorUndoIncomplete, runDoctorUndoLineage, runDoctorUnpersistedToken, runPoll4xx, runReportCutover, runStatusHistory, runSwitchStep7,
+  type DoctorArtifacts,
 } from './ac41-writer-scenarios';
 
 const REDACTED = '[redacted]';
@@ -394,6 +396,64 @@ describe('AC41 writer sweep', () => {
       assert.equal((JSON.parse(artifacts.reloginsJson ?? '{}') as { relogins: unknown[] }).relogins.length, 1);
       assert.match(artifacts.statusJson ?? '', /ac41-failure-pad/);
       for (const [key, value] of Object.entries(artifacts)) assert.deepEqual(leakedFixtures(value), [], key);
+    });
+
+    // Doctor rows (HP-H3-12B). Each runs the real `qlb doctor` CLI for text and
+    // --json and reads the newest health_log.failing_json. Text and JSON pass the
+    // doctor report boundary (redactCheck); S64-blocking rows are written to
+    // history behind a second boundary (appendHealthLog's redactJson), so a
+    // history proof fails only when both are bypassed.
+    const assertDoctorClean = (artifacts: DoctorArtifacts, name: string): void => {
+      assert.match(artifacts.text, new RegExp(`\\] ${name}: `));
+      for (const key of ['message', 'text', 'json', 'history'] as const) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
+    };
+
+    await t.test('row 4 doctor claude:switch-journal: text/JSON and failing_json (redaction proof)', async () => {
+      const artifacts = await runDoctorSwitchJournal();
+      assert.equal(artifacts.level, 'FAIL');
+      assert.match(artifacts.message ?? '', /^unfinished Claude switch journal .*attemptId=ac41-attempt step=7 from=.*ac41-failure-pad.* to=.*ac41-failure-pad.*; run qlb claude journal resolve --forward or qlb claude journal resolve --back$/);
+      assert.equal(artifacts.historyHasRow, true);
+      assertDoctorClean(artifacts, 'claude:switch-journal');
+    });
+
+    await t.test('row 5 doctor journal:in-progress: text/JSON (redaction proof); INFO row absent from failing_json (control)', async () => {
+      const artifacts = await runDoctorJournalInProgress();
+      assert.equal(artifacts.level, 'INFO');
+      assert.match(artifacts.message ?? '', /^C-swap import lock is fresh; phases=\[redacted\]:invalid, \[redacted\]:invalid, \[redacted\]:invalid$/);
+      assert.equal(artifacts.historyHasRow, false);
+      assertDoctorClean(artifacts, 'journal:in-progress');
+    });
+
+    await t.test('row 6 doctor undo:incomplete: fixed text/JSON and failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorUndoIncomplete();
+      assert.equal(artifacts.level, 'FAIL');
+      assert.equal(artifacts.message, 'undo-unfinished: undo_began_at=1234; run qlb undo cswap --resume');
+      assert.equal(artifacts.historyHasRow, true);
+      assertDoctorClean(artifacts, 'undo:incomplete');
+    });
+
+    await t.test('row 7 doctor undo:lineage-match: fixed text/JSON and failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorUndoLineage();
+      assert.equal(artifacts.level, 'FAIL');
+      assert.equal(artifacts.message, 'refused: active-slot-missing');
+      assert.equal(artifacts.historyHasRow, true);
+      assertDoctorClean(artifacts, 'undo:lineage-match');
+    });
+
+    await t.test('row 8 doctor claude:active: fixed text/JSON and failing_json (non-propagation control)', async () => {
+      const artifacts = await runDoctorClaudeActive();
+      assert.equal(artifacts.level, 'FAIL');
+      assert.equal(artifacts.message, 'active Claude login names a dead or archived slot');
+      assert.equal(artifacts.historyHasRow, true);
+      assertDoctorClean(artifacts, 'claude:active');
+    });
+
+    await t.test('row 11 doctor claude:unpersisted-token: text/JSON and failing_json (redaction proof)', async () => {
+      const artifacts = await runDoctorUnpersistedToken();
+      assert.equal(artifacts.level, 'FAIL');
+      assert.match(artifacts.message ?? '', /^unpersisted Claude token evidence without later recovery: ac41-failure-pad .*; re-login affected slot\(s\)$/);
+      assert.equal(artifacts.historyHasRow, true);
+      assertDoctorClean(artifacts, 'claude:unpersisted-token');
     });
   });
 });
