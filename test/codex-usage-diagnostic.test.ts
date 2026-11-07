@@ -89,7 +89,9 @@ describe('Codex usage diagnostic', () => {
     assert.deepEqual(errors, []);
 
     const text: string[] = [];
-    assert.equal(runCodexUsageDiagnostic([], (line) => text.push(line), (line) => errors.push(line), path), 0);
+    const textErrors: string[] = [];
+    assert.equal(runCodexUsageDiagnostic([], (line) => text.push(line), (line) => textErrors.push(line), path), 0);
+    assert.deepEqual(textErrors, []);
     assert.deepEqual(text, ['codex usage diagnostic: attemptedAt=1700000000 dispatch=true classification=rate-limited entitlement=unknown http=429 endpoint=wham fallback=false parser=not-applicable backoff=1700000030 authoritative=false stale=true']);
   });
 

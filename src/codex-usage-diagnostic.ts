@@ -73,7 +73,7 @@ export function readCodexUsageDiagnostic(now = Date.now(), dbPath = config.dbPat
   }
 }
 
-export function runCodexUsageDiagnostic(args: string[], write = console.log, error = console.error, dbPath = config.dbPath): number {
+export function runCodexUsageDiagnostic(args: string[], write: (line: string) => void = console.log, error: (line: string) => void = console.error, dbPath = config.dbPath): number {
   const json = args.length === 1 && args[0] === '--json';
   if (!(args.length === 0 || json)) {
     error('usage: qlb codex usage-diagnostic [--json]');
