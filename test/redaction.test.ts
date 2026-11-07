@@ -558,20 +558,24 @@ describe('AC41 writer sweep', () => {
       assertClean(artifacts);
     });
 
-    await sweepRow('row 20 undo C-swap --dry-run --record-drill (non-propagation control)', async () => {
+    await sweepRow('row 20 undo C-swap --dry-run --record-drill output (redaction proof)', async () => {
       const artifacts = await runUndoRecordDrill();
       assert.equal(artifacts.textCode, '0');
-      assert.equal(artifacts.textStdout, 'activeAccountNumber=none');
-      assert.deepEqual(JSON.parse(artifacts.jsonStdout ?? ''), { slots: [], deleteEnc: [], activeAccountNumber: null, dryRun: true });
+      assert.match(artifacts.textStdout ?? '', /^activeAccountNumber=1\nslot 1: update claude-swap\/account-1-ac41-failure-pad /);
+      const json = JSON.parse(artifacts.jsonStdout ?? '') as { activeAccountNumber: number; dryRun: boolean; slots: Array<{ item: string }> };
+      assert.equal(json.activeAccountNumber, 1);
+      assert.equal(json.dryRun, true);
+      assert.equal(json.slots.length, 1);
+      assert.match(json.slots[0]?.item ?? '', /^account-1-ac41-failure-pad /);
       assert.equal(artifacts.storedDryRunAt, '123');
       assertClean(artifacts);
     });
 
-    await sweepRow('row 21 Claude journal resolve output and switch_log row (non-propagation control)', async () => {
+    await sweepRow('row 21 Claude journal rollback output and switch_log row (non-propagation control)', async () => {
       const artifacts = await runJournalResolve();
       assert.equal(artifacts.backCode, '0');
       assert.equal(artifacts.backStdout, 'Claude journal resolved back');
-      assert.deepEqual(JSON.parse(artifacts.switchRows ?? ''), [{ detail: 'journal-back', error: null, steps_json: JSON.stringify({ attempt: 'ac41-attempt' }) }]);
+      assert.deepEqual(JSON.parse(artifacts.switchRows ?? ''), [{ from_account: 'ac41-from-slot', to_account: 'ac41-to-slot', detail: 'journal-back', error: null, steps_json: JSON.stringify({ attempt: 'ac41-attempt' }) }]);
       assertClean(artifacts);
     });
 

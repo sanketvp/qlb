@@ -549,14 +549,18 @@ export async function runUndoRecordDrill(): Promise<ScenarioArtifacts> {
       db.prepare(`INSERT INTO claude_slots (account_id, slot_num, email, config_json, fingerprint, added_at, source)
         VALUES ('ac41-slot', 1, ?, '{}', 'sha256:ac41', 1, 'cswap-import')`).run(AC41_BODY);
     } finally { db.close(); }
+    const store = openStore(dbPath);
+    try { store.setActiveLogin('anthropic', 'ac41-slot', 'fixture', 123); } finally { store.close(); }
     const { ctx, take } = commandContext(home, dbPath);
     const recordCtx = { ...ctx, env: { ...ctx.env, QLB_FAULT_INJECTION: '1' } };
+    const keychain = new MockKeychain();
+    await keychain.set(qlbKeychainService('anthropic', 'ac41-slot'), QLB_KEYCHAIN_ACCOUNT, credential('ac41-slot', 3_600_000));
     const deps = {
-      keychain: new MockKeychain(), backupDir: join(home, 'cswap'), now: () => 123,
-      plan: async () => ({ slots: [], deleteEnc: [], activeAccountNumber: null }),
+      keychain, backupDir: join(home, 'cswap'), now: () => 123,
     };
-    const text = take(await runUndoCswapCommand(['--dry-run', '--record-drill'], recordCtx, deps));
-    const json = take(await runUndoCswapCommand(['--dry-run', '--record-drill', '--json'], recordCtx, deps));
+    const command = { name: 'undo cswap', execute: (args: string[], commandCtx: CommandContext) => runUndoCswapCommand(args, commandCtx, deps) };
+    const text = take(await runExecutingCommand({ command, args: ['--dry-run', '--record-drill'] }, recordCtx));
+    const json = take(await runExecutingCommand({ command, args: ['--dry-run', '--record-drill', '--json'] }, recordCtx));
     const read = new DatabaseSync(dbPath, { readOnly: true });
     try {
       const stored = (read.prepare("SELECT value FROM config WHERE key = 'drill.undoDryRunAt'").get() as { value: string } | undefined)?.value ?? null;
@@ -565,7 +569,7 @@ export async function runUndoRecordDrill(): Promise<ScenarioArtifacts> {
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
-/** Row 21: `qlb claude journal resolve --back` on an orphaned journal whose `from` and `to` carry the AC41 body. */
+/** Row 21: `qlb claude journal resolve --back` on an orphaned journal with AC41 failure detail. */
 export async function runJournalResolve(): Promise<ScenarioArtifacts> {
   const now = 1_000_000;
   const dir = root('resolve');
@@ -584,7 +588,7 @@ export async function runJournalResolve(): Promise<ScenarioArtifacts> {
       const slots = new ClaudeSlots({ backend, repository, stashDir: join(dir, 'unclaimed'), now: () => now });
       const options = { home, env, configPath: paths.globalConfigPath, keychainService: paths.keychainService };
       createClaudeSwitchJournal({
-        v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: AC41_BODY, to: AC41_BODY, trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: null,
+        v: 1, provider: 'anthropic', attemptId: 'ac41-attempt', from: 'ac41-from-slot', to: 'ac41-to-slot', trigger: 'manual', by: 'qlb-cli', republish: false, injected: false, detail: AC41_BODY,
         decision: { leftHeadroom: null, leftRecoveryAt: null, leftTrigger: null }, outgoingKind: null, bindingJson: null, step: 7,
         stagedBlobService: 'qlb:anthropic:staged-rollback:ac41', stagedAccount: 'qlb', stagedWritten: false,
         keychainService: paths.keychainService, configPath: paths.globalConfigPath, configText: null, configWrittenHash: null, fromOauthAccount: null,
@@ -604,7 +608,7 @@ export async function runJournalResolve(): Promise<ScenarioArtifacts> {
       const back = take(await runExecutingCommand({ command, args: ['--back'] }, ctx));
       const rows = new DatabaseSync(dbPath, { readOnly: true });
       try {
-        return { ...flatten({ back }), switchRows: JSON.stringify(rows.prepare('SELECT detail, error, steps_json FROM switch_log').all()) };
+        return { ...flatten({ back }), switchRows: JSON.stringify(rows.prepare('SELECT from_account, to_account, detail, error, steps_json FROM switch_log').all()) };
       } finally { rows.close(); }
     } finally { repository.close(); store.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
