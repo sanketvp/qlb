@@ -17,6 +17,7 @@ export function isProviderAuthoritativeReading(
   if (reading.confidence !== 'authoritative') return false;
   if (reading.source !== 'provider-poll' && reading.source !== 'provider-headers') return false;
   if (!Number.isFinite(reading.fetchedAt) || reading.fetchedAt > now) return false;
+  if (reading.resetAt !== undefined && reading.resetAt <= now) return false;
   return now - reading.fetchedAt <= PROVIDER_READING_MAX_AGE_MS;
 }
 

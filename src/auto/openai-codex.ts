@@ -310,7 +310,11 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
   if (usage.windows && usage.windows.length > 0) {
     const readings = readingsFrom(usage, nowMs);
     const direct = authoritativeReadings(readings, nowMs);
-    if (!(await record(Object.keys(direct).length > 0 ? 'ok' : 'usage-unknown', readings))) return base(false, null, refresh, false);
+    if (Object.keys(direct).length === 0) {
+      if (!(await record('usage-unknown'))) return base(false, null, refresh, false);
+      return base(false, null, refresh, false);
+    }
+    if (!(await record('ok', readings))) return base(false, null, refresh, false);
     return {
       accountId,
       readings: direct,

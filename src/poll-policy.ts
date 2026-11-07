@@ -11,7 +11,7 @@ export const SERVE_TTL_S = 180.0;
 export const MIN_INTERVAL_S = 180.0;
 /** Active accounts with a relevant window rising into its own switch-line band. */
 export const URGENT_INTERVAL_S = 60.0;
-export const ACTIVE_MAX_INTERVAL_S = 300.0;
+export const ACTIVE_MAX_INTERVAL_S = 240.0;
 export const CANDIDATE_DEFAULT_INTERVAL_S = 300.0;
 export const CANDIDATE_MAX_INTERVAL_S = 600.0;
 export const EXHAUSTED_INTERVAL_S = 600.0;

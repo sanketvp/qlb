@@ -99,6 +99,30 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
   return row?.last429At !== null && row?.last429At !== undefined && nowS - row.last429At <= RECENT_429_WINDOW_S;
 }
 
+function needsCandidateRefresh(
+  activeId: string | null,
+  slots: ReturnType<ClaudeSlots['listSlots']>,
+  store: Store,
+  polls: Record<string, UsagePollRow>,
+  nowS: number,
+  settings: { threshold: number; weeklyThreshold: number | null },
+  models: readonly string[],
+): boolean {
+  if (activeId === null) return false;
+  const activeNeedsCandidate = Object.entries(store.getAllSnapshots(activeId)).some(([label, reading]) =>
+    isProviderAuthoritativeReading(reading, nowS * 1000)
+    && reading.usedPct >= (label === '5h' ? settings.threshold : settings.weeklyThreshold ?? settings.threshold),
+  );
+  if (!activeNeedsCandidate) return false;
+  return !freshAnthropicAccounts(slots, store, polls, nowS, models)
+    .some((account) => account.accountId !== activeId && Object.keys(account.buckets).length > 0);
+}
+
+function onDemandCandidate(ids: readonly string[], polls: Record<string, UsagePollRow>, nowS: number): string | null {
+  const ready = Object.fromEntries(ids.map((id) => [id, { ...polls[id], nextDueAt: nowS }]));
+  return dueCandidate(ids, ready, nowS);
+}
+
 /** The slot's live dead flag supersedes a legacy sticky poll status. */
 function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record<string, UsagePollRow>): Record<string, UsagePollRow> {
   const liveIds = new Set(slots.filter((slot) => !slot.dead).map((slot) => slot.accountId));
@@ -211,8 +235,12 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
     }
   }
 
+  const latestPolls = pollingState(slots, deps.store.listUsagePolls(PROVIDER));
   const inactiveIds = slots.filter((slot) => !slot.dead && slot.accountId !== activeId).map((slot) => slot.accountId);
-  const inactiveId = dueCandidate(inactiveIds, polls, nowS);
+  const inactiveId = dueCandidate(inactiveIds, latestPolls, nowS)
+    ?? (needsCandidateRefresh(activeId, slots, deps.store, latestPolls, nowS, settings, models)
+      ? onDemandCandidate(inactiveIds, latestPolls, nowS)
+      : null);
   if (inactiveId) {
     const previous = readUsage(deps.store.getAllSnapshots(inactiveId));
     let credential: string | null = null;
@@ -381,6 +409,9 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     lastSwitchAtMs,
     activeCredentialExpired: polls[activeAccountId ?? '']?.lastStatus === 'token-expired',
     activeUsageUnknown: deps.activeUsageUnknown === true,
+    activeUsagePollFailed: activeAccountId !== null && failedProviderAttemptAfterReadings(
+      deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId],
+    ),
     unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,
     idleHoldSinceMs: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}idleHoldSince`) : undefined,
     parkedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}parkedUntil`),

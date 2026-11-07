@@ -137,6 +137,22 @@ describe('auto anthropic poll (G8)', () => {
     if (result.decision.kind === 'switch') assert.equal(result.decision.reason, 'parked');
   });
 
+  it('does not park away from a provider reading after its reset', async () => {
+    const f = await fixture();
+    f.store.upsertSnapshot('active', '5h', {
+      usedPct: 100, resetAt: (NOW - 1) * 1000, fetchedAt: (NOW - 250) * 1000,
+      source: 'provider-poll', confidence: 'authoritative',
+    });
+    f.store.upsertSnapshot('inactive', '5h', {
+      usedPct: 100, resetAt: (NOW + 3000) * 1000, fetchedAt: NOW * 1000,
+      source: 'provider-poll', confidence: 'authoritative',
+    });
+
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => (NOW + 30) * 1000, dryRun: true });
+
+    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+  });
+
   it('makes a failed provider poll unknown instead of reusing its prior quota', async () => {
     const f = await fixture();
     for (const accountId of ['active', 'inactive']) {
@@ -146,8 +162,26 @@ describe('auto anthropic poll (G8)', () => {
       });
     }
     f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-500' });
-    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
-    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
+    for (let tick = 0; tick < 3; tick += 1) {
+      const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => (NOW + tick * 60) * 1000, dryRun: true });
+      assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 });
+    }
+  });
+
+  it('refreshes an unmeasured candidate when the active provider reading needs one', async () => {
+    const f = await fixture();
+    f.store.upsertSnapshot('active', '5h', {
+      usedPct: 100, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
+    });
+    f.store.writeUsagePollPlans('anthropic', {
+      active: { nextDueAt: NOW + 10_000, pollIntervalS: 240 },
+      inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 600 },
+    });
+
+    const accounts = await pollAnthropic(f.deps());
+
+    assert.equal(f.calls().gets, 1);
+    assert.equal(accounts.find((account) => account.accountId === 'inactive')?.buckets['5h']?.usedPct, 20);
   });
 
   it('an expired inactive slot is refreshed through the consume gate once', async () => {

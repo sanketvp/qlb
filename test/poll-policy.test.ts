@@ -278,14 +278,14 @@ describe('claude-swap poll policy port', () => {
     assert.equal(weeklyCandidate[1], 300);
   });
 
-  it('exports the C-swap cadence constants unchanged', () => {
+  it('keeps active poll cadence within provider authority', () => {
     assert.deepEqual({
       SERVE_TTL_S, MIN_INTERVAL_S, URGENT_INTERVAL_S, ACTIVE_MAX_INTERVAL_S,
       CANDIDATE_MAX_INTERVAL_S, EDGE_BACKOFF_S, POST_429_MIN_INTERVAL_S,
       POST_429_MAX_INTERVAL_S, EXHAUSTED_INTERVAL_S, JITTER_FRAC,
     }, {
       SERVE_TTL_S: 180, MIN_INTERVAL_S: 180, URGENT_INTERVAL_S: 60,
-      ACTIVE_MAX_INTERVAL_S: 300, CANDIDATE_MAX_INTERVAL_S: 600,
+      ACTIVE_MAX_INTERVAL_S: 240, CANDIDATE_MAX_INTERVAL_S: 600,
       EDGE_BACKOFF_S: 300, POST_429_MIN_INTERVAL_S: 360,
       POST_429_MAX_INTERVAL_S: 1800, EXHAUSTED_INTERVAL_S: 600, JITTER_FRAC: 0.1,
     });

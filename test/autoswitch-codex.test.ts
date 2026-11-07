@@ -180,7 +180,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal((h.records.at(-1)?.result.readings?.primary as { confidence: string }).confidence, 'authoritative');
   });
 
-  it('keeps rollout fallback readings advisory', async () => {
+  it('does not persist rollout fallback readings as usage success', async () => {
     const h = autoHarness({
       probeUsage: async () => ({
         status: 500,
@@ -192,8 +192,7 @@ describe('C8 Codex poll and refresh', () => {
 
     await codexAutoTick(h.deps);
 
-    const reading = h.records.at(-1)?.result.readings?.primary as { source: string; confidence: string };
-    assert.deepEqual(reading, { source: 'poll', confidence: 'advisory', usedPct: 12, fetchedAt: NOW });
+    assert.equal(h.records.at(-1)?.result.readings, undefined);
     assert.deepEqual((await codexAutoTick(h.deps)).readings, {});
     assert.equal(h.records.at(-1)?.result.status, 'usage-unknown');
   });
