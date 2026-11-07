@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credentialWithFixtureAccess } from './support/claude-fixtures';
+
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { runAuto, type LiveBinding } from '../src/auto';
 import { anthropicTick, pollAnthropic } from '../src/auto/anthropic';
@@ -29,10 +31,6 @@ import { openStore, openStoreConnection } from '../src/store';
 
 // Keep the rehearsal's injected clock inside the real cutover window.
 const NOW = Date.now();
-
-function credential(account: string, refresh: string, expiresAt = NOW + 3_600_000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${account}`, refreshToken: refresh, expiresAt } });
-}
 
 function response(usedPct: number): { status: number; body: string } {
   return { status: 200, body: JSON.stringify({ five_hour: { utilization: usedPct }, seven_day: { utilization: 10 } }) };
@@ -150,9 +148,9 @@ describe('Stage 1 sandbox dress rehearsal (G19)', () => {
       }));
       writeFileSync(join(backup, 'configs', '.claude-config-1-a@example.test.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test', organizationUuid: 'org-fixture' } }));
       writeFileSync(join(backup, 'configs', '.claude-config-2-b@example.test.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-b', emailAddress: 'b@example.test', organizationUuid: 'org-fixture' } }));
-      writeFileSync(join(backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('account-a', 'refresh-a')).toString('base64'));
-      await keychain.set('claude-swap', 'account-2-b@example.test', credential('account-b-before', 'refresh-b-before'));
-      await keychain.set(paths.keychainService, 'fixture-user', credential('account-a', 'refresh-a'));
+      writeFileSync(join(backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credentialWithFixtureAccess('account-a', 'refresh-a', NOW + 3_600_000)).toString('base64'));
+      await keychain.set('claude-swap', 'account-2-b@example.test', credentialWithFixtureAccess('account-b-before', 'refresh-b-before', NOW + 3_600_000));
+      await keychain.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('account-a', 'refresh-a', NOW + 3_600_000));
 
       await t.test('1. cutover begin drains the injected C-swap agent', async () => {
         const command = createCutoverCommand({ makeAgent: () => agent });
@@ -263,8 +261,8 @@ describe('Stage 1 sandbox dress rehearsal (G19)', () => {
 
       await t.test('6. one auto --once tick refreshes then switches the live Claude login to account-b', async () => {
         // This tick's production refresh path rotates account-a before its 95% reading triggers the switch.
-        await keychain.set('qlb:anthropic:account-a', 'qlb', credential('account-a', 'refresh-a', NOW - 1_000));
-        await keychain.set(paths.keychainService, 'fixture-user', credential('account-a', 'refresh-a', NOW - 1_000));
+        await keychain.set('qlb:anthropic:account-a', 'qlb', credentialWithFixtureAccess('account-a', 'refresh-a', NOW - 1_000));
+        await keychain.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('account-a', 'refresh-a', NOW - 1_000));
         const store = openStore(config.dbPath);
         const repository = SqliteClaudeSlotRepository.open(config.dbPath);
         const slots = new ClaudeSlots({ backend: keychain, repository, stashDir: join(home, '.qlb', 'unclaimed'), now: () => clock });
@@ -292,7 +290,7 @@ describe('Stage 1 sandbox dress rehearsal (G19)', () => {
             assert.equal(refreshed.outcome, 'posted');
             // Rotate the inactive slot through its production slot writer too, so both
             // C-swap destinations are stale before hand-back.
-            await slots.writeSlot('account-b', credential('account-b-rotated', 'refresh-b-rotated'), { cause: 'post', by: 'qlb-auto', evidence: 'post' });
+            await slots.writeSlot('account-b', credentialWithFixtureAccess('account-b-rotated', 'refresh-b-rotated', NOW + 3_600_000), { cause: 'post', by: 'qlb-auto', evidence: 'post' });
             return pollAnthropic({
               store, slots, now: () => Math.floor(clock / 1000), rng: () => 0.5,
               fetchActiveDeps: { live: liveDeps, env, now: () => clock, verdicts, by: 'qlb-auto', postRefresh: refresh },

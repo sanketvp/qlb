@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credentialWithRefreshTokenExpiry } from './support/claude-fixtures';
+
 import { claudeLoginExpiryCheck } from '../src/checks/claude-login-expiry';
 import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
 import { claudeUnpersistedTokenCheck } from '../src/checks/claude-unpersisted-token';
@@ -55,10 +57,6 @@ function insertSlot(dbPath: string, accountId: string, archivedAt: number | null
   }
 }
 
-function credential(expiresAt: unknown, tokens: Record<string, string> = {}): string {
-  return JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: expiresAt, ...tokens } });
-}
-
 function keychain(...entries: Array<[string, string]>): MockKeychain {
   const result = new MockKeychain();
   for (const [accountId, value] of entries) {
@@ -73,7 +71,7 @@ describe('claude:login-expiry doctor check', () => {
     insertSlot(dbPath, 'expired');
     insertSlot(dbPath, 'archived', NOW);
     insertSlot(dbPath, 'dead', null, 1);
-    const row = claudeLoginExpiryCheck(dbPath, keychain(['expired', credential(NOW - 1, {
+    const row = claudeLoginExpiryCheck(dbPath, keychain(['expired', credentialWithRefreshTokenExpiry(NOW - 1, {
       refreshToken: 'refresh-token-value', accessToken: 'access-token-value',
     })]), NOW);
     assert.deepEqual(row, {
@@ -90,14 +88,14 @@ describe('claude:login-expiry doctor check', () => {
   it('reports missing expiry, near expiry, and valid expiry without refresh or writes', () => {
     const dbPath = fixture();
     insertSlot(dbPath, 'slot');
-    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credential(0)]), NOW), {
+    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credentialWithRefreshTokenExpiry(0)]), NOW), {
       name: 'claude:login-expiry', level: 'PASS', message: 'expiry not reported',
     });
-    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credential(NOW + 7 * 24 * 60 * 60 * 1_000)]), NOW), {
+    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credentialWithRefreshTokenExpiry(NOW + 7 * 24 * 60 * 60 * 1_000)]), NOW), {
       name: 'claude:login-expiry', level: 'WARN',
       message: 'Claude login expires within 7 days: slot (2026-01-08T00:00:00Z)',
     });
-    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credential(NOW + 8 * 24 * 60 * 60 * 1_000)]), NOW), {
+    assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(['slot', credentialWithRefreshTokenExpiry(NOW + 8 * 24 * 60 * 60 * 1_000)]), NOW), {
       name: 'claude:login-expiry', level: 'PASS', message: 'Claude login expiry is valid',
     });
   });
@@ -107,8 +105,8 @@ describe('claude:login-expiry doctor check', () => {
     insertSlot(dbPath, 'valid');
     insertSlot(dbPath, 'unreported');
     assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(
-      ['valid', credential(NOW + 8 * 24 * 60 * 60 * 1_000)],
-      ['unreported', credential(0)],
+      ['valid', credentialWithRefreshTokenExpiry(NOW + 8 * 24 * 60 * 60 * 1_000)],
+      ['unreported', credentialWithRefreshTokenExpiry(0)],
     ), NOW), {
       name: 'claude:login-expiry', level: 'PASS',
       message: 'Claude login expiry is valid; expiry not reported for slot unreported',
@@ -132,8 +130,8 @@ describe('claude:login-expiry doctor check', () => {
     insertSlot(dbPath, 'unreadable');
     insertSlot(dbPath, 'expiring');
     assert.deepEqual(claudeLoginExpiryCheck(dbPath, keychain(
-      ['expired', credential(NOW - 1)],
-      ['expiring', credential(NOW + 7 * 24 * 60 * 60 * 1_000)],
+      ['expired', credentialWithRefreshTokenExpiry(NOW - 1)],
+      ['expiring', credentialWithRefreshTokenExpiry(NOW + 7 * 24 * 60 * 60 * 1_000)],
     ), NOW), {
       name: 'claude:login-expiry', level: 'FAIL',
       message: 'expired Claude login: expired (2025-12-31T23:59:59Z); Claude credential unreadable for slot unreadable; Claude login expires within 7 days: expiring (2026-01-08T00:00:00Z)',
@@ -155,7 +153,7 @@ describe('claude:login-expiry doctor check', () => {
       }
       const report = await doctorQlb(config, {
         command: () => '', hostCommand: () => '', now: () => NOW,
-        keychain: keychain(['slot', credential(NOW - 1)]),
+        keychain: keychain(['slot', credentialWithRefreshTokenExpiry(NOW - 1)]),
       });
       assert.equal(report.checks.find((row) => row.name === 'claude:login-expiry')?.level, 'FAIL', state);
       assert.deepEqual(s64DoctorVerdict({

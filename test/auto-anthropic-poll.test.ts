@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credentialWithStandardExpiry } from './support/claude-fixtures';
+
 import { pollAnthropic } from '../src/auto/anthropic';
 import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { claudePaths } from '../src/cc-paths';
@@ -15,10 +17,6 @@ import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000;
 
-function credential(tag: string, expiresAt = (NOW + 60 * 60) * 1000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${tag}`, refreshToken: `refresh-${tag}`, expiresAt } });
-}
-
 async function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-auto-anthropic-'));
   const env = { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home };
@@ -26,8 +24,8 @@ async function fixture() {
   const backend = new MockKeychain();
   let now = NOW;
   const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(home, 'unclaimed'), now: () => now * 1000 });
-  await slots.createSlot({ accountId: 'active', credential: credential('active'), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
-  await slots.createSlot({ accountId: 'inactive', credential: credential('inactive'), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
+  await slots.createSlot({ accountId: 'active', credential: credentialWithStandardExpiry('active'), email: 'active@example.test', orgUuid: 'active-org', slotNum: 1, source: 'fixture' });
+  await slots.createSlot({ accountId: 'inactive', credential: credentialWithStandardExpiry('inactive'), email: 'inactive@example.test', orgUuid: 'inactive-org', slotNum: 2, source: 'fixture' });
   store.setActiveLogin('anthropic', 'active', 'fixture', NOW);
   let gets = 0;
   const usageGets = new Map<string, number>();
@@ -95,7 +93,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('an expired inactive slot is refreshed through the consume gate once', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     await pollAnthropic(f.deps());
     assert.deepEqual(f.calls(), { gets: 1, posts: 1 });
@@ -149,7 +147,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('keeps scheduled readings known across steady 60-second ticks', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('active', credential('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('active', credentialWithStandardExpiry('active-long', (NOW + 7200) * 1000), { cause: 'fixture' });
     for (let tick = 0; tick < 60; tick += 1) {
       f.now(NOW + tick * 60);
       const accounts = await pollAnthropic(f.deps());
@@ -161,7 +159,7 @@ describe('auto anthropic poll (G8)', () => {
     const f = await fixture();
     const durationS = 120 * 60;
     for (const accountId of ['active', 'inactive']) {
-      await f.slots.writeSlot(accountId, credential(`${accountId}-long`, (NOW + 10_800) * 1000), { cause: 'fixture' });
+      await f.slots.writeSlot(accountId, credentialWithStandardExpiry(`${accountId}-long`, (NOW + 10_800) * 1000), { cause: 'fixture' });
     }
     f.store.writeUsagePollPlans('anthropic', {
       active: { nextDueAt: NOW, pollIntervalS: 300 },
@@ -191,7 +189,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('strikes a dead inactive token and never posts it again', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const deps = f.deps();
     let deadPosts = 0;
@@ -205,7 +203,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a lineage-moved dead strike does not quarantine an inactive slot', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const deps = f.deps();
     deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
@@ -217,7 +215,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('records an unpersisted inactive successor as a failed consume without using it', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     (f.slots as unknown as { writeSlot: () => Promise<void> }).writeSlot = async () => { throw new Error('fixture write failure'); };
     (f.slots as unknown as { stashUnclaimed: () => Promise<void> }).stashUnclaimed = async () => { throw new Error('fixture stash failure'); };
@@ -245,7 +243,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('rechecks active ownership before refreshing an inactive candidate', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const readSlot = f.slots.readSlot.bind(f.slots);
     let switched = false;
@@ -263,7 +261,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('never refreshes an inactive slot that shares Claude Code live lineage', async () => {
     const f = await fixture();
-    const expired = credential('shared', (NOW - 1) * 1000);
+    const expired = credentialWithStandardExpiry('shared', (NOW - 1) * 1000);
     await f.slots.writeSlot('inactive', expired, { cause: 'fixture' });
     await f.backend.set(f.paths.keychainService, 'fixture', expired);
     skipActive(f);
@@ -273,7 +271,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('uses the live credential for an active usage poll', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('live'));
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('live'));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     let servedLive = false;
     const deps = f.deps();
@@ -287,8 +285,8 @@ describe('auto anthropic poll (G8)', () => {
 
   it('an unknown credential adopted during expired-live recovery with an inconclusive probe records live-unattributed', async () => {
     const f = await fixture();
-    const expired = credential('active', (NOW - 1) * 1000);
-    const foreign = credential('foreign');
+    const expired = credentialWithStandardExpiry('active', (NOW - 1) * 1000);
+    const foreign = credentialWithStandardExpiry('foreign');
     await f.slots.writeSlot('active', expired, { cause: 'fixture' });
     await f.backend.set(f.paths.keychainService, 'fixture', expired);
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
@@ -313,7 +311,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('records usage when expired unknown live credentials are restored from the active slot backup', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign', (NOW - 1) * 1000));
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('foreign', (NOW - 1) * 1000));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     const deps = f.deps();
     const fetchDeps = deps.fetchActiveDeps as typeof deps.fetchActiveDeps & {
@@ -329,8 +327,8 @@ describe('auto anthropic poll (G8)', () => {
 
   it('records usage when an expired active slot posts a successor from its backup', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('active', credential('active', (NOW - 1) * 1000), { cause: 'fixture' });
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign', (NOW - 2) * 1000));
+    await f.slots.writeSlot('active', credentialWithStandardExpiry('active', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('foreign', (NOW - 2) * 1000));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     const deps = f.deps();
     const fetchDeps = deps.fetchActiveDeps as typeof deps.fetchActiveDeps & {
@@ -350,7 +348,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a foreign live credential with a profile 500 records live-unattributed and no usage under the active account', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign'));
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('foreign'));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     const deps = f.deps();
     deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
@@ -364,7 +362,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a foreign live credential with a mismatching profile records foreign-credential and 0 POSTs', async () => {
     const f = await fixture();
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('foreign'));
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('foreign'));
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     const deps = f.deps();
     deps.resyncDeps.readLiveIdentity = () => ({ accountId: 'active', email: 'active@example.test', orgUuid: 'active-org' });
@@ -378,7 +376,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a same-account rotation attributed by the probe in the same pass records usage', async () => {
     const f = await fixture();
-    const rotated = credential('active-rotated');
+    const rotated = credentialWithStandardExpiry('active-rotated');
     await f.backend.set(f.paths.keychainService, 'fixture', rotated);
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     const deps = f.deps();
@@ -394,13 +392,13 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a re-logged-in slot is polled again', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const deps = f.deps();
     deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_grant"}' });
     await pollAnthropic(deps);
     assert.equal(f.slots.getSlot('inactive')?.dead, true);
-    await f.slots.writeSlot('inactive', credential('relogged'), { cause: 'fixture-relogin' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('relogged'), { cause: 'fixture-relogin' });
     const dueAt = f.store.listUsagePolls('anthropic').inactive?.nextDueAt;
     assert.ok(dueAt !== undefined);
     f.now(dueAt!);
@@ -430,7 +428,7 @@ describe('auto anthropic poll (G8)', () => {
     await pollAnthropic(f.deps());
     const dueAt = f.store.listUsagePolls('anthropic').active?.nextDueAt;
     assert.ok(dueAt !== undefined);
-    await f.slots.writeSlot('active', credential('expired-active', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('active', credentialWithStandardExpiry('expired-active', (NOW - 1) * 1000), { cause: 'fixture' });
     f.now(dueAt!);
     await pollAnthropic(f.deps());
     f.now(dueAt! + 181);
@@ -440,7 +438,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('keeps polling and repairs a same-account Claude Code rotation across many ticks', async () => {
     const f = await fixture();
-    const rotated = credential('active-rotated', (NOW + 7_200) * 1000);
+    const rotated = credentialWithStandardExpiry('active-rotated', (NOW + 7_200) * 1000);
     await f.backend.set(f.paths.keychainService, 'fixture', rotated);
     f.store.writeUsagePollPlans('anthropic', { inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 300 } });
     const deps = f.deps();
@@ -475,10 +473,10 @@ describe('auto anthropic poll (G8)', () => {
 
   it('a spend-guard skip yields to the next inactive candidate', async () => {
     const f = await fixture();
-    const shared = credential('shared', (NOW - 1) * 1000);
+    const shared = credentialWithStandardExpiry('shared', (NOW - 1) * 1000);
     await f.slots.writeSlot('inactive', shared, { cause: 'fixture' });
     await f.backend.set(f.paths.keychainService, 'fixture', shared);
-    await f.slots.createSlot({ accountId: 'other', credential: credential('other'), email: 'other@example.test', orgUuid: 'other-org', slotNum: 3, source: 'fixture' });
+    await f.slots.createSlot({ accountId: 'other', credential: credentialWithStandardExpiry('other'), email: 'other@example.test', orgUuid: 'other-org', slotNum: 3, source: 'fixture' });
     skipActive(f);
     await pollAnthropic(f.deps());
     f.now(NOW + 1);
@@ -488,7 +486,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('an unreadable live credential fails closed before inactive spend', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const deps = f.deps();
     deps.fetchActiveDeps.live.backend.get = async () => { throw new Error('fixture unreadable'); };
@@ -498,8 +496,8 @@ describe('auto anthropic poll (G8)', () => {
 
   it('does not spend an expired inactive slot when no active row exists', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
-    await f.backend.set(f.paths.keychainService, 'fixture', credential('rotated-live'));
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.backend.set(f.paths.keychainService, 'fixture', credentialWithStandardExpiry('rotated-live'));
     f.store.setActiveLogin('anthropic', null, 'fixture', NOW);
     f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 300, pollIntervalS: 300 } });
     await pollAnthropic(f.deps());
@@ -508,7 +506,7 @@ describe('auto anthropic poll (G8)', () => {
 
   it('records inactive invalid_client for the doctor check', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('inactive', credential('expired', (NOW - 1) * 1000), { cause: 'fixture' });
+    await f.slots.writeSlot('inactive', credentialWithStandardExpiry('expired', (NOW - 1) * 1000), { cause: 'fixture' });
     skipActive(f);
     const deps = f.deps();
     deps.consumeDeps.postRefresh = async () => ({ status: 400, body: '{"error":"invalid_client"}' });

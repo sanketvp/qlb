@@ -6,6 +6,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { oauthCredential } from './support/claude-fixtures';
+
 import {
   adoptStashedSuccessor,
   persistStash,
@@ -20,10 +22,6 @@ import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/k
 import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
 
 const NOW = 1_730_000_000_000;
-
-function credential(access: string, refresh: string, expires = NOW + 30_000): OAuthCredential {
-  return { type: 'oauth', access, refresh, expires };
-}
 
 function lineage(refresh: string): string {
   return `sha256:${createHash('sha256').update(refresh, 'utf8').digest('hex')}`;
@@ -65,7 +63,7 @@ describe('single-grant stash store', () => {
     const keychain = new StashFailingKeychain();
     try {
       process.env.HOME = isolatedOsHome;
-      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, { env: {}, now: () => NOW });
+      await persistStash('xai', oauthCredential('issued', 'next'), lineage('before'), keychain, { env: {}, now: () => NOW });
       const [entry] = await listStashes(root(processHome), 'xai', 'default');
       assert.ok(entry);
       assert.equal(existsSync(root(isolatedOsHome)), false);
@@ -86,7 +84,7 @@ describe('single-grant stash store', () => {
       process.env.HOME = isolatedOsHome;
       assert.equal(homedir(), isolatedOsHome);
       await assert.rejects(
-        persistStash('xai', credential('issued', 'next'), lineage('before'), new StashFailingKeychain(), { env: {}, now: () => NOW }),
+        persistStash('xai', oauthCredential('issued', 'next'), lineage('before'), new StashFailingKeychain(), { env: {}, now: () => NOW }),
         /explicit home/,
       );
     } finally {
@@ -103,7 +101,7 @@ describe('single-grant stash store', () => {
     const keychain = new StashFailingKeychain();
     keychain.failStashWrites = true;
     try {
-      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, { home, now: () => NOW });
+      await persistStash('xai', oauthCredential('issued', 'next'), lineage('before'), keychain, { home, now: () => NOW });
       const [entry] = await listStashes(root(home), 'xai', 'default');
       assert.equal(entry?.location, 'file');
       assert.equal(existsSync(join(root(home), 'xai', `${entry?.stashId}.json`)), true);
@@ -128,7 +126,7 @@ describe('single-grant stash store', () => {
       },
     };
     try {
-      await persistStash('xai', credential('issued', 'next'), lineage('before'), keychain, deps);
+      await persistStash('xai', oauthCredential('issued', 'next'), lineage('before'), keychain, deps);
       const [entry] = await listStashes(root(home), 'xai', 'default');
       assert.equal(entry?.location, 'file');
       assert.equal(existsSync(join(root(home), 'xai', `${entry?.stashId}.json`)), true);
@@ -141,8 +139,8 @@ describe('single-grant stash store', () => {
   it('adopting a file-fallback stash deletes the file and its row and never calls the Keychain delete', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
-    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const current = oauthCredential('before', 'before-refresh');
+    const successor = oauthCredential('issued', 'next-refresh', NOW + 60_000);
     const primary = qlbKeychainService('xai', 'default');
     keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
     keychain.failStashWrites = true;
@@ -163,8 +161,8 @@ describe('single-grant stash store', () => {
   it('adopting a Keychain stash deletes the item and leaves no file', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
-    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const current = oauthCredential('before', 'before-refresh');
+    const successor = oauthCredential('issued', 'next-refresh', NOW + 60_000);
     const stashId = 'keychain-stash';
     const stashService = qlbKeychainService('xai', `unclaimed:${stashId}`);
     keychain.setSync(qlbKeychainService('xai', 'default'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
@@ -186,8 +184,8 @@ describe('single-grant stash store', () => {
   it('three xAI passes after a file-fallback adoption leave zero rows and the primary unchanged', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
-    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const current = oauthCredential('before', 'before-refresh');
+    const successor = oauthCredential('issued', 'next-refresh', NOW + 60_000);
     const primary = qlbKeychainService('xai', 'default');
     keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
     keychain.failStashWrites = true;
@@ -208,7 +206,7 @@ describe('single-grant stash store', () => {
   it('clears a reservation whose body is absent in both places', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
+    const current = oauthCredential('before', 'before-refresh');
     const warnings: string[] = [];
     try {
       await recordStash(root(home), {
@@ -225,7 +223,7 @@ describe('single-grant stash store', () => {
   it('defers a present but corrupt stash rather than treating it as an orphan', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
+    const current = oauthCredential('before', 'before-refresh');
     const stashId = 'corrupt-stash';
     try {
       await recordStash(root(home), {
@@ -244,8 +242,8 @@ describe('single-grant stash store', () => {
   it('a stash that is not newer than the installed primary is removed, never re-installed', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('primary', 'same-refresh', NOW + 60_000);
-    const stale = credential('stale', 'same-refresh', NOW + 60_000);
+    const current = oauthCredential('primary', 'same-refresh', NOW + 60_000);
+    const stale = oauthCredential('stale', 'same-refresh', NOW + 60_000);
     const stashId = 'obsolete-stash';
     const primary = qlbKeychainService('xai', 'default');
     keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify(current));
@@ -279,7 +277,7 @@ describe('single-grant stash store', () => {
         credential: JSON.stringify({ claudeAiOauth: { accessToken: 'claude-access', refreshToken: 'claude-refresh', expiresAt: NOW + 60_000 } }),
         source: 'test',
       });
-      await persistStash('xai', credential('issued', 'next'), lineage('before'), xaiKeychain, { home, now: () => NOW });
+      await persistStash('xai', oauthCredential('issued', 'next'), lineage('before'), xaiKeychain, { home, now: () => NOW });
 
       assert.equal(await claudeSlots.adoptStashedSuccessor('claude-slot'), null);
       assert.deepEqual(await claudeSlots.sweepUnclaimed(), { swept: 0, retained: 0 });
@@ -291,8 +289,8 @@ describe('single-grant stash store', () => {
   it('an unreadable second row after a successful adoption still reports adopted', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
-    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const current = oauthCredential('before', 'before-refresh');
+    const successor = oauthCredential('issued', 'next-refresh', NOW + 60_000);
     const firstStashId = 'adopt-first';
     const secondStashId = 'unreadable-second';
     const warnings: string[] = [];
@@ -317,8 +315,8 @@ describe('single-grant stash store', () => {
   it('a row left by a failed cleanup is removed on the next pass after the refresh token rotated', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
-    const successor = credential('issued', 'next-refresh', NOW + 60_000);
+    const current = oauthCredential('before', 'before-refresh');
+    const successor = oauthCredential('issued', 'next-refresh', NOW + 60_000);
     const warnings: string[] = [];
     try {
       await persistStash('xai', successor, lineage('before-refresh'), keychain, { home, now: () => NOW });
@@ -341,8 +339,8 @@ describe('single-grant stash store', () => {
       const store = new Store(':memory:');
       const accountId = ADAPTER_ACCOUNT_IDS[provider];
       const primary = qlbKeychainService(provider, 'default');
-      const before = credential('before', 'before-refresh');
-      const successor = credential('issued', 'issued-refresh', NOW + 60_000);
+      const before = oauthCredential('before', 'before-refresh');
+      const successor = oauthCredential('issued', 'issued-refresh', NOW + 60_000);
       store.upsertAccount(accountId, provider, provider);
       store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
       keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
@@ -376,12 +374,12 @@ describe('single-grant stash store', () => {
       const store = new Store(':memory:');
       const accountId = ADAPTER_ACCOUNT_IDS[provider];
       const primary = qlbKeychainService(provider, 'default');
-      const before = credential('before', 'before-refresh', NOW - 100_000);
+      const before = oauthCredential('before', 'before-refresh', NOW - 100_000);
       store.upsertAccount(accountId, provider, provider);
       store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify({ accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] }));
       keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
       try {
-        await persistStash(provider, credential('issued', 'issued-refresh', NOW - 1), lineage('before-refresh'), keychain, { home, now: () => NOW });
+        await persistStash(provider, oauthCredential('issued', 'issued-refresh', NOW - 1), lineage('before-refresh'), keychain, { home, now: () => NOW });
         let posts = 0;
         const result = await consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
           keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
@@ -405,7 +403,7 @@ describe('single-grant stash store', () => {
       const store = new Store(':memory:');
       const accountId = ADAPTER_ACCOUNT_IDS[provider];
       const primary = qlbKeychainService(provider, 'default');
-      const before = credential('before', 'before-refresh');
+      const before = oauthCredential('before', 'before-refresh');
       const detail = { accounts: [{ id: accountId, provider, label: provider, keychain: sharedSingleGrantCoords(provider) }] };
       // A hand-back marker lands while the stash body is being read.
       let armed = false;
@@ -419,7 +417,7 @@ describe('single-grant stash store', () => {
       store.upsertMigration(`pi-${provider}`, 'QLB_OWNED', JSON.stringify(detail));
       keychain.setSync(primary, QLB_KEYCHAIN_ACCOUNT, JSON.stringify({ ...before, generation: 0 }));
       try {
-        await persistStash(provider, credential('issued', 'issued-refresh', NOW + 60_000), lineage('before-refresh'), keychain, { home, now: () => NOW });
+        await persistStash(provider, oauthCredential('issued', 'issued-refresh', NOW + 60_000), lineage('before-refresh'), keychain, { home, now: () => NOW });
         armed = true;
         await assert.rejects(consumeSingleCredential(provider, { access: before.access, expires: before.expires! }, {
           keychain, home, store, lock: createInMemorySingleConsumeLock(), now: () => NOW,
@@ -434,7 +432,7 @@ describe('single-grant stash store', () => {
   it('a Linux-style operational keychain error with no fallback file defers and keeps the row', async () => {
     const home = await mkdtemp(join(tmpdir(), 'qlb-single-stash-'));
     const keychain = new StashFailingKeychain();
-    const current = credential('before', 'before-refresh');
+    const current = oauthCredential('before', 'before-refresh');
     try {
       await recordStash(root(home), {
         provider: 'xai', accountId: 'default', stashId: 'linux-operational', consumedFp: lineage('before-refresh'), location: 'keychain', createdAt: NOW,

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credentialWithStandardExpiry, credentialWithTokens } from './support/claude-fixtures';
+
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
 import { ClaudeSlots, SqliteClaudeSlotRepository } from '../src/cc-slots';
@@ -21,14 +23,6 @@ import { runPiGate } from '../src/pi-gate';
 import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000_000;
-
-function credentialWithTokens(accessToken: string, refreshToken: string, expiresAt = NOW + 60 * 60_000): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken, refreshToken, expiresAt } });
-}
-
-function credential(tag: string, expiresAt = NOW + 60 * 60_000): string {
-  return credentialWithTokens(`access-${tag}`, `refresh-${tag}`, expiresAt);
-}
 
 function accessFingerprint(token: string): string {
   return `sha256-at:${createHash('sha256').update(token, 'utf8').digest('hex')}`;
@@ -59,7 +53,7 @@ async function fixture(): Promise<Fixture> {
     stashDir: join(home, 'unclaimed'),
     now: () => NOW,
   });
-  const initial = credential('slot');
+  const initial = credentialWithStandardExpiry('slot');
   await slots.createSlot({ accountId: 'account-a', credential: initial, email: 'a@example.test', orgUuid: 'org-a', source: 'cswap-import' });
   await backend.set(paths.keychainService, 'fixture-user', initial);
   return { dbPath, store, slots, backend, live, env };
@@ -94,7 +88,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     let posts = 0;
     const result = await run(f, accessFingerprint('access-slot'), async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     });
     assert.equal(result.code, 0);
     assert.equal(posts, 1);
@@ -106,7 +100,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     let posts = 0;
     const refresh: NonNullable<AnthropicGateDeps['refresh']> = async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     };
     const fp = accessFingerprint('access-slot');
     const [first, second] = await Promise.all([run(f, fp, refresh), run(f, fp, refresh)]);
@@ -120,7 +114,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     let posts = 0;
     const refresh: NonNullable<AnthropicGateDeps['refresh']> = async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     };
     await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithTokens('access-first', 'refresh-slot'));
     assert.equal((await run(f, accessFingerprint('access-first'), refresh)).code, 0);
@@ -135,7 +129,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     let posts = 0;
     const result = await run(f, accessFingerprint('different-access'), async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     });
     assert.equal(result.code, 0);
     assert.equal(posts, 0);
@@ -145,11 +139,11 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
 
   it('a served token whose lineage is not the slot\'s is never forced', async () => {
     const f = await fixture();
-    await f.slots.writeSlot('account-a', credential('slot-successor'), { cause: 'post', by: 'qlb-gate', evidence: 'post' });
+    await f.slots.writeSlot('account-a', credentialWithStandardExpiry('slot-successor'), { cause: 'post', by: 'qlb-gate', evidence: 'post' });
     let posts = 0;
     const result = await run(f, accessFingerprint('access-slot'), async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     });
     assert.equal(result.code, 0);
     assert.equal(posts, 0);
@@ -164,7 +158,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
     let posts = 0;
     const result = await run(f, accessFingerprint('access-slot'), async () => {
       posts += 1;
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     });
     assert.equal(result.code, 0);
     assert.equal(posts, 0);
@@ -179,7 +173,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
       calls += 1;
       return calls === 1
         ? { outcome: 'deferred', deferReason: 'locks-held' }
-        : posted(credential('rotated'));
+        : posted(credentialWithStandardExpiry('rotated'));
     };
     assert.equal((await run(f, fp, refresh)).code, 3);
     assert.equal(f.store.getConfig('pi.anthropic.forced401'), null);
@@ -205,7 +199,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
       posts += 1;
       // A concurrent `qlb switch` lands as soon as the refresh drops its locks.
       f.store.setActiveLogin('anthropic', 'account-b', 'fixture');
-      return posted(credential('rotated'));
+      return posted(credentialWithStandardExpiry('rotated'));
     });
     assert.equal(result.code, 3);
     assert.equal(posts, 1);
@@ -241,7 +235,7 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
   });
 
   it('startedPost is exhaustive over every RefreshOutcome variant', () => {
-    const working = credential('working');
+    const working = credentialWithStandardExpiry('working');
     const cases: Array<{ outcome: RefreshOutcome; expected: boolean }> = [
       { outcome: { outcome: 'posted', working }, expected: true },
       { outcome: { outcome: 'restored', working }, expected: false },

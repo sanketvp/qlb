@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import { credentialWithRefresh } from './support/claude-fixtures';
+
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { undoIncompleteCheck } from '../src/checks/undo-incomplete';
 import { runAutoCommand } from '../src/commands/auto';
@@ -35,10 +37,6 @@ const support = join(__dirname, '..', '..', 'test', 'support');
 const { buildV4Store } = require(join(support, 'v4-fixture.cjs')) as {
   buildV4Store: (path: string, rows?: Array<Record<string, unknown>>) => string;
 };
-
-function credential(account: string, refresh: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: `access-${account}`, refreshToken: refresh, expiresAt: 1_800_000_000_000 } });
-}
 
 function lineage(refresh: string): string {
   return `sha256:${createHash('sha256').update(refresh, 'utf8').digest('hex')}`;
@@ -108,7 +106,7 @@ function addSlot(f: Fixture, input: { accountId: string; number: number; email: 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
       input.accountId, input.number, input.email, '{}', lineage(input.refresh), 1, input.source ?? 'cswap-import', input.dead ? 1 : 0,
     );
-    f.keychain.set(`qlb:anthropic:${input.accountId}`, 'qlb', credential(input.accountId, input.refresh));
+    f.keychain.set(`qlb:anthropic:${input.accountId}`, 'qlb', credentialWithRefresh(input.accountId, input.refresh));
     if (input.active) {
       db.prepare("INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', ?, 1, 'test')")
         .run(input.accountId);
@@ -197,7 +195,7 @@ describe('qlb undo cswap --dry-run', () => {
     const f = fixture();
     try {
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('account-a', 'refresh-stale'));
       writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'stale encrypted fixture');
 
       assert.equal(await dryRun(f), 0);
@@ -222,7 +220,7 @@ describe('qlb undo cswap --dry-run', () => {
     try {
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-equal', active: true });
       // Access-token differences must not turn an equal refresh lineage into an update.
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('other-access', 'refresh-equal'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('other-access', 'refresh-equal'));
 
       assert.equal(await dryRun(f), 0);
       const plan = JSON.parse(f.output[0]!);
@@ -239,7 +237,7 @@ describe('qlb undo cswap --dry-run', () => {
     try {
       addSlot(f, { accountId: 'account-dead', number: 1, email: 'dead@example.test', refresh: 'refresh-dead', active: true, dead: true });
       addSlot(f, { accountId: 'account-healthy', number: 2, email: 'healthy@example.test', refresh: 'refresh-healthy' });
-      f.keychain.set('claude-swap', 'account-2-healthy@example.test', credential('account-healthy', 'refresh-healthy'));
+      f.keychain.set('claude-swap', 'account-2-healthy@example.test', credentialWithRefresh('account-healthy', 'refresh-healthy'));
 
       assert.equal(await dryRun(f), 0);
       const plan = JSON.parse(f.output[0]!);
@@ -254,7 +252,7 @@ describe('qlb undo cswap --dry-run', () => {
     const f = fixture();
     try {
       addSlot(f, { accountId: 'account-a', number: 1, email: 'new@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.set('claude-swap', 'account-1-new@example.test', credential('account-a', 'refresh-current'));
+      f.keychain.set('claude-swap', 'account-1-new@example.test', credentialWithRefresh('account-a', 'refresh-current'));
       const oldEnc = join(f.backup, 'credentials', '.creds-1-old@example.test.enc');
       writeFileSync(oldEnc, 'stale encrypted fixture');
 
@@ -269,7 +267,7 @@ describe('qlb undo cswap --dry-run', () => {
     const f = fixture();
     try {
       addSlot(f, { accountId: 'account-one', number: 1, email: 'one@example.test', refresh: 'refresh-one', active: true });
-      f.keychain.set('claude-swap', 'account-1-one@example.test', credential('account-one', 'refresh-one'));
+      f.keychain.set('claude-swap', 'account-1-one@example.test', credentialWithRefresh('account-one', 'refresh-one'));
       writeFileSync(join(f.backup, 'credentials', '.creds-11-eleven@example.test.enc'), 'other slot fixture');
 
       assert.equal(await dryRun(f), 0);
@@ -336,7 +334,7 @@ describe('qlb undo cswap --dry-run', () => {
     const f = fixture();
     try {
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-old'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('account-a', 'refresh-old'));
       writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'stale encrypted fixture');
       const before = snapshot(f.root);
 
@@ -571,18 +569,18 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-before', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('old', 'refresh-old'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('old', 'refresh-old'));
       let held = true;
       f.keychain.writes.length = 0;
       assert.equal(await undo(f, {
         listHeldLocks: () => held ? ['consume-anthropic-account-a.lock'] : [],
         sleep: async () => {
           held = false;
-          await f.keychain.set('qlb:anthropic:account-a', 'qlb', credential('account-a', 'refresh-successor'));
+          await f.keychain.set('qlb:anthropic:account-a', 'qlb', credentialWithRefresh('account-a', 'refresh-successor'));
         },
-        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-successor'), accountId: 'account-a' }),
+        readActiveCredential: async () => ({ credential: credentialWithRefresh('account-a', 'refresh-successor'), accountId: 'account-a' }),
       }), 0);
-      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-successor'));
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credentialWithRefresh('account-a', 'refresh-successor'));
       assert.equal(f.keychain.writes.filter(({ service }) => service === 'claude-swap').length, 2);
     } finally { close(f); }
   });
@@ -592,7 +590,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
-      const rotated = credential('account-a', 'refresh-native');
+      const rotated = credentialWithRefresh('account-a', 'refresh-native');
       writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
       await f.keychain.set('Claude Code-credentials', 'fixture-user', rotated);
       let profiles = 0;
@@ -614,8 +612,8 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-shared', active: true });
-      const live = credential('live-access', 'refresh-shared');
-      await f.keychain.set('qlb:anthropic:account-a', 'qlb', credential('slot-access', 'refresh-shared'));
+      const live = credentialWithRefresh('live-access', 'refresh-shared');
+      await f.keychain.set('qlb:anthropic:account-a', 'qlb', credentialWithRefresh('slot-access', 'refresh-shared'));
       writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
       await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
       assert.equal(await undo(f, {
@@ -632,7 +630,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
-      const live = credential('account-a', 'refresh-live');
+      const live = credentialWithRefresh('account-a', 'refresh-live');
       writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'live@example.test', organizationUuid: 'live-org' } }));
       await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
       assert.equal(await undo(f, {
@@ -655,7 +653,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
-      const live = credential('account-a', 'refresh-live');
+      const live = credentialWithRefresh('account-a', 'refresh-live');
       writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'other@example.test' } }));
       await f.keychain.set('Claude Code-credentials', 'fixture-user', live);
       f.keychain.writes.length = 0;
@@ -673,7 +671,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-slot', active: true });
-      const rotated = credential('account-a', 'refresh-native');
+      const rotated = credentialWithRefresh('account-a', 'refresh-native');
       writeFileSync(join(f.home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
       await f.keychain.set('Claude Code-credentials', 'fixture-user', rotated);
       f.keychain.writes.length = 0;
@@ -853,16 +851,16 @@ describe('qlb undo cswap hand-back', () => {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-active', active: true });
       addSlot(f, { accountId: 'account-b', number: 2, email: 'b@example.test', refresh: 'refresh-before' });
-      f.keychain.set('claude-swap', 'account-2-b@example.test', credential('old', 'refresh-old'));
+      f.keychain.set('claude-swap', 'account-2-b@example.test', credentialWithRefresh('old', 'refresh-old'));
       assert.equal(await undo(f, {
         plan: async (deps) => {
           const { planHandBack: freshPlan } = await import('../src/cswap-undo');
           const plan = await freshPlan(deps);
-          await f.keychain.set('qlb:anthropic:account-b', 'qlb', credential('account-b', 'refresh-successor'));
+          await f.keychain.set('qlb:anthropic:account-b', 'qlb', credentialWithRefresh('account-b', 'refresh-successor'));
           return plan;
         },
       }), 0);
-      assert.equal(await f.keychain.get('claude-swap', 'account-2-b@example.test'), credential('account-b', 'refresh-successor'));
+      assert.equal(await f.keychain.get('claude-swap', 'account-2-b@example.test'), credentialWithRefresh('account-b', 'refresh-successor'));
     } finally { close(f); }
   });
 
@@ -883,7 +881,7 @@ describe('qlb undo cswap hand-back', () => {
       assert.equal(await undo(f, {
         keychain,
         withActiveLocks: async (fn) => { underLock = true; try { return await fn(); } finally { underLock = false; } },
-        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-before'), accountId: 'account-a' }),
+        readActiveCredential: async () => ({ credential: credentialWithRefresh('account-a', 'refresh-before'), accountId: 'account-a' }),
       }), 0);
       assert.ok(reads.includes('locked'), `active slot reads: ${reads.join(',')}`);
     } finally { close(f); }
@@ -1218,9 +1216,9 @@ describe('qlb undo cswap hand-back', () => {
         store.recordLineage({ provider: 'anthropic', accountId: 'account-a', fromFp: lineage('refresh-spent'), toFp: lineage('refresh-successor'), cause: 'resync', by: 'test', evidence: 'lineage' });
       } finally { store.close(); }
       assert.equal(await undo(f, {
-        readActiveCredential: async () => ({ credential: credential('account-a', 'refresh-spent'), accountId: 'account-a' }),
+        readActiveCredential: async () => ({ credential: credentialWithRefresh('account-a', 'refresh-spent'), accountId: 'account-a' }),
       }), 0);
-      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-successor'));
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credentialWithRefresh('account-a', 'refresh-successor'));
     } finally { close(f); }
   });
 
@@ -1231,7 +1229,7 @@ describe('qlb undo cswap hand-back', () => {
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
       f.keychain.set('claude-swap', 'account-1-a@example.test', 'malformed fixture');
       assert.equal(await undo(f), 0);
-      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credential('account-a', 'refresh-current'));
+      assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test'), credentialWithRefresh('account-a', 'refresh-current'));
       assert.equal(await f.keychain.get('claude-swap', 'account-1-a@example.test.prev'), 'malformed fixture');
     } finally { close(f); }
   });
@@ -1322,7 +1320,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credential('old', 'refresh-stale')).toString('base64'));
+      writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), Buffer.from(credentialWithRefresh('old', 'refresh-stale')).toString('base64'));
       assert.equal(await undo(f, { deleteEnc: () => undefined }), 1);
       const store = openStore(f.dbPath);
       try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
@@ -1334,7 +1332,7 @@ describe('qlb undo cswap hand-back', () => {
     try {
       beginUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      assert.equal(await undo(f, { readBack: async () => credential('wrong', 'refresh-wrong') }), 1);
+      assert.equal(await undo(f, { readBack: async () => credentialWithRefresh('wrong', 'refresh-wrong') }), 1);
       const store = openStore(f.dbPath);
       try { assert.equal(phase(store).state, 'undoing'); } finally { store.close(); }
     } finally { close(f); }
@@ -1480,7 +1478,7 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     try {
       completedUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-equal', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('different-access', 'refresh-equal'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('different-access', 'refresh-equal'));
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'PASS', message: 'all undo credential lineages match',
       });
@@ -1496,7 +1494,7 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     try {
       completedUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('account-a', 'refresh-stale'));
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'WARN', message: 'slot 1: credential lineage changed after hand-back',
       });
@@ -1543,7 +1541,7 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     try {
       completedUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-equal', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-equal'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('account-a', 'refresh-equal'));
       writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
@@ -1556,7 +1554,7 @@ describe('qlb undo lineage-match doctor diagnostic', () => {
     try {
       completedUndo(f);
       addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-current', active: true });
-      f.keychain.set('claude-swap', 'account-1-a@example.test', credential('account-a', 'refresh-stale'));
+      f.keychain.set('claude-swap', 'account-1-a@example.test', credentialWithRefresh('account-a', 'refresh-stale'));
       writeFileSync(join(f.backup, 'credentials', '.creds-1-a@example.test.enc'), 'fixture');
       assert.deepEqual(await undoLineageMatchCheck(f.dbPath, { available: true, phase: 'rolled-back' }, f.keychain, f.backup), {
         name: 'undo:lineage-match', level: 'FAIL', message: 'slot 1: encrypted credential remains',
