@@ -125,6 +125,21 @@ describe('qlb resolve — store-backed end-to-end', () => {
     store.close();
   });
 
+  it('fails closed when a failed provider poll shares the reading second', () => {
+    const store = openStore(':memory:');
+    const second = Math.floor(Date.now() / 1000) - 1;
+    store.upsertAccount('account', 'anthropic', 'account');
+    store.upsertSnapshot('account', '5h', { ...reading(10), fetchedAt: second * 1000 + 100 });
+    store.upsertSnapshot('account', '7d', { ...reading(10), fetchedAt: second * 1000 + 100 });
+    store.recordUsagePollResult('anthropic', 'account', { attemptedAt: second, status: 'http-500' });
+    const decision = resolveFromSnapshots({
+      model: 'claude-sonnet-5', snapshots: snapshotsFromStore(store, 'anthropic'), store,
+    });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
+    store.close();
+  });
+
   it('excludes inactive accounts from store-backed pool measurement', () => {
     const store = openStore(':memory:');
     seed(store, 'active', { '5h': reading(100), '7d': reading(100) });
