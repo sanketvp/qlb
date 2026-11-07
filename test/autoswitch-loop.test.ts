@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { credential } from './support/claude-fixtures';
+
 import { anthropicTick } from '../src/auto/anthropic';
 import type { AutoswitchAccount } from '../src/autoswitch';
 import { makeProductionSwitchDeps } from '../src/commands/switch-anthropic';
@@ -59,15 +61,14 @@ async function realSwitchFixture() {
   const env = { HOME: home, QLB_HOME: join(home, 'qlb'), QLB_TEST_MODE: '1' };
   const paths = claudePaths({ home, env });
   mkdirSync(dirname(paths.globalConfigPath), { recursive: true });
-  const credential = (tag: string) => JSON.stringify({ claudeAiOauth: { accessToken: `fixture-access-${tag}`, refreshToken: `fixture-refresh-${tag}`, expiresAt: NOW + 60 * 60_000 } });
   writeFileSync(paths.globalConfigPath, `${JSON.stringify({ oauthAccount: { accountUuid: '1' } })}\n`);
   const store = openStore(join(home, 'qlb.db'));
   const repository = SqliteClaudeSlotRepository.open(join(home, 'qlb.db'));
   const backend = new MockKeychain();
   const slots = new ClaudeSlots({ backend, repository, stashDir: join(home, 'unclaimed') });
-  await slots.createSlot({ accountId: '1', credential: credential('one'), slotNum: 1, configJson: JSON.stringify({ oauthAccount: { accountUuid: '1' } }), source: 'fixture' });
-  await slots.createSlot({ accountId: '2', credential: credential('two'), slotNum: 2, configJson: JSON.stringify({ oauthAccount: { accountUuid: '2' } }), source: 'fixture' });
-  await backend.set(paths.keychainService, 'fixture-user', credential('one'));
+  await slots.createSlot({ accountId: '1', credential: credential('one', { accessToken: 'fixture-access-one', refreshToken: 'fixture-refresh-one', expiresAt: NOW + 60 * 60_000 }), slotNum: 1, configJson: JSON.stringify({ oauthAccount: { accountUuid: '1' } }), source: 'fixture' });
+  await slots.createSlot({ accountId: '2', credential: credential('two', { accessToken: 'fixture-access-two', refreshToken: 'fixture-refresh-two', expiresAt: NOW + 60 * 60_000 }), slotNum: 2, configJson: JSON.stringify({ oauthAccount: { accountUuid: '2' } }), source: 'fixture' });
+  await backend.set(paths.keychainService, 'fixture-user', credential('one', { accessToken: 'fixture-access-one', refreshToken: 'fixture-refresh-one', expiresAt: NOW + 60 * 60_000 }));
   store.setActiveLogin('anthropic', '1', 'fixture', NOW);
   store.upsertSnapshot('1', '5h', { usedPct: 95, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
   store.upsertSnapshot('2', '5h', { usedPct: 10, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });

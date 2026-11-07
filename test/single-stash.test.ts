@@ -6,8 +6,6 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { oauthCredential } from './support/claude-fixtures';
-
 import {
   adoptStashedSuccessor,
   persistStash,
@@ -22,6 +20,8 @@ import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/k
 import { listStashes, recordStash, removeStash } from '../src/unclaimed-index';
 
 const NOW = 1_730_000_000_000;
+
+const oauthCredential = (access: string, refresh: string, expires = NOW + 30_000): OAuthCredential => ({ type: 'oauth', access, refresh, expires });
 
 function lineage(refresh: string): string {
   return `sha256:${createHash('sha256').update(refresh, 'utf8').digest('hex')}`;

@@ -7,7 +7,6 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
 
-import { oauthCredential } from './support/claude-fixtures';
 import { DEFAULT_HEARTBEAT_MS } from '../src/refresh-lease';
 
 import {
@@ -25,6 +24,8 @@ import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
 import { refreshLeaseName, Store } from '../src/store';
 
 const NOW = 1_730_000_000_000;
+
+const oauthCredential = (access: string, refresh: string, expires = NOW + 30_000): OAuthCredential => ({ type: 'oauth', access, refresh, expires });
 
 function lineageFp(refresh: string): string {
   return `sha256:${createHash('sha256').update(refresh, 'utf8').digest('hex')}`;

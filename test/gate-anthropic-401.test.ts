@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { credentialWithStandardExpiry, credentialWithTokens } from './support/claude-fixtures';
+import { credential as claudeCredential, credentialWithTokens } from './support/claude-fixtures';
 
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
@@ -23,6 +23,7 @@ import { runPiGate } from '../src/pi-gate';
 import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000_000;
+const credentialWithStandardExpiry = (tag: string, expiresAt = NOW + 60 * 60_000) => claudeCredential(tag, { expiresAt });
 
 function accessFingerprint(token: string): string {
   return `sha256-at:${createHash('sha256').update(token, 'utf8').digest('hex')}`;
@@ -116,9 +117,9 @@ describe('Anthropic gate 401 recovery (K6b)', () => {
       posts += 1;
       return posted(credentialWithStandardExpiry('rotated'));
     };
-    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithTokens('access-first', 'refresh-slot'));
+    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithTokens('access-first', 'refresh-slot', NOW + 60 * 60_000));
     assert.equal((await run(f, accessFingerprint('access-first'), refresh)).code, 0);
-    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithTokens('access-second', 'refresh-slot'));
+    await f.backend.set(f.live.paths.keychainService, f.live.account, credentialWithTokens('access-second', 'refresh-slot', NOW + 60 * 60_000));
     assert.equal((await run(f, accessFingerprint('access-second'), refresh)).code, 0);
     assert.equal(posts, 1);
     f.store.close();

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { credentialWithStandardExpiry } from './support/claude-fixtures';
+import { credential as claudeCredential } from './support/claude-fixtures';
 
 import { pollAnthropic } from '../src/auto/anthropic';
 import { anthropicStoreSnapshots } from '../src/anthropic-usage-view';
@@ -16,6 +16,7 @@ import { CANDIDATE_DEFAULT_INTERVAL_S, JITTER_FRAC, MIN_INTERVAL_S } from '../sr
 import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000;
+const credentialWithStandardExpiry = (tag: string, expiresAt = (NOW + 3600) * 1000) => claudeCredential(tag, { expiresAt });
 
 async function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'qlb-auto-anthropic-'));
