@@ -143,7 +143,6 @@ export function createCodexAdapter(deps: CodexAdapterDeps = {}): Adapter {
           try {
             store.recordUsagePollResult(PROVIDER, accountId, {
               attemptedAt, status: 'usage-unknown',
-              codexDiagnostic: { classification: 'transport-failure', httpStatus: null, endpoint: 'wham', fallbackAttempted: false, parserShape: 'not-applicable', entitlementEvidence: 'unknown' },
             });
           } catch {
             return [{ accountId, provider: PROVIDER, label, buckets: {}, error: STORE_ERROR }];
