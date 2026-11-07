@@ -115,13 +115,13 @@ function activeAuthorityLapsed(
   nowS: number,
 ): boolean {
   const nowMs = nowS * 1000;
-  if (poll?.lastStatus !== 'ok' || poll.nextDueAt == null || poll.nextDueAt <= nowS) return false;
+  if (poll?.lastStatus !== 'ok') return false;
   const providerReadings = Object.values(readings).filter((reading) => reading.confidence === 'authoritative'
     && (reading.source === 'provider-poll' || reading.source === 'provider-headers')
     && Number.isFinite(reading.usedPct) && Number.isFinite(reading.fetchedAt)
-    && reading.fetchedAt <= nowMs && (reading.resetAt === undefined || reading.resetAt > nowMs));
+    && reading.fetchedAt <= nowMs);
   return providerReadings.length > 0
-    && providerReadings.every((reading) => nowMs - reading.fetchedAt > PROVIDER_READING_MAX_AGE_MS);
+    && providerReadings.every((reading) => !isAutoAuthoritativeReading(reading, nowMs));
 }
 
 function onDemandCandidate(ids: readonly string[], polls: Record<string, UsagePollRow>, nowS: number): string | null {

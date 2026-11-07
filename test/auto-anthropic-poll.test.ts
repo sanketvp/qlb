@@ -267,6 +267,22 @@ describe('auto anthropic poll (G8)', () => {
     assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 });
   });
 
+  it('holds an active measurement after its reset instead of failing over', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.unhealthyTicks', '1');
+    f.store.recordUsagePollResult('anthropic', 'active', {
+      attemptedAt: NOW - 60,
+      status: 'ok',
+      readings: { '5h': { usedPct: 40, resetAt: (NOW - 1) * 1000, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative' } },
+    });
+    f.store.writeUsagePollPlans('anthropic', { active: { nextDueAt: NOW + 60, pollIntervalS: 180 } });
+    f.store.upsertSnapshot('inactive', '5h', { usedPct: 10, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative' });
+
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+
+    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 });
+  });
+
   it('two simulated hours with fresh tokens make 0 POSTs and poll only on schedule', async () => {
     const f = await fixture();
     const durationS = 120 * 60;

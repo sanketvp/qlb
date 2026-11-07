@@ -67,7 +67,7 @@ function weeklyUsageFixture(fablePct: number, modelConfig: string | null = null,
 async function autoCli(home: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
   // Node <26 emits an SQLite ExperimentalWarning on stderr; suppress only
   // that runtime warning so this helper observes the CLI's stderr contract.
-  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', '--require', join(process.cwd(), 'test', 'support', 'frozen-now.cjs'), join(__dirname, '..', 'src', 'cli.js'), 'auto', ...args], {
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', '--require', join(__dirname, 'support', 'frozen-now.js'), join(__dirname, '..', 'src', 'cli.js'), 'auto', ...args], {
     env: { QLB_TEST_MODE: '1', QLB_TEST_NOW: String(AUTO_NOW), QLB_HOME: home, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   return new Promise((resolve, reject) => {
