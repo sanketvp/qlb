@@ -137,9 +137,17 @@ describe('Codex S29 activation', () => {
     }]);
   });
 
-  it('persists only live provider primary and secondary quota windows', async () => {
+  it('persists live provider quota windows and keeps them actionable after a scoped refresh', async () => {
     const store = openStore(':memory:');
     try {
+      const accountId = 'fixture-user:fixture-account';
+      store.upsertAccount(accountId, 'openai-codex', 'fixture');
+      store.upsertSnapshot(accountId, 'primary', {
+        usedPct: 10, fetchedAt: 1_699_999_999_000, source: 'provider-poll', confidence: 'authoritative',
+      });
+      store.upsertSnapshot(accountId, 'secondary', {
+        usedPct: 20, fetchedAt: 1_699_999_999_000, source: 'provider-poll', confidence: 'authoritative',
+      });
       const adapter = createCodexAdapter({
         readAuth: async () => JSON.stringify(document()),
         getStore: () => store,
@@ -164,42 +172,9 @@ describe('Codex S29 activation', () => {
         primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
         secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
       });
-    } finally {
-      store.close();
-    }
-  });
-
-  it('keeps a direct Codex provider observation actionable after a scoped refresh', async () => {
-    const store = openStore(':memory:');
-    const now = 1_700_000_000_000;
-    const accountId = 'fixture-user:fixture-account';
-    try {
-      store.upsertAccount(accountId, 'openai-codex', 'fixture');
-      store.upsertSnapshot(accountId, 'primary', {
-        usedPct: 10, fetchedAt: now - 1_000, source: 'provider-poll', confidence: 'authoritative',
-      });
-      store.upsertSnapshot(accountId, 'secondary', {
-        usedPct: 20, fetchedAt: now - 1_000, source: 'provider-poll', confidence: 'authoritative',
-      });
-      const adapter = createCodexAdapter({
-        readAuth: async () => JSON.stringify(document()),
-        getStore: () => store,
-        now: () => now,
-        probeUsage: async () => ({
-          status: 200,
-          source: 'codex-api',
-          keys: ['primary', 'secondary'],
-          windows: [{ bucket: 'primary', usedPct: 12 }, { bucket: 'secondary', usedPct: 34 }],
-        }),
-      });
-
-      await adapter.fetchSnapshots();
       const snapshot = snapshotsFromStore(store, 'openai-codex')[0];
       assert.ok(snapshot);
-      assert.deepEqual(routingAuthority(snapshot, 'gpt-5.4', now), {
-        eligible: true,
-        reason: 'fresh direct provider reading',
-      });
+      assert.deepEqual(routingAuthority(snapshot, 'gpt-5.4', 1_700_000_000_000), { eligible: true, reason: 'fresh direct provider reading' });
     } finally {
       store.close();
     }
