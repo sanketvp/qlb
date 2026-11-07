@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export function readUserVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA user_version').get() as

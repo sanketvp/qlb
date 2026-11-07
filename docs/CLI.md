@@ -233,6 +233,31 @@ Reconciliation and preview are admitted only while the lifecycle is `cutting-ove
 
 Flags: `[--dry-run] [--replace] [--json]`, or `--reconcile [--preview] [--json]`.
 
+## `qlb codex usage-diagnostic`
+
+Read the last persisted, redacted result of an explicitly authorized `qlb refresh --provider openai-codex --allow-probe` attempt.
+
+This command is local and read-only: it opens SQLite read-only, never creates or migrates a database, and does not load adapters or credential stores, read credentials, call a provider, mutate an account, or append a health-log row.
+
+```console
+$ qlb codex usage-diagnostic --json
+{"provider":"openai-codex","recorded":true,"attemptedAt":1700000000,"networkDispatchAttempted":true,"classification":"rate-limited","entitlementEvidence":"unknown","httpStatus":429,"endpoint":"wham","fallbackAttempted":false,"parserShape":"not-applicable","backoffUntil":1700004500,"authoritativeWindowObserved":false,"stale":false}
+```
+
+The finite classification distinguishes local preflight, transport, HTTP, recognized provider-gauge, and successful unrecognized-shape outcomes.
+
+`entitlementEvidence` is evidence from the provider response only; it never claims a subscription plan, OAuth scope, token audience, account eligibility, or capacity.
+
+`recorded: false` means no persisted diagnostic exists, not that a request was made or that quota is unavailable.
+
+The command cannot create capacity or routing authority.
+
+Only provider-reported recognized `primary` or `secondary` windows remain authoritative for snapshots, export, and routing.
+
+Do not use `qlb usage probe` as a diagnostic substitute: it directly probes and does not apply the scoped-refresh backoff gate.
+
+Flags: `[--json]`.
+
 ## `qlb export`
 
 Emit the last persisted usage readings as JSON without loading provider adapters or credential stores, making network requests, or migrating the database. The SQLite database is opened read-only and is never created when absent. This is the cache-only interface for status consumers; unlike `qlb status`, it does not refresh readings.

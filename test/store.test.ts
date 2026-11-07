@@ -53,7 +53,7 @@ describe('store decision columns', () => {
 
     const store = openStore(path);
     try {
-      assert.equal(userVersion(path), 5);
+      assert.equal(userVersion(path), 6);
       const cols = columns(path, 'decisions');
       assert.ok(cols.includes('strategy'));
       assert.ok(cols.includes('provider'));
@@ -74,7 +74,7 @@ describe('store decision columns', () => {
     a.close();
     const b = openStore(path);
     try {
-      assert.equal(userVersion(path), 5);
+      assert.equal(userVersion(path), 6);
       const cols = columns(path, 'decisions');
       assert.equal(cols.filter((c) => c === 'strategy').length, 1);
       assert.equal(cols.filter((c) => c === 'provider').length, 1);
@@ -172,7 +172,7 @@ describe('store decision columns', () => {
 
     const migrated = openStore(path);
     migrated.close();
-    assert.equal(userVersion(path), 5);
+    assert.equal(userVersion(path), 6);
     const cols = columns(path, 'decisions');
     assert.ok(cols.includes('strategy'));
     assert.ok(cols.includes('provider'));
@@ -695,7 +695,7 @@ describe('Pi export target provenance', () => {
 
     const beforeDrop = new DatabaseSync(path);
     beforeDrop.exec('ALTER TABLE pi_export_targets DROP COLUMN recorded_by');
-    assert.equal((beforeDrop.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5);
+    assert.equal((beforeDrop.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
     assert.equal((beforeDrop.prepare('PRAGMA table_info(pi_export_targets)').all() as Array<{ name: string }>).length, 5);
     beforeDrop.close();
 

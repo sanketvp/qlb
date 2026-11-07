@@ -417,12 +417,12 @@ describe('qlb undo cswap --dry-run', () => {
     const f = fixture();
     try {
       const db = openStoreConnection(f.dbPath);
-      try { db.exec('PRAGMA user_version = 6'); } finally { db.close(); }
+      try { db.exec('PRAGMA user_version = 7'); } finally { db.close(); }
 
       const result = await admitOnly(f, 'undo cswap', ['--dry-run']);
 
       assert.deepEqual(result, { code: 1, executed: false });
-      assert.match(f.output[0]!, /qlb\.db schema user_version=6 is newer than this binary \(5\); upgrade qlb/);
+      assert.match(f.output[0]!, /qlb\.db schema user_version=7 is newer than this binary \(6\); upgrade qlb/);
     } finally { close(f); }
   });
 
@@ -436,7 +436,7 @@ describe('qlb undo cswap --dry-run', () => {
       const result = await admitOnly(f, 'cutover', ['begin']);
 
       assert.deepEqual(result, { code: 0, executed: true });
-      assert.equal(userVersion(f.dbPath), 5);
+      assert.equal(userVersion(f.dbPath), 6);
     } finally { close(f); }
   });
 
@@ -450,7 +450,7 @@ describe('qlb undo cswap --dry-run', () => {
       const result = await admitOnly(f, 'doctor', []);
 
       assert.deepEqual(result, { code: 0, executed: true });
-      assert.equal(userVersion(f.dbPath), 5);
+      assert.equal(userVersion(f.dbPath), 6);
       assert.doesNotMatch(f.output.join('\n'), /schema-migration-required/);
     } finally { close(f); }
   });
