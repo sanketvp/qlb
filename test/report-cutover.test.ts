@@ -506,17 +506,25 @@ test('no health log in the window fails AC21 rather than passing', async () => {
   } finally { subject.close(); }
 });
 
-test('text and JSON report output redact token-shaped values', async () => {
+test('text and JSON report output redact token-shaped values after control characters', async () => {
   const subject = fixture();
-  const secret = 'sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const secrets = [
+    'sk-ant-oat01-' + 'a'.repeat(64),
+    'sk-ant-api03-' + 'b'.repeat(64),
+    'xai-' + 'c'.repeat(32),
+    'eyJ' + 'd'.repeat(12) + '.' + 'e'.repeat(24) + '.' + 'f'.repeat(24),
+    'Bearer ' + 'g'.repeat(24),
+  ];
+  const failureBody = `${'failure-body-prefix '.repeat(96)}\n${secrets[0]}\t${secrets[1]}\r${secrets[2]}\n${secrets[3]}\t${secrets[4]}${' failure-body-suffix'.repeat(96)}`;
   try {
-    seed(subject, { piDeferred: true, deadSlots: [secret], drill: true });
+    assert.ok(Buffer.byteLength(failureBody) >= 2_048);
+    seed(subject, { piDeferred: true, deadSlots: [failureBody], drill: true });
     assert.equal(await run(subject), 1);
-    assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
+    for (const secret of secrets) assert.equal(subject.output.join('\n').includes(secret), false, 'JSON output leaked fixture secret');
     subject.output.length = 0;
     const code = await runText(subject);
     assert.equal(code, 1);
-    assert.doesNotMatch(subject.output.join('\n'), new RegExp(secret));
+    for (const secret of secrets) assert.equal(subject.output.join('\n').includes(secret), false, 'text output leaked fixture secret');
   } finally { subject.close(); }
 });
 

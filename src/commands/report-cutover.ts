@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
-import { redactSecrets } from '../redact';
+import { redactJson } from '../redact';
 import { hasRecentPiService, receiptHealthHistory } from '../receipt-gates';
 import { reloginsInWindow } from '../relogin';
 import { openStore, type Store } from '../store';
@@ -190,7 +190,7 @@ async function execute(args: string[], ctx: CommandContext, deps: ReportCutoverC
       report.lifecycle.extendedAt = extended.row!.extendedAt;
     }
     writeOrClearReceipt(store, now, doctor.healthLogId, report.ok, receiptIsDeferred(report));
-    const redacted = JSON.parse(redactSecrets(JSON.stringify(report), ctx.knownSecrets())) as CutoverReport;
+    const redacted = JSON.parse(redactJson(report, ctx.knownSecrets())) as CutoverReport;
     if (json) ctx.stdout(JSON.stringify(redacted));
     else for (const line of formatText(redacted)) ctx.stdout(line);
     if (!redacted.ok) {

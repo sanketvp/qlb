@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { redactError, redactEvent, redactJson, redactKeyValueText, redactSecrets } from '../src/redact';
+import {
+  AC41_BODY, AC41_FIXTURES, leakedFixtures, runAutoThrownTick, runPoll4xx, runReportCutover, runStatusHistory, runSwitchStep7,
+} from './ac41-writer-scenarios';
 
 const REDACTED = '[redacted]';
 
@@ -329,5 +332,68 @@ describe('redaction', () => {
     assert.equal(error.includes('\r'), false);
     assert.equal(error.includes('\u0007'), false);
     assert.match(error, /request\\nfailed\\r\[redacted\]\\u0007/);
+  });
+});
+
+// AC41 (HP-H3-12). Each subtest runs one real writer with the synthetic
+// failure body and inspects what that writer actually persisted or printed.
+// "redaction proof" rows fail if the named writer boundary stops redacting;
+// "non-propagation control" rows assert the writer's fixed artifact and do
+// not claim a redactor ran. Later slices add the remaining writers here.
+describe('AC41 writer sweep', () => {
+  it('uses the three synthetic fixtures in a body of at least 2 KB', () => {
+    assert.equal(AC41_FIXTURES.length, 3);
+    assert.ok(Buffer.byteLength(AC41_BODY) >= 2_048);
+    for (const fixture of AC41_FIXTURES) assert.ok(AC41_BODY.includes(fixture));
+  });
+
+  it('sweep: no fixture secret survives in any writer', async (t) => {
+    await t.test('row 1 Claude switch step-7 failure: switch_log.error and steps_json (non-propagation control)', async () => {
+      const artifacts = await runSwitchStep7();
+      assert.equal(artifacts.thrown, 'true');
+      assert.equal(artifacts.outcome, 'rolled-back');
+      assert.equal(artifacts.error, 'keychain-write-failed');
+      assert.equal(artifacts.detail, 'step-7');
+      assert.equal((JSON.parse(artifacts.stepsJson ?? '{}') as { failedStep?: number }).failedStep, 7);
+      for (const key of ['error', 'detail', 'stepsJson']) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
+    });
+
+    await t.test('row 2 Anthropic poll 4xx: usage_polls.last_status (non-propagation control)', async () => {
+      const artifacts = await runPoll4xx();
+      assert.equal(artifacts.bodyServed, 'true');
+      assert.equal(artifacts.lastStatus, 'http-403');
+      assert.deepEqual(leakedFixtures(artifacts.lastStatus), []);
+    });
+
+    // Two stacked boundaries guard this line (the tick's redactError and the
+    // loop's redactedLog); the proof fails only when both are bypassed.
+    await t.test('row 14 auto thrown tick: auto log line (redaction proof)', async () => {
+      const { log } = await runAutoThrownTick();
+      assert.match(log ?? '', /^auto: tick error: ac41-failure-pad /);
+      assert.deepEqual(leakedFixtures(log), []);
+    });
+
+    // Two stacked boundaries: the report's pre-serialization redactJson and
+    // runExecutingCommand's output redaction. The five-family control-character
+    // regression in report-cutover.test.ts separately pins the redactJson boundary.
+    await t.test('row 16 report cutover: text and --json output (redaction proof)', async () => {
+      const artifacts = await runReportCutover();
+      assert.ok(JSON.parse((artifacts.json ?? '').split('\n')[0] ?? 'null'));
+      assert.match(artifacts.json ?? '', /ac41-failure-pad/);
+      assert.match(artifacts.text ?? '', /ac41-failure-pad/);
+      for (const key of ['json', 'text']) assert.deepEqual(leakedFixtures(artifacts[key]), [], key);
+    });
+
+    // Stored rows prove the write boundary; command output proves write and read boundaries together.
+    await t.test('row 17 status switches, relogins and AC33 JSON (redaction proof)', async () => {
+      const artifacts = await runStatusHistory();
+      assert.match(artifacts.storedSwitchError ?? '', /ac41-failure-pad/);
+      assert.match(artifacts.storedUsageStatus ?? '', /ac41-failure-pad/);
+      assert.match(artifacts.storedReloginDetail ?? '', /^sha256:[0-9a-f]{16}$/);
+      assert.equal((JSON.parse(artifacts.switchesJson ?? '{}') as { switches: unknown[] }).switches.length, 1);
+      assert.equal((JSON.parse(artifacts.reloginsJson ?? '{}') as { relogins: unknown[] }).relogins.length, 1);
+      assert.match(artifacts.statusJson ?? '', /ac41-failure-pad/);
+      for (const [key, value] of Object.entries(artifacts)) assert.deepEqual(leakedFixtures(value), [], key);
+    });
   });
 });
