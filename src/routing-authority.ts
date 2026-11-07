@@ -46,7 +46,7 @@ export function failedProviderAttemptAfterReadings(
 }
 
 /**
- * Routing may only use a complete, fresh direct provider measurement.
+ * Routing may only use a fresh direct provider measurement for each available relevant bucket.
  * This leaves cached rows intact for status, export, and cross-check display.
  */
 export function routingAuthority(

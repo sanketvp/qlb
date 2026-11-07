@@ -20,7 +20,7 @@ interface AccountSnapshot {
 }
 ```
 
-`fetchSnapshots()` must be read-only and should return error snapshots rather than throw. QLB also wraps plugin calls so an accidental throw cannot crash `qlb status`.
+`fetchSnapshots()` must be read-only and should return error snapshots rather than throw. QLB also wraps plugin calls so an accidental throw cannot crash `qlb status`. Plugin readings are retained for display and cross-checking, but QLB marks their source as `plugin`, so they cannot establish routing capacity or select an account.
 
 ## Minimal Mistral example
 
@@ -76,7 +76,7 @@ The returned `accounts` list will include `provider: "mistral"`. Syntax errors, 
 A bucket requires:
 
 - `usedPct`: percentage consumed, or `null` when unknown
-- `source`: `poll`, `headers`, or `error`
+- `source`: `provider-poll`, `provider-headers`, `poll`, `headers`, `plugin`, or `error`
 - `confidence`: `authoritative`, `advisory`, `stale`, or `unknown`
 - `fetchedAt`: Unix epoch milliseconds
 
