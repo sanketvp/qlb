@@ -2,8 +2,6 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
-  CSWAP_ACTIVE_ID,
-  getConsumedAccess,
   prepareConsumeSnapshots,
   syntheticCswapActiveSnapshot,
 } from '../src/cswap-consume';
@@ -11,35 +9,7 @@ import { resolveFromSnapshots } from '../src/resolve';
 import { openStore } from '../src/store';
 import type { AccountSnapshot } from '../src/types';
 
-const FUTURE = 4102444800000;
-
-function blob(access: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken: access, expiresAt: FUTURE } });
-}
-
-describe('cswap consume inject', () => {
-  it('consume-access', () => {
-    const result = getConsumedAccess({
-      runner: () => blob('test-access'),
-      env: { USER: 'fixture-user' },
-    });
-    console.log('HAS_ACCESS=1');
-    assert.equal(typeof result.access, 'string');
-    assert.ok(result.access.length > 0);
-    assert.equal('refreshToken' in result, false);
-  });
-
-  it('normal-oauth-shape', () => {
-    const result = getConsumedAccess({
-      runner: () => blob('test-access'),
-      env: { USER: 'fixture-user' },
-    });
-    console.log(`HAS_ACCESS=1 SERVE_ID=${CSWAP_ACTIVE_ID}`);
-    assert.equal(result.access, 'test-access');
-    const text = `HAS_ACCESS=1 SERVE_ID=${CSWAP_ACTIVE_ID}`;
-    assert.doesNotMatch(text, /identity_unproven/);
-    assert.doesNotMatch(text, /foreign_credential/);
-  });
+describe('cswap consume routing', () => {
 
   it('no-slot-pick', () => {
     const consumed = prepareConsumeSnapshots(
@@ -69,19 +39,7 @@ describe('cswap consume inject', () => {
     console.log('SLOT_PICKS=0');
   });
 
-  it('no-claude-hop', () => {
-    let threw = false;
-    try {
-      getConsumedAccess({
-        runner: () => {
-          throw new Error('missing');
-        },
-        env: { USER: 'fixture-user' },
-      });
-    } catch {
-      threw = true;
-    }
-    assert.equal(threw, true);
+  it('removes Anthropic snapshots without routing a slot', () => {
     const prepared = prepareConsumeSnapshots(
       [
         {
@@ -95,21 +53,6 @@ describe('cswap consume inject', () => {
     );
     assert.equal(prepared.some((s) => s.accountId === 'cswap-slot-2'), false);
     console.log('NO_HOP=1');
-  });
-
-  it('switch-between-reads', () => {
-    const accesses = ['access-one', 'access-two'];
-    let n = 0;
-    const read = () => getConsumedAccess({
-      runner: () => blob(accesses[Math.min(n++, accesses.length - 1)]!),
-      env: { USER: 'fixture-user' },
-    });
-    const first = read();
-    const second = read();
-    assert.notEqual(first.fingerprint, second.fingerprint);
-    console.log(`SERVE_ID=${CSWAP_ACTIVE_ID} RETRY_REEVAL=1`);
-    assert.equal(first.access, 'access-one');
-    assert.equal(second.access, 'access-two');
   });
 
   it('does not route consume mode without a fresh active provider reading', () => {

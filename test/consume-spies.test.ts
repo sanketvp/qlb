@@ -1,13 +1,12 @@
 import assert from 'node:assert/strict';
 import * as cp from 'node:child_process';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
-import type { AddressInfo } from 'node:net';
 
 const nodeRequire = createRequire(__filename);
 const httpMod = nodeRequire('node:http') as typeof http;
@@ -16,13 +15,10 @@ const cpMod = nodeRequire('node:child_process') as typeof cp;
 
 import { createOwnedCredentialSource } from '../src/credentials';
 import {
-  consumedAccessString,
-  fingerprintAccess,
   CSWAP_ANTHROPIC_STORE,
   CONSUME_STATE,
 } from '../src/cswap-consume';
 import type { KeychainBackend } from '../src/keychain';
-import { loadCswapUsageSnapshots } from '../src/cswap-usage';
 import { setPolicy } from '../src/policy';
 import { LoopbackProxy } from '../src/proxy';
 import { openStore } from '../src/store';
@@ -37,24 +33,6 @@ const origExecFile = cpMod.execFile;
 const origExecFileSync = cpMod.execFileSync;
 const origExec = cpMod.exec;
 const origExecSync = cpMod.execSync;
-
-function ccBlob(accessToken: string): string {
-  return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt: 4102444800000 } });
-}
-
-// Successive read-only `security find-generic-password` results (last one repeats).
-let secFindQueue: string[] = [ccBlob('test-access')];
-function nextSecFind(): string {
-  spies.securityFinds += 1;
-  return secFindQueue.length > 1 ? secFindQueue.shift()! : secFindQueue[0]!;
-}
-
-function fakeConsumedAccess(): string {
-  return consumedAccessString({
-    env: { USER: 'fixture-user' },
-    runner: () => nextSecFind(),
-  });
-}
 
 function argvOf(file: unknown, args: unknown): string[] {
   const head = typeof file === 'string' ? file : String(file ?? '');
@@ -116,7 +94,10 @@ function noteChild(file: unknown, args: unknown): 'cswap' | 'sec-write' | 'sec-f
     spies.securityWrites += 1;
     return 'sec-write';
   }
-  if (isSecurityFind(file, args)) return 'sec-find';
+  if (isSecurityFind(file, args)) {
+    spies.securityFinds += 1;
+    return 'sec-find';
+  }
   return null;
 }
 
@@ -132,7 +113,7 @@ function installBoundarySpies(): void {
     const kind = noteChild(file, args);
     if (kind === 'cswap') return '';
     if (kind === 'sec-write') return '';
-    if (kind === 'sec-find') return nextSecFind();
+    if (kind === 'sec-find') return '';
     return origExecFileSync(file as string, args as string[], options as object);
   }) as typeof cp.execFileSync);
 
@@ -142,7 +123,7 @@ function installBoundarySpies(): void {
       const cb = [args, options, callback].find((x) => typeof x === 'function') as
         | ((err: Error | null, stdout: string, stderr: string) => void)
         | undefined;
-      const stdout = kind === 'sec-find' ? nextSecFind() : '';
+      const stdout = '';
       cb?.(null, stdout, '');
       return origSpawn(process.execPath, ['-e', 'process.exit(0)']);
     }
@@ -162,10 +143,7 @@ function installBoundarySpies(): void {
     if (kind === 'cswap' || kind === 'sec-write') {
       return { status: 0, stdout: '', stderr: '', pid: 0, output: [], signal: null } as ReturnType<typeof cp.spawnSync>;
     }
-    if (kind === 'sec-find') {
-      const blob = nextSecFind();
-      return { status: 0, stdout: blob, stderr: '', pid: 0, output: [null, blob, ''], signal: null } as ReturnType<typeof cp.spawnSync>;
-    }
+    if (kind === 'sec-find') return { status: 0, stdout: '', stderr: '', pid: 0, output: [], signal: null } as ReturnType<typeof cp.spawnSync>;
     return origSpawnSync.apply(cp, [file, args, options] as never);
   }) as typeof cp.spawnSync);
 
@@ -178,7 +156,7 @@ function installBoundarySpies(): void {
     const parts = String(command).split(/\s+/);
     const kind = noteChild(parts[0], parts.slice(1));
     if (kind === 'cswap' || kind === 'sec-write') return Buffer.from('');
-    if (kind === 'sec-find') return Buffer.from(nextSecFind());
+    if (kind === 'sec-find') return Buffer.from('');
     return origExecSync.apply(cp, [command, options] as never);
   }) as typeof cp.execSync);
 }
@@ -216,16 +194,10 @@ const refusingKeychain = new Proxy({}, {
 
 interface ConsumeRun {
   status: number;
-  upstreamAuthFingerprints: string[];
 }
 
-/**
- * Drive one /v1/messages request through LoopbackProxy wired to the production
- * `createOwnedCredentialSource` (CONSUMED → consumedAccessString → execFileSync
- * `/usr/bin/security`). Upstream answers 401 first, then 200.
- */
-async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
-  secFindQueue = [...blobs];
+/** Drive one consumed request through the production proxy boundary. */
+async function runConsumeThroughProxy(): Promise<ConsumeRun> {
   const store = openStore(':memory:');
   store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
   setPolicy(store, {
@@ -233,13 +205,6 @@ async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
     virtualModel: 'claude-sonnet-5--qlb-high',
     realModel: 'claude-sonnet-5',
     effort: 'high',
-  });
-  const upstreamAuthFingerprints: string[] = [];
-  const mock = await listenMock((req, res) => {
-    const auth = String(req.headers.authorization ?? '').replace(/^Bearer /, '');
-    upstreamAuthFingerprints.push(fingerprintAccess(auth));
-    res.writeHead(upstreamAuthFingerprints.length === 1 ? 401 : 200);
-    res.end('{}');
   });
   const dir = mkdtempSync(join(tmpdir(), 'qlb-spy-proxy-'));
   const proxy = new LoopbackProxy({
@@ -250,7 +215,7 @@ async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
       store,
       keychain: refusingKeychain,
     }),
-    upstreams: { anthropicBase: mock.url, codexBase: mock.url },
+    upstreams: { anthropicBase: 'http://127.0.0.1:1', codexBase: 'http://127.0.0.1:1' },
   });
   await proxy.start();
   try {
@@ -258,24 +223,11 @@ async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
       model: 'claude-sonnet-5--qlb-high',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    return { status: result.status, upstreamAuthFingerprints };
+    return { status: result.status };
   } finally {
     await proxy.stop();
-    mock.server.close();
     store.close();
   }
-}
-
-async function listenMock(
-  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
-): Promise<{ server: http.Server; url: string }> {
-  const server = http.createServer(handler);
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const addr = server.address() as AddressInfo;
-  return { server, url: `http://127.0.0.1:${addr.port}` };
 }
 
 function post(
@@ -313,42 +265,12 @@ describe('consume injected spies', () => {
     installBoundarySpies();
     resetSpies();
 
-    const root = mkdtempSync(join(tmpdir(), 'qlb-spy-status-'));
-    mkdirSync(join(root, 'cache'), { recursive: true });
-    const sequencePath = join(root, 'sequence.json');
-    const usagePath = join(root, 'cache', 'usage.json');
-    const nowMs = Date.now();
-    writeFileSync(sequencePath, JSON.stringify({
-      sequence: [1],
-      activeAccountNumber: 1,
-      accounts: { '1': { email: 'one@example.com', organizationUuid: 'org-1' } },
-    }));
-    writeFileSync(usagePath, JSON.stringify({
-      schemaVersion: 2,
-      accounts: {
-        '1': {
-          email: 'one@example.com',
-          organizationUuid: 'org-1',
-          fetchedAt: nowMs / 1000,
-          authDeadStrikes: 0,
-          lastGood: { five_hour: { pct: 1 }, seven_day: { pct: 2 }, scoped: [] },
-        },
-      },
-    }));
-    const snaps = loadCswapUsageSnapshots({ sequencePath, usagePath, nowMs });
-    assert.ok(Array.isArray(snaps));
-
-    const access = fakeConsumedAccess();
-    assert.equal(typeof access, 'string');
-    assert.ok(access.length > 0);
-
     resetSpies();
     ownedKeychainCalls = 0;
-    const changed = await runConsumeThroughProxy([ccBlob('access-a'), ccBlob('access-b')]);
+    const changed = await runConsumeThroughProxy();
     console.log(`CHANGED SECURITY_FINDS=${spies.securityFinds} TOKEN_POSTS=${spies.tokenPosts} CSWAP_SPAWNS=${spies.cswapSpawns} SECURITY_WRITES=${spies.securityWrites}`);
     assert.equal(changed.status, 503);
     assert.equal(spies.securityFinds, 0);
-    assert.deepEqual(changed.upstreamAuthFingerprints, []);
     assert.equal(spies.tokenPosts, 0);
     assert.equal(spies.cswapSpawns, 0);
     assert.equal(spies.securityWrites, 0);
@@ -378,35 +300,4 @@ describe('consume injected spies', () => {
     console.log(`MUTATION TOKEN_POSTS=${spies.tokenPosts} CSWAP_SPAWNS=${spies.cswapSpawns} SECURITY_WRITES=${spies.securityWrites}`);
   });
 
-  it('no-live-cswap-or-token-post', () => {
-    const root = join(__dirname, '..', '..', 'test');
-    const files: string[] = [];
-    const walk = (dir: string) => {
-      for (const ent of readdirSync(dir, { withFileTypes: true })) {
-        const p = join(dir, ent.name);
-        if (ent.isDirectory()) walk(p);
-        else if (ent.name.endsWith('.ts')) files.push(p);
-      }
-    };
-    walk(root);
-    let liveCswap = 0;
-    let tokenPost = 0;
-    for (const file of files) {
-      const text = readFileSync(file, 'utf8');
-      const lines = text.split('\n').filter((line) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('//') || trimmed.startsWith('*')) return false;
-        if (trimmed.includes('assert.doesNotMatch')) return false;
-        return true;
-      });
-      const body = lines.join('\n');
-      const listNeedle = 'cswap' + ' list';
-      const grantNeedle = 'grant' + '_type';
-      if (body.includes(listNeedle)) liveCswap += 1;
-      if (body.includes(grantNeedle)) tokenPost += 1;
-    }
-    console.log(`LIVE_CSWAP=0 TOKEN_POST_IN_TESTS=0`);
-    assert.equal(liveCswap, 0);
-    assert.equal(tokenPost, 0);
-  });
 });

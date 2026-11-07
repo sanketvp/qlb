@@ -10,7 +10,6 @@ import {
   ownerStateForProvider,
   parsePiOwnerFile,
   decidePiMode,
-  type CswapActiveAccess,
   type PiOwnerFile,
 } from '../extensions/qlb-pi/consume';
 
@@ -129,8 +128,4 @@ describe('qlb-pi active access scaffold', () => {
     assert.match(qlbUnavailable('anthropic', 'phase=cutover').error.errorMessage, /\(unknown\)$/);
   });
 
-  it('uses a distinct type for legacy cswap access', () => {
-    const access: CswapActiveAccess = { access: 'test-access', fingerprint: 'test-fingerprint' };
-    assert.equal(access.access, 'test-access');
-  });
 });
