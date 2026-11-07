@@ -54,7 +54,7 @@ describe('OpenRouter adapter', () => {
       used: 39.866197439,
       limit: 100,
       remaining: 60.133802561,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
       fetchedAt: 1_725_000_000_000,
       detail:
@@ -153,7 +153,7 @@ describe('OpenRouter adapter', () => {
     const store = openStore(':memory:');
     const credits = (usedPct: number): BucketReading => ({
       usedPct,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
       fetchedAt: Date.now(),
     });

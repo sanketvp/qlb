@@ -233,6 +233,7 @@ export const ROUTING_DECISION_MODES = [
   'round-robin',
   'failover',
   'pin_unavailable',
+  'unavailable',
   'exhausted',
 ] as const;
 
@@ -1627,6 +1628,18 @@ export class Store {
       ? this.listAccountsByProviderStmt.all(provider)
       : this.listAccountsStmt.all();
     return rows as unknown as AccountRow[];
+  }
+
+  isAccountLiveForRouting(provider: string, accountId: string): boolean | null {
+    const table = provider === 'anthropic' ? 'claude_slots'
+      : provider === 'openai-codex' ? 'codex_slots'
+        : null;
+    if (table === null) return null;
+    const row = this.db.prepare(`SELECT dead, archived_at FROM ${table} WHERE account_id = ?`).get(accountId) as
+      | { dead: number; archived_at: number | null }
+      | undefined;
+    if (!row) return null;
+    return row.dead === 0 && row.archived_at === null;
   }
 
   /** Current provider-owned login, if an adoption or switch has recorded one. */

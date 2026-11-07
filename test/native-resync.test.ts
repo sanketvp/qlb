@@ -1311,6 +1311,14 @@ describe('proxy retry-once wiring on upstream 401', () => {
     temps.push(dir);
     const store = openStore(join(dir, 'qlb.db'));
     store.upsertAccount('acct-a', 'anthropic', 'acct-a');
+    for (const bucket of ['5h', '7d'] as const) {
+      store.upsertSnapshot('acct-a', bucket, {
+        usedPct: 10,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+        fetchedAt: Date.now(),
+      });
+    }
     setPolicy(store, {
       harness: 'claude-code',
       virtualModel: 'claude-sonnet-5--qlb-high',
@@ -1374,6 +1382,14 @@ describe('proxy retry-once wiring on upstream 401', () => {
     temps.push(dir);
     const store = openStore(join(dir, 'qlb.db'));
     store.upsertAccount('acct-a', 'anthropic', 'acct-a');
+    for (const bucket of ['5h', '7d'] as const) {
+      store.upsertSnapshot('acct-a', bucket, {
+        usedPct: 10,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+        fetchedAt: Date.now(),
+      });
+    }
     setPolicy(store, {
       harness: 'claude-code',
       virtualModel: 'claude-sonnet-5--qlb-high',

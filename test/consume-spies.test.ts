@@ -224,10 +224,7 @@ interface ConsumeRun {
  * `createOwnedCredentialSource` (CONSUMED → consumedAccessString → execFileSync
  * `/usr/bin/security`). Upstream answers 401 first, then 200.
  */
-async function runConsumeThroughProxy(
-  blobs: string[],
-  getConsumedAccess?: () => string,
-): Promise<ConsumeRun> {
+async function runConsumeThroughProxy(blobs: string[]): Promise<ConsumeRun> {
   secFindQueue = [...blobs];
   const store = openStore(':memory:');
   store.upsertMigration(CSWAP_ANTHROPIC_STORE, CONSUME_STATE, '{}');
@@ -252,7 +249,6 @@ async function runConsumeThroughProxy(
     getCredentialForAccount: createOwnedCredentialSource({
       store,
       keychain: refusingKeychain,
-      getConsumedAccess: getConsumedAccess ?? fakeConsumedAccess,
     }),
     upstreams: { anthropicBase: mock.url, codexBase: mock.url },
   });
@@ -313,7 +309,7 @@ function post(
 }
 
 describe('consume injected spies', () => {
-  it('inject + 401 + status never post tokens, spawn cswap, or write security', async () => {
+  it('consume admission stops before credential reads without authoritative quota', async () => {
     installBoundarySpies();
     resetSpies();
 
@@ -346,58 +342,17 @@ describe('consume injected spies', () => {
     assert.equal(typeof access, 'string');
     assert.ok(access.length > 0);
 
-    // 401 with a rotated credential: exactly two read-only GETs, retry sends the reread value.
     resetSpies();
     ownedKeychainCalls = 0;
     const changed = await runConsumeThroughProxy([ccBlob('access-a'), ccBlob('access-b')]);
     console.log(`CHANGED SECURITY_FINDS=${spies.securityFinds} TOKEN_POSTS=${spies.tokenPosts} CSWAP_SPAWNS=${spies.cswapSpawns} SECURITY_WRITES=${spies.securityWrites}`);
-    assert.equal(changed.status, 200);
-    assert.equal(spies.securityFinds, 2);
-    assert.deepEqual(changed.upstreamAuthFingerprints, [
-      fingerprintAccess('access-a'),
-      fingerprintAccess('access-b'),
-    ]);
+    assert.equal(changed.status, 503);
+    assert.equal(spies.securityFinds, 0);
+    assert.deepEqual(changed.upstreamAuthFingerprints, []);
     assert.equal(spies.tokenPosts, 0);
     assert.equal(spies.cswapSpawns, 0);
     assert.equal(spies.securityWrites, 0);
     assert.equal(ownedKeychainCalls, 0);
-
-    // 401 with an unchanged credential: one reread, no retry, the 401 is surfaced.
-    resetSpies();
-    const unchanged = await runConsumeThroughProxy([ccBlob('access-a'), ccBlob('access-a')]);
-    assert.equal(unchanged.status, 401);
-    assert.equal(spies.securityFinds, 2);
-    assert.deepEqual(unchanged.upstreamAuthFingerprints, [fingerprintAccess('access-a')]);
-    assert.equal(spies.tokenPosts + spies.cswapSpawns + spies.securityWrites, 0);
-    assert.equal(ownedKeychainCalls, 0);
-  });
-
-  it('integrated-path mutations make each counter nonzero', async () => {
-    installBoundarySpies();
-    // Each mutation runs inside the production credential source the proxy
-    // calls for inject and 401 reread, on top of the real security GET.
-    const mutations: Array<[keyof typeof spies, () => void]> = [
-      ['tokenPosts', () => {
-        const req = https.request({ hostname: '127.0.0.1', port: 1, path: '/oauth/token', method: 'POST' });
-        req.on('error', () => undefined);
-        req.end(['grant', '_type=refresh_token'].join(''));
-      }],
-      ['cswapSpawns', () => { cp.spawnSync('cswap', ['list']); }],
-      ['securityWrites', () => {
-        cp.execFileSync('/usr/bin/security', ['add-generic-password', '-a', 'qlb-mutation-never', '-s', 'qlb-mutation-never']);
-      }],
-    ];
-    for (const [counter, forbidden] of mutations) {
-      resetSpies();
-      const run = await runConsumeThroughProxy([ccBlob('access-a'), ccBlob('access-b')], () => {
-        forbidden();
-        return fakeConsumedAccess();
-      });
-      console.log(`MUTATION ${counter}=${spies[counter]} SECURITY_FINDS=${spies.securityFinds}`);
-      assert.equal(run.status, 200);
-      assert.equal(spies.securityFinds, 2, 'mutation must still traverse the real security GET');
-      assert.ok(spies[counter] > 0, `${counter} mutation did not fire through the proxy path`);
-    }
   });
 
   it('mutation controls make each counter nonzero', () => {

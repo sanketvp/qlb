@@ -34,6 +34,7 @@ import {
 import {
   registerConflictProvider,
   registerConsumeProvider,
+  registerUnavailableConsumeProvider,
   type AnthropicNativeProvider,
   type Builtin,
   type ConsumeDeps,
@@ -597,5 +598,50 @@ describe('redaction helper', () => {
   it('removes both the value and its fingerprint', () => {
     const fp = fingerprintAccess('tok-123');
     assert.equal(redactSecrets(`a tok-123 b ${fp} c`, ['tok-123']), 'a [redacted] b [redacted] c');
+  });
+});
+
+describe('qlb-pi consume unavailable stub', () => {
+  it('fails unavailable without calling the replaced provider', () => {
+    let replacedProviderCalls = 0;
+    const providers = new Map<string, AnthropicNativeProvider>();
+    const previous: AnthropicNativeProvider = {
+      id: 'anthropic',
+      name: 'anthropic-pool',
+      auth: { apiKey: {
+        name: 'pool',
+        async check() { return { type: 'api_key', source: 'pool' }; },
+        async resolve() { return { auth: { apiKey: 'pool' }, source: 'pool' }; },
+      } },
+      getModels: () => [],
+      stream: () => { replacedProviderCalls += 1; return sink(); },
+      streamSimple: () => { replacedProviderCalls += 1; return sink(); },
+    };
+    providers.set('anthropic', previous);
+    const pi: ProviderApi = {
+      unregisterProvider(name) { providers.delete(name); },
+      registerProvider(provider) { providers.set(provider.id, provider); },
+    };
+    const outcomes: Array<Record<string, unknown>> = [];
+
+    registerUnavailableConsumeProvider(pi, {
+      createStream: sink,
+      models: [MODEL],
+      recordOutcome(outcome) { outcomes.push(outcome); },
+    });
+
+    const output = providers.get('anthropic')!.stream(MODEL, {}) as Sink;
+    assert.equal(output.ended, true);
+    assert.equal(replacedProviderCalls, 0);
+    assert.deepEqual(output.events.map((event) => (event as { error: { errorMessage: string } }).error.errorMessage), [
+      CONSUME_ERRORS.quotaUnavailable,
+    ]);
+    assert.deepEqual(outcomes, [{
+      accountId: CSWAP_ACTIVE_ID,
+      provider: 'anthropic',
+      model: MODEL.id,
+      outcome: 'unavailable',
+      error: CONSUME_ERRORS.quotaUnavailable,
+    }]);
   });
 });
