@@ -13,6 +13,8 @@ import { CodexAdmissionRefused } from '../src/codex-rekey';
 import { checkRestorePrecondition } from '../src/codex-restore-baseline';
 import { MockKeychain } from '../src/keychain';
 import { createSingleGrantMigration, defaultRehearseFn } from '../src/migration';
+import { snapshotsFromStore } from '../src/resolve';
+import { routingAuthority } from '../src/routing-authority';
 import { backupBeforeMigrateSync, openStore } from '../src/store';
 
 function jwt(payload: Record<string, unknown>): string {
@@ -154,12 +156,48 @@ describe('Codex S29 activation', () => {
 
       const [snapshot] = await adapter.fetchSnapshots();
       assert.deepEqual(snapshot?.buckets, {
-        primary: { usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
-        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, windowMin: 300, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
       });
       assert.deepEqual(store.getAllSnapshots('fixture-user:fixture-account'), {
-        primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
-        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'poll', confidence: 'authoritative' },
+        primary: { usedPct: 12, resetAt: 1_700_000_300_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
+        secondary: { usedPct: 34, resetAt: 1_700_100_000_000, fetchedAt: 1_700_000_000_000, source: 'provider-poll', confidence: 'authoritative' },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keeps a direct Codex provider observation actionable after a scoped refresh', async () => {
+    const store = openStore(':memory:');
+    const now = 1_700_000_000_000;
+    const accountId = 'fixture-user:fixture-account';
+    try {
+      store.upsertAccount(accountId, 'openai-codex', 'fixture');
+      store.upsertSnapshot(accountId, 'primary', {
+        usedPct: 10, fetchedAt: now - 1_000, source: 'provider-poll', confidence: 'authoritative',
+      });
+      store.upsertSnapshot(accountId, 'secondary', {
+        usedPct: 20, fetchedAt: now - 1_000, source: 'provider-poll', confidence: 'authoritative',
+      });
+      const adapter = createCodexAdapter({
+        readAuth: async () => JSON.stringify(document()),
+        getStore: () => store,
+        now: () => now,
+        probeUsage: async () => ({
+          status: 200,
+          source: 'codex-api',
+          keys: ['primary', 'secondary'],
+          windows: [{ bucket: 'primary', usedPct: 12 }, { bucket: 'secondary', usedPct: 34 }],
+        }),
+      });
+
+      await adapter.fetchSnapshots();
+      const snapshot = snapshotsFromStore(store, 'openai-codex')[0];
+      assert.ok(snapshot);
+      assert.deepEqual(routingAuthority(snapshot, 'gpt-5.4', now), {
+        eligible: true,
+        reason: 'fresh direct provider reading',
       });
     } finally {
       store.close();
@@ -238,7 +276,7 @@ describe('Codex S29 activation', () => {
     try {
       store.upsertAccount('fixture-user:fixture-account', 'openai-codex', 'fixture');
       store.upsertSnapshot('fixture-user:fixture-account', 'primary', {
-        usedPct: 55, fetchedAt: 1, source: 'poll', confidence: 'authoritative',
+        usedPct: 55, fetchedAt: 1, source: 'provider-poll', confidence: 'authoritative',
       });
       const adapter = createCodexAdapter({
         readAuth: async () => JSON.stringify(document()),
