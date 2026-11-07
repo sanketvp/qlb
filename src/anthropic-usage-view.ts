@@ -226,10 +226,8 @@ export function hasFreshAnthropicUsagePoll(
   const polls = store.listUsagePolls('anthropic');
   return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
     const row = polls[slot.accountId];
-    const observed = currentProviderObservation(store.getAllSnapshots(slot.accountId));
     return row !== undefined
-      && !failedProviderAttemptAfterReadings(observed, row)
-      && Object.keys(projectAnthropicUsageReadings(observed, row, nowS)).length > 0;
+      && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;
   });
 }
 
