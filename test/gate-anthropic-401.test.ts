@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { credential as claudeCredential, credentialWithTokens } from './support/claude-fixtures';
+import { credential as claudeCredential } from './support/claude-fixtures';
 
 import { InMemoryCredentialBackend } from '../src/cc-credentials';
 import { claudePaths } from '../src/cc-paths';
@@ -24,6 +24,7 @@ import { openStore } from '../src/store';
 
 const NOW = 1_700_000_000_000;
 const credentialWithStandardExpiry = (tag: string, expiresAt = NOW + 60 * 60_000) => claudeCredential(tag, { expiresAt });
+const credentialWithTokens = (accessToken: string, refreshToken: string, expiresAt?: number) => claudeCredential('', { accessToken, refreshToken, expiresAt });
 
 function accessFingerprint(token: string): string {
   return `sha256-at:${createHash('sha256').update(token, 'utf8').digest('hex')}`;

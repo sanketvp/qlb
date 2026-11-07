@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { cswapImportCredential } from './support/claude-fixtures';
+import { credentialWithRefresh } from './support/claude-fixtures';
 
 import { credentialFingerprint } from '../src/anthropic-oauth';
 import { InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
@@ -21,6 +21,8 @@ import {
   classifyCswapImportJournals, importCswap, planCswapImport, probeCswapImportLock,
   reconcileCswapImportJournals, recoverUncommittedCswapImport,
 } from '../src/cswap-import';
+
+const cswapImportCredential = (tag: string, refreshToken: string) => credentialWithRefresh(tag, refreshToken, { extra: { scopes: ['user:inference'], subscriptionType: 'max' } });
 
 function fixture(): { root: string; backup: string; keychain: MockKeychain; repo: InMemoryClaudeSlotRepository } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-cswap-import-'));

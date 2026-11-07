@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { credentialWithRefreshTokenExpiry } from './support/claude-fixtures';
+import { credential } from './support/claude-fixtures';
 
 import { claudeLoginExpiryCheck } from '../src/checks/claude-login-expiry';
 import { claudeUnclaimedCheck } from '../src/checks/claude-unclaimed';
@@ -19,6 +19,7 @@ import { openStore } from '../src/store';
 import { recordStash } from '../src/unclaimed-index';
 
 const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
+const credentialWithRefreshTokenExpiry = (expiresAt: unknown, tokens: Record<string, string> = {}) => credential('', { accessToken: null, refreshToken: null, extra: { refreshTokenExpiresAt: expiresAt, ...tokens } });
 
 async function withTestQlbHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
   const previousTestMode = process.env.QLB_TEST_MODE;

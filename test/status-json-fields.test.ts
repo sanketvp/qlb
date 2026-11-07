@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
+import { credential } from './support/claude-fixtures';
+
 import { statusAnthropicLoginExpiry } from '../src/app';
 import { readAnthropicStoreSnapshots } from '../src/anthropic-usage-view';
 import { formatDashboard, type DashboardAccount } from '../src/dashboard';
@@ -88,15 +90,7 @@ function insertLifecycle(dbPath: string, state = 'cutover'): void {
   }
 }
 
-function oauthExpiry(expiresAt: number): string {
-  return JSON.stringify({
-    claudeAiOauth: {
-      accessToken: 'fixture-access',
-      refreshToken: 'fixture-refresh',
-      refreshTokenExpiresAt: expiresAt,
-    },
-  });
-}
+const oauthExpiry = (expiresAt: number) => credential('', { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', extra: { refreshTokenExpiresAt: expiresAt } });
 
 describe('status JSON operational fields', () => {
   it('projects ISO/null login expiry and renders the text login expiry', () => {
