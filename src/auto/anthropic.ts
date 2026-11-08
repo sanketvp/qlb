@@ -23,7 +23,7 @@ import { switchClaude, type ClaudeSwitchDeps, type ClaudeSwitchResult } from '..
 import { dueCandidate, planAfterFetch, RECENT_429_WINDOW_S, type Usage } from '../poll-policy';
 import { redactSecrets } from '../redact';
 import { Store, type UsagePollRow } from '../store';
-import { projectAnthropicUsageReadings } from '../anthropic-usage-view';
+import { failedProviderAttemptAfterReadings, isProviderAuthoritativeReading } from '../routing-authority';
 import type { BucketReading } from '../types';
 
 const PROVIDER = 'anthropic';
@@ -99,6 +99,63 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
   return row?.last429At !== null && row?.last429At !== undefined && nowS - row.last429At <= RECENT_429_WINDOW_S;
 }
 
+function isAutoAuthoritativeReading(reading: BucketReading | undefined, nowMs: number): boolean {
+  if (reading === undefined || !isProviderAuthoritativeReading(reading, nowMs)) return false;
+  return reading.resetAt === undefined || reading.resetAt > nowMs;
+}
+
+function autoBucketIncludes(models: readonly string[]): (label: string) => boolean {
+  const configuredModels = new Set(models.map((model) => model.toLowerCase()));
+  const scopedEnabled = configuredModels.size > 0;
+  const allScoped = configuredModels.has('all');
+  return (label) => !label.startsWith('7d:')
+    || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase())));
+}
+
+function isTransientUsageFailure(status: string | null | undefined): boolean {
+  return status === 'http-429' || status === 'usage-fetch-failed' || status === 'usage-unreadable'
+    || status === 'usage-unknown' || /^http-5\d\d$/u.test(status ?? '');
+}
+
+function isHardUsageFailure(status: string | null | undefined): boolean {
+  return status === 'foreign-credential' || status === 'live-unattributed' || status === 'no-credentials'
+    || status === 'keychain-unavailable' || status === 'slot-unreadable' || status === 'relogin-needed'
+    || status === 'http-401' || status === 'http-403';
+}
+
+function latestProviderReadingAt(readings: Record<string, BucketReading>, include: (label: string) => boolean): number | undefined {
+  const values = Object.entries(readings).flatMap(([label, reading]) => include(label)
+    && reading.confidence === 'authoritative' && (reading.source === 'provider-poll' || reading.source === 'provider-headers')
+    && Number.isFinite(reading.fetchedAt) ? [reading.fetchedAt] : []);
+  return values.length === 0 ? undefined : Math.max(...values);
+}
+
+function needsCandidateRefresh(input: AutoswitchInput): boolean {
+  const decision = decideAutoswitch(input);
+  return decision.kind === 'stay' && decision.reason === 'no-comparison';
+}
+
+function activeAuthorityLapsed(
+  readings: Record<string, BucketReading>,
+  poll: UsagePollRow | undefined,
+  nowS: number,
+  include: (label: string) => boolean,
+): boolean {
+  const nowMs = nowS * 1000;
+  if (poll?.lastStatus !== 'ok') return false;
+  const providerReadings = Object.entries(readings).flatMap(([label, reading]) => include(label) && reading.confidence === 'authoritative'
+    && (reading.source === 'provider-poll' || reading.source === 'provider-headers')
+    && Number.isFinite(reading.usedPct) && Number.isFinite(reading.fetchedAt)
+    && reading.fetchedAt <= nowMs ? [reading] : []);
+  return providerReadings.length > 0
+    && providerReadings.every((reading) => !isAutoAuthoritativeReading(reading, nowMs));
+}
+
+function onDemandCandidate(ids: readonly string[], polls: Record<string, UsagePollRow>, nowS: number): string | null {
+  const ready = Object.fromEntries(ids.map((id) => [id, { ...polls[id], nextDueAt: nowS }]));
+  return dueCandidate(ids, ready, nowS);
+}
+
 /** The slot's live dead flag supersedes a legacy sticky poll status. */
 function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record<string, UsagePollRow>): Record<string, UsagePollRow> {
   const liveIds = new Set(slots.filter((slot) => !slot.dead).map((slot) => slot.accountId));
@@ -108,20 +165,26 @@ function pollingState(slots: ReturnType<ClaudeSlots['listSlots']>, polls: Record
 }
 
 export function freshAnthropicAccounts(slots: ReturnType<ClaudeSlots['listSlots']>, store: Store, polls: Record<string, UsagePollRow>, nowS: number, models: readonly string[]): AutoswitchAccount[] {
-  const configuredModels = new Set(models.map((model) => model.toLowerCase()));
-  const scopedEnabled = configuredModels.size > 0;
-  const allScoped = configuredModels.has('all');
+  const include = autoBucketIncludes(models);
   return slots.filter((slot) => slot.archivedAt == null).map((slot) => {
     const row = polls[slot.accountId];
     const snapshot = store.getAllSnapshots(slot.accountId);
-    const trusted = projectAnthropicUsageReadings(
-      snapshot, row, nowS,
-      (label) => !label.startsWith('7d:') || (scopedEnabled && (allScoped || configuredModels.has(label.slice(3).toLowerCase()))),
-    );
-    const buckets = Object.fromEntries(Object.entries(trusted).map(([label, reading]) => [label, {
-      usedPct: reading.usedPct,
-      ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
-    }]));
+    const failedAfterReadings = failedProviderAttemptAfterReadings(snapshot, row);
+    const latestProviderReading = latestProviderReadingAt(snapshot, include);
+    const hardFailureExpired = isHardUsageFailure(row?.lastStatus)
+      && (latestProviderReading === undefined || nowS * 1000 - latestProviderReading > 180_000);
+    const buckets = (failedAfterReadings && isTransientUsageFailure(row?.lastStatus)) || hardFailureExpired
+      ? {}
+      : Object.fromEntries(Object.entries(snapshot).flatMap(([label, reading]) => {
+        if (include(label)
+          && isAutoAuthoritativeReading(reading, nowS * 1000)) {
+          return [[label, {
+            usedPct: reading.usedPct,
+            ...(reading.resetAt === undefined ? {} : { resetAt: reading.resetAt }),
+          }]];
+        }
+        return [];
+      }));
     return {
       accountId: slot.accountId, buckets, dead: slot.dead,
       ...(slot.threshold == null ? {} : { threshold: slot.threshold }),
@@ -207,8 +270,12 @@ export async function pollAnthropic(deps: AnthropicPollDeps): Promise<Autoswitch
     }
   }
 
+  const latestPolls = pollingState(slots, deps.store.listUsagePolls(PROVIDER));
   const inactiveIds = slots.filter((slot) => !slot.dead && slot.accountId !== activeId).map((slot) => slot.accountId);
-  const inactiveId = dueCandidate(inactiveIds, polls, nowS);
+  const inactiveId = dueCandidate(inactiveIds, latestPolls, nowS)
+    ?? (needsCandidateRefresh(decisionInput({ store: deps.store, slots: deps.slots, now: () => nowS * 1000, models }))
+      ? onDemandCandidate(inactiveIds, latestPolls, nowS)
+      : null);
   if (inactiveId) {
     const previous = readUsage(deps.store.getAllSnapshots(inactiveId));
     let credential: string | null = null;
@@ -355,6 +422,7 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
   const nowS = Math.floor(nowMs / 1000);
   const settings = deps.store.getAutoswitchSettings();
   const activeAccountId = deps.store.getActiveLogin(PROVIDER)?.accountId ?? null;
+  const include = autoBucketIncludes(deps.models ?? []);
   const polls = pollingState(deps.slots.listSlots(), deps.store.listUsagePolls(PROVIDER));
   const healthTickAt = configNumber(deps.store, `${AUTO_PREFIX}healthTickAt`);
   const healthIsFresh = activeAccountId !== null
@@ -377,6 +445,10 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     lastSwitchAtMs,
     activeCredentialExpired: polls[activeAccountId ?? '']?.lastStatus === 'token-expired',
     activeUsageUnknown: deps.activeUsageUnknown === true,
+    activeMeasurementGap: activeAccountId !== null && (
+      isTransientUsageFailure(polls[activeAccountId]?.lastStatus)
+      || activeAuthorityLapsed(deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId], nowS, include)
+    ),
     unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,
     idleHoldSinceMs: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}idleHoldSince`) : undefined,
     parkedUntilMs: configNumber(deps.store, `${AUTO_PREFIX}parkedUntil`),

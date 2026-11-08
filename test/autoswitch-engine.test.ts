@@ -134,8 +134,8 @@ describe('autoswitch decision engine — upstream decision table', () => {
     });
   });
 
-  it('applies unknown grace to a dead active because upstream has no immediate-dead escape', () => {
-    const base = input({ accounts: [account('1', null, { dead: true }), account('2', 80)] });
+  it('applies unknown grace to a dead active even after a failed usage poll', () => {
+    const base = input({ activeMeasurementGap: true, accounts: [account('1', null, { dead: true }), account('2', 80)] });
     assert.deepEqual(decideAutoswitch(base), { kind: 'stay', reason: 'unknown', unhealthyTicks: 1 });
     assertSwitch(decideAutoswitch({ ...base, unhealthyTicks: 2 }), '2', 'failover');
   });

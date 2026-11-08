@@ -109,7 +109,7 @@ function document(expiresAt: number, lastRefresh = NOW, account = 'account-a'): 
 function autoHarness(overrides: Partial<CodexAutoDeps> = {}) {
   const records: Array<{ accountId: string; result: { status: string; readings?: Record<string, unknown>; http429?: boolean; retryAfterS?: number } }> = [];
   const snapshots: Record<string, Record<string, unknown>> = { 'user-a:account-a': {} };
-  const polls: Record<string, { pollIntervalS?: number; nextDueAt?: number; heldUntil?: number | null; backoffUntil?: number | null; last429At?: number | null }> = {};
+  const polls: Record<string, { pollIntervalS?: number; nextDueAt?: number; heldUntil?: number | null; backoffUntil?: number | null; last429At?: number | null; lastAttemptAt?: number | null; lastStatus?: string | null }> = {};
   const configs: Record<string, string> = {};
   let activeId: string | null = 'user-a:account-a';
   let now = NOW;
@@ -119,7 +119,11 @@ function autoHarness(overrides: Partial<CodexAutoDeps> = {}) {
     recordUsagePollResult: (_provider: string, accountId: string, result: { status: string; readings?: Record<string, unknown>; http429?: boolean; retryAfterS?: number }) => {
       records.push({ accountId, result });
       if (result.readings) snapshots[accountId] = result.readings;
+      polls[accountId] = { ...polls[accountId], lastAttemptAt: Math.floor(now / 1000), lastStatus: result.status };
       if (result.http429) polls[accountId] = { ...polls[accountId], last429At: Math.floor(now / 1000), backoffUntil: Math.floor(now / 1000) + (result.retryAfterS ?? 30) };
+    },
+    upsertSnapshot: (accountId: string, bucket: string, reading: unknown) => {
+      snapshots[accountId] = { ...snapshots[accountId], [bucket]: reading };
     },
     listUsagePolls: () => polls,
     writeUsagePollPlans: (_provider: string, plans: Record<string, { nextDueAt: number; pollIntervalS: number }>) => {
@@ -180,7 +184,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal((h.records.at(-1)?.result.readings?.primary as { confidence: string }).confidence, 'authoritative');
   });
 
-  it('keeps rollout fallback readings advisory', async () => {
+  it('retains rollout fallback readings as advisory snapshots', async () => {
     const h = autoHarness({
       probeUsage: async () => ({
         status: 500,
@@ -190,10 +194,29 @@ describe('C8 Codex poll and refresh', () => {
       }),
     });
 
-    await codexAutoTick(h.deps);
+    const result = await codexAutoTick(h.deps);
 
-    const reading = h.records.at(-1)?.result.readings?.primary as { source: string; confidence: string };
-    assert.deepEqual(reading, { source: 'poll', confidence: 'advisory', usedPct: 12, fetchedAt: NOW });
+    assert.deepEqual(result.readings, {});
+    assert.equal(h.records.at(-1)?.result.readings, undefined);
+    assert.equal(h.records.at(-1)?.result.status, 'usage-unknown');
+    assert.deepEqual(h.snapshots['user-a:account-a']?.primary, {
+      usedPct: 12,
+      fetchedAt: NOW,
+      source: 'poll',
+      confidence: 'advisory',
+    });
+  });
+
+  it('does not return stale provider readings to Codex auto consumers', async () => {
+    const h = autoHarness();
+    h.snapshots['user-a:account-a'] = {
+      primary: { usedPct: 100, fetchedAt: NOW - 300_001, source: 'provider-poll', confidence: 'authoritative' },
+    };
+    h.polls['user-a:account-a'] = { nextDueAt: Math.floor(NOW / 1000) + 60, pollIntervalS: 60 };
+
+    const result = await codexAutoTick(h.deps);
+
+    assert.deepEqual(result.readings, {});
   });
 
   it('refreshes an active near-expiry login before its usage poll', async () => {
@@ -551,7 +574,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.ok((h.polls['user-a:account-a']?.backoffUntil ?? 0) > NOW / 1000);
   });
 
-  it('keeps rollout readings but records a 429 outcome and Retry-After backoff', async () => {
+  it('keeps rollout readings out of Codex auto authority during a 429', async () => {
     const h = autoHarness({
       probeUsage: async () => ({
         status: 429, source: 'codex-rollout', keys: ['rate_limits'], retryAfterS: 120,
@@ -561,11 +584,25 @@ describe('C8 Codex poll and refresh', () => {
 
     const result = await codexAutoTick(h.deps);
 
-    assert.equal(result.readings.primary?.usedPct, 20);
+    assert.equal(result.readings.primary, undefined);
     assert.equal(h.records.at(-1)?.result.status, 'http-429');
     assert.equal(h.records.at(-1)?.result.http429, true);
     assert.equal(h.records.at(-1)?.result.retryAfterS, 120);
     assert.equal(h.records.at(-1)?.result.readings, undefined);
+  });
+
+  it('keeps a prior Codex reading out of auto authority throughout 429 backoff', async () => {
+    const h = autoHarness({ probeUsage: async () => ({ status: 429, source: 'unknown', keys: [], retryAfterS: 120 }) });
+    h.snapshots['user-a:account-a'] = {
+      primary: { usedPct: 20, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' },
+    };
+    h.polls['user-a:account-a'] = { nextDueAt: NOW / 1000, pollIntervalS: 60 };
+
+    await codexAutoTick(h.deps);
+    h.setNow(NOW + 60_000);
+    const duringBackoff = await codexAutoTick(h.deps);
+
+    assert.deepEqual(duringBackoff.readings, {});
   });
 
   it('replaces another account’s persisted idle hold instead of inheriting it', async () => {

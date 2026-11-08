@@ -109,6 +109,8 @@ Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EX
 
 Run QLB's Anthropic autoswitch loop. `--once` performs one live tick; `--dry-run` makes a decision without mutating state or switching credentials. The normal loop refuses to run while an active lifecycle drill is in progress.
 
+Automatic switching and parking use only fresh, direct provider quota readings. Cached, imported, stale, or advisory rows remain available for display but cannot create a quota verdict; when the active provider measurement is unavailable or a transient usage poll fails, the loop holds rather than switching on a synthetic exhaustion result.
+
 For an authorized fault-injection drill, set `QLB_FAULT_INJECTION=1` and run:
 
 ```bash

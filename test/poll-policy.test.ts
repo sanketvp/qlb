@@ -291,6 +291,7 @@ describe('claude-swap poll policy port', () => {
     });
     assert.equal(bindingPct({ five_hour: { pct: 80 }, seven_day: { pct: 20 } }), 80);
   });
+
 });
 
 describe('claude-swap due-candidate port', () => {

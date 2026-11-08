@@ -30,7 +30,7 @@ async function fixture(used = [95, 30, 10], resets = [60, 60, 60]) {
   for (let index = 0; index < used.length; index += 1) {
     const accountId = String(index + 1);
     await slots.createSlot({ accountId, credential: JSON.stringify({ fixture: accountId }), slotNum: index + 1, source: 'fixture' });
-    store.upsertSnapshot(accountId, '5h', { usedPct: used[index], resetAt: NOW + resets[index] * 60_000, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+    store.upsertSnapshot(accountId, '5h', { usedPct: used[index], resetAt: NOW + resets[index] * 60_000, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' });
   }
   store.setActiveLogin('anthropic', '1', 'fixture', NOW);
   return { store, slots };
@@ -70,8 +70,8 @@ async function realSwitchFixture() {
   await slots.createSlot({ accountId: '2', credential: credentialWithFixtureAccess('two', 'fixture-refresh-two', NOW + 60 * 60_000), slotNum: 2, configJson: JSON.stringify({ oauthAccount: { accountUuid: '2' } }), source: 'fixture' });
   await backend.set(paths.keychainService, 'fixture-user', credentialWithFixtureAccess('one', 'fixture-refresh-one', NOW + 60 * 60_000));
   store.setActiveLogin('anthropic', '1', 'fixture', NOW);
-  store.upsertSnapshot('1', '5h', { usedPct: 95, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
-  store.upsertSnapshot('2', '5h', { usedPct: 10, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'poll', confidence: 'authoritative' });
+  store.upsertSnapshot('1', '5h', { usedPct: 95, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' });
+  store.upsertSnapshot('2', '5h', { usedPct: 10, resetAt: NOW + 60_000, fetchedAt: NOW, source: 'provider-poll', confidence: 'authoritative' });
   return { home, env, paths, store, backend, slots, close: () => repository.close() };
 }
 
