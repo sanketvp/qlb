@@ -446,8 +446,7 @@ function decisionInput(deps: AnthropicTickDeps): AutoswitchInput {
     activeCredentialExpired: polls[activeAccountId ?? '']?.lastStatus === 'token-expired',
     activeUsageUnknown: deps.activeUsageUnknown === true,
     activeMeasurementGap: activeAccountId !== null && (
-      (failedProviderAttemptAfterReadings(deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId])
-        && isTransientUsageFailure(polls[activeAccountId]?.lastStatus))
+      isTransientUsageFailure(polls[activeAccountId]?.lastStatus)
       || activeAuthorityLapsed(deps.store.getAllSnapshots(activeAccountId), polls[activeAccountId], nowS, include)
     ),
     unhealthyTicks: healthIsFresh ? configNumber(deps.store, `${AUTO_PREFIX}unhealthyTicks`) : undefined,

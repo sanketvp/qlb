@@ -168,6 +168,19 @@ describe('auto anthropic poll (G8)', () => {
     }
   });
 
+  it('holds an unmeasured active after a transient usage failure', async () => {
+    const f = await fixture();
+    f.store.setConfig('autoswitch.unhealthyTicks', '1');
+    f.store.upsertSnapshot('inactive', '5h', {
+      usedPct: 10, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
+    });
+    f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status: 'http-500' });
+
+    const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+
+    assert.deepEqual(result.decision, { kind: 'stay', reason: 'unknown', unhealthyTicks: 0 });
+  });
+
   it('refreshes an unmeasured candidate when the active provider reading needs one', async () => {
     const f = await fixture(80);
     f.store.upsertSnapshot('active', '5h', {
