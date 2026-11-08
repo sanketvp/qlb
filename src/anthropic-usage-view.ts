@@ -218,7 +218,7 @@ export function anthropicStoreSnapshots(
 }
 
 /** Whether any persisted Anthropic poll has a currently usable reading. */
-export function hasFreshAnthropicUsagePoll(
+function hasFreshAnthropicUsagePoll(
   slots: readonly AnthropicUsageSlot[],
   store: AnthropicUsageStoreReader,
   nowS: number,

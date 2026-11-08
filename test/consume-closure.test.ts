@@ -24,7 +24,6 @@ const SRC = join(ROOT, 'src');
 const CONSUME_ROOTS = [
   join(SRC, 'cswap-usage.ts'),
   join(SRC, 'cswap-consume.ts'),
-  join(SRC, 'cswap-native-read.ts'),
   join(SRC, 'adapters', 'anthropic.ts'),
 ];
 

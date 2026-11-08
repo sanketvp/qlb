@@ -167,13 +167,13 @@ describe('audit — recorded strategy from resolve', () => {
       '5h': reading(100),
       '7d': reading(100),
     });
-    seedAccount(fbStore, 'x', 'xai', {
-      tokens: reading(10),
-      requests: reading(10),
+    seedAccount(fbStore, 'x', 'kimi-coding', {
+      '5h': reading(10),
+      weekly: reading(10),
     });
     const fallback = resolveFromSnapshots({
       model: 'claude-sonnet-5',
-      fallback: ['grok-4.6'],
+      fallback: ['kimi-k3'],
       snapshots: snapshotsFromStore(fbStore),
       store: fbStore,
     });

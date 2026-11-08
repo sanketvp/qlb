@@ -1,24 +1,12 @@
-// Consume Option B for Pi: serve cswap's currently-active Claude Code access as
-// the unattributed `cswap-active` identity. Read-only Keychain GET only — never
-// refreshes, never writes, never binds a QLB account slot.
-//
-// The reader duplicates src/cswap-native-read.ts (same allowlisted argv, same
-// parse and expiry rules) so the extension has no dependency on QLB's runtime
-// modules. Its sole shared local dependency is src/redact.ts, which pi:extension
-// verifies and copies for the standalone extension layout. test/qlb-pi-consume.test.ts
-// pins the two readers to identical behavior.
+// Consume Option B for Pi replaces Anthropic with an unavailable provider when
+// the cache cannot establish provider-attributable capacity.
 
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir, userInfo } from "node:os";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isPiProvider, type PiProvider } from "./active-access.js";
 
 export const CSWAP_ACTIVE_ID = "cswap-active";
-export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
-export const SECURITY_BIN = "/usr/bin/security";
-const FALLBACK_ACCOUNT = "claude-code-user";
 
 // Shared redaction is intentionally imported from src/: in a package install it
 // resolves within QLB, and in a copied install pi:extension supplies agent/src/redact.ts.
@@ -30,10 +18,6 @@ export { redactEvent, redactSecrets } from "../../src/redact.js";
 export const CONSUME_ERRORS = {
   quotaUnavailable:
     "QLB Anthropic consume unavailable: no fresh provider-attributable quota reading",
-  unreadable: "cswap-active credential unavailable (Claude Code login unreadable)",
-  expired: "cswap-active credential expired; switch or re-login in Claude Code/cswap",
-  disabled:
-    "QLB cswap consume is no longer enabled; restart Pi to return to its own Anthropic provider",
   conflict:
     "QLB ownership conflict: Pi's Anthropic accounts are QLB-owned (or unknown) while cswap consume is enabled. " +
     "Run `qlb consume disable --provider anthropic` or `qlb migrate rollback --provider anthropic`, then restart Pi.",
@@ -45,76 +29,9 @@ export const CONSUME_ERRORS = {
     "Re-run `qlb consume enable --provider anthropic` or `qlb consume disable --provider anthropic`, then restart Pi.",
 } as const;
 
-export type SecurityRunner = (executable: string, args: readonly string[]) => string;
-
-export interface CswapActiveAccess {
-  access: string;
-  fingerprint: string;
-}
-
-export function fingerprintAccess(access: string): string {
-  return createHash("sha256").update(access, "utf8").digest("hex");
-}
-
-export function activeKeychainAccount(env: NodeJS.ProcessEnv = process.env): string {
-  if (typeof env.USER === "string" && env.USER.length > 0) return env.USER;
-  try {
-    const name = userInfo().username;
-    if (typeof name === "string" && name.length > 0) return name;
-  } catch {
-    // fall through
-  }
-  return FALLBACK_ACCOUNT;
-}
-
-export function activeCcSecurityArgs(account: string): string[] {
-  return ["find-generic-password", "-a", account, "-w", "-s", ACTIVE_CC_SERVICE];
-}
-
-function defaultRunner(executable: string, args: readonly string[]): string {
-  return execFileSync(executable, [...args], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
-}
-
-/** Read-only GET of the active Claude Code login; returns only the access token. */
-export function readActiveClaudeAccess(opts: {
-  runner?: SecurityRunner;
-  env?: NodeJS.ProcessEnv;
-  nowMs?: number;
-} = {}): CswapActiveAccess {
-  const runner = opts.runner ?? defaultRunner;
-  let raw: string;
-  try {
-    raw = String(runner(SECURITY_BIN, activeCcSecurityArgs(activeKeychainAccount(opts.env))));
-  } catch {
-    throw new Error(CONSUME_ERRORS.unreadable);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.replace(/\n$/, ""));
-  } catch {
-    throw new Error(CONSUME_ERRORS.unreadable);
-  }
-  const oauth = asRecord(asRecord(parsed)?.claudeAiOauth);
-  const access = oauth?.accessToken;
-  const expiresAt = oauth?.expiresAt;
-  if (typeof access !== "string" || access.length === 0) {
-    throw new Error(CONSUME_ERRORS.unreadable);
-  }
-  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
-    throw new Error(CONSUME_ERRORS.unreadable);
-  }
-  if (expiresAt < (opts.nowMs ?? Date.now())) {
-    throw new Error(CONSUME_ERRORS.expired);
-  }
-  return { access, fingerprint: fingerprintAccess(access) };
 }
 
 /**
@@ -300,39 +217,4 @@ export function conflictMessage(input: PiModeInput): string {
   if ((input.journal ?? "unknown") === "unknown") return CONSUME_ERRORS.stateUnknown;
   const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
   return claimsOwnership ? CONSUME_ERRORS.conflict : CONSUME_ERRORS.stateInconsistent;
-}
-
-/**
- * Adapter for streamWithAuthRetry: at most two reads per request. The first
- * stream uses read #1; a 401 triggers exactly one reread, and the retry sends
- * exactly that reread value — only if its fingerprint changed.
- */
-export function consumeAccessSource(read: () => CswapActiveAccess): {
-  readAccess: () => string;
-  resync: () => Promise<{ resynced: boolean; reason: string }>;
-  sent: () => string[];
-} {
-  let current: CswapActiveAccess | undefined;
-  const sent: string[] = [];
-  return {
-    readAccess: () => {
-      current ??= read();
-      sent.push(current.access);
-      return current.access;
-    },
-    resync: async () => {
-      let next: CswapActiveAccess;
-      try {
-        next = read();
-      } catch {
-        return { resynced: false, reason: "cswap-active reread failed" };
-      }
-      if (current && next.fingerprint === current.fingerprint) {
-        return { resynced: false, reason: "cswap-active access fingerprint unchanged" };
-      }
-      current = next;
-      return { resynced: true, reason: "cswap-active access fingerprint changed" };
-    },
-    sent: () => [...sent],
-  };
 }
