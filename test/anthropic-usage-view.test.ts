@@ -24,7 +24,12 @@ function slot(accountId: string, extra: Partial<ClaudeSlot> = {}): ClaudeSlot {
   };
 }
 
-function record(store: ReturnType<typeof openStore>, accountId: string, fetchedAtS: number): void {
+function record(
+  store: ReturnType<typeof openStore>,
+  accountId: string,
+  fetchedAtS: number,
+  source: 'poll' | 'provider-poll' = 'poll',
+): void {
   store.recordUsagePollResult('anthropic', accountId, {
     attemptedAt: fetchedAtS,
     status: 'ok',
@@ -32,7 +37,7 @@ function record(store: ReturnType<typeof openStore>, accountId: string, fetchedA
       '5h': {
         usedPct: 12,
         fetchedAt: fetchedAtS * 1000,
-        source: 'poll',
+        source,
         confidence: 'authoritative',
       },
     },
@@ -54,13 +59,14 @@ describe('QLB-owned Anthropic store projection', () => {
     }
   });
 
-  it('retains a backoff-protected poll as stale', () => {
+  it('marks a provider reading older than five minutes stale', () => {
     const store = openStore(':memory:');
     try {
-      record(store, 'stale', NOW_S - 600);
+      record(store, 'stale', NOW_S - 301, 'provider-poll');
       store.recordUsagePollResult('anthropic', 'stale', { attemptedAt: NOW_S, status: 'usage-fetch-failed' });
       const result = anthropicStoreSnapshots([slot('stale')], store, NOW_S);
       assert.equal(result.snapshots[0]?.buckets['5h']?.confidence, 'stale');
+      assert.equal(result.snapshots[0]?.buckets['5h']?.fetchedAt, (NOW_S - 301) * 1000);
       assert.equal(result.snapshots[0]?.error, undefined);
     } finally {
       store.close();

@@ -1361,32 +1361,23 @@ export function persistUsageObservation(
   if (eligible && hasUsageDiscrepanciesTable(db)) {
     const now = Date.now();
     db.prepare('DELETE FROM usage_discrepancies WHERE observed_at < ?').run(now - USAGE_DISCREPANCY_RETENTION_MS);
-    const duplicate = db.prepare(`SELECT 1 FROM usage_discrepancies
-      WHERE account_id IS ? AND bucket IS ? AND source_class IS ?
-        AND comparison_source_class IS ? AND provider_value IS ?
-        AND comparison_value IS ? AND resolution IS ?`).get(
-      accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
-      eligible.providerValue, eligible.comparisonValue, eligible.resolution,
+    const inserted = db.prepare(`INSERT OR IGNORE INTO usage_discrepancies (
+      observed_at, account_id, bucket, source_class, comparison_source_class,
+      provider_observed_at, comparison_observed_at, provider_value, comparison_value,
+      tolerance, resolution
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      now, accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
+      eligible.providerObservedAt, eligible.comparisonObservedAt,
+      eligible.providerValue, eligible.comparisonValue,
+      USAGE_DISCREPANCY_TOLERANCE_PCT, eligible.resolution,
     );
-    if (!duplicate) {
-      const inserted = db.prepare(`INSERT OR IGNORE INTO usage_discrepancies (
-        observed_at, account_id, bucket, source_class, comparison_source_class,
-        provider_observed_at, comparison_observed_at, provider_value, comparison_value,
-        tolerance, resolution
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        now, accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
-        eligible.providerObservedAt, eligible.comparisonObservedAt,
-        eligible.providerValue, eligible.comparisonValue,
-        USAGE_DISCREPANCY_TOLERANCE_PCT, eligible.resolution,
-      );
-      if (Number(inserted.changes) > 0) {
-        db.prepare(`DELETE FROM usage_discrepancies WHERE id IN (
-          SELECT id FROM usage_discrepancies
-          ORDER BY CASE resolution WHEN 'provider-wins-discrepancy' THEN 0 ELSE 1 END,
-                   observed_at DESC, id DESC
-          LIMIT -1 OFFSET ?
-        )`).run(USAGE_DISCREPANCY_MAX_ROWS);
-      }
+    if (Number(inserted.changes) > 0) {
+      db.prepare(`DELETE FROM usage_discrepancies WHERE id IN (
+        SELECT id FROM usage_discrepancies
+        ORDER BY CASE resolution WHEN 'provider-wins-discrepancy' THEN 0 ELSE 1 END,
+                 observed_at DESC, id DESC
+        LIMIT -1 OFFSET ?
+      )`).run(USAGE_DISCREPANCY_MAX_ROWS);
     }
   }
 
