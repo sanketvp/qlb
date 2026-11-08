@@ -1159,11 +1159,16 @@ export function hasUsageDiscrepanciesTable(db: DatabaseSync): boolean {
   return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_discrepancies'").get());
 }
 
+function hasUsageDiscrepanciesLastObservedAt(db: DatabaseSync): boolean {
+  return hasUsageDiscrepanciesTable(db) && hasColumn(db, 'usage_discrepancies', 'last_observed_at');
+}
+
 function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS usage_discrepancies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       observed_at INTEGER NOT NULL,
+      last_observed_at INTEGER NOT NULL DEFAULT 0,
       account_id TEXT NOT NULL,
       bucket TEXT NOT NULL,
       source_class TEXT NOT NULL CHECK (source_class IN ('provider-direct','local','import','advisory')),
@@ -1175,7 +1180,6 @@ function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
       tolerance REAL NOT NULL,
       resolution TEXT NOT NULL CHECK (resolution IN ('provider-wins-discrepancy','provider-anomaly-unavailable'))
     );
-    CREATE INDEX IF NOT EXISTS usage_discrepancies_observed_at ON usage_discrepancies(observed_at);
     CREATE UNIQUE INDEX IF NOT EXISTS usage_discrepancies_dedupe ON usage_discrepancies(
       account_id, bucket, source_class,
       COALESCE(comparison_source_class, ''),
@@ -1184,13 +1188,19 @@ function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
       resolution
     );
   `);
+  if (!hasUsageDiscrepanciesLastObservedAt(db)) {
+    db.exec('ALTER TABLE usage_discrepancies ADD COLUMN last_observed_at INTEGER NOT NULL DEFAULT 0');
+  }
+  db.exec(`UPDATE usage_discrepancies SET last_observed_at = observed_at WHERE last_observed_at = 0;
+    DROP INDEX IF EXISTS usage_discrepancies_observed_at;
+    CREATE INDEX IF NOT EXISTS usage_discrepancies_last_observed_at ON usage_discrepancies(last_observed_at);`);
 }
 
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
   return version < SCHEMA_VERSION
     || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db))
-    || !hasUsageDiscrepanciesTable(db);
+    || !hasUsageDiscrepanciesLastObservedAt(db);
 }
 
 function normalizedSql(sql: string): string {
@@ -1360,25 +1370,27 @@ export function persistUsageObservation(
 
   if (eligible && hasUsageDiscrepanciesTable(db)) {
     const now = Date.now();
-    db.prepare('DELETE FROM usage_discrepancies WHERE observed_at < ?').run(now - USAGE_DISCREPANCY_RETENTION_MS);
-    const inserted = db.prepare(`INSERT OR IGNORE INTO usage_discrepancies (
-      observed_at, account_id, bucket, source_class, comparison_source_class,
+    db.prepare('DELETE FROM usage_discrepancies WHERE last_observed_at < ?').run(now - USAGE_DISCREPANCY_RETENTION_MS);
+    db.prepare(`INSERT INTO usage_discrepancies (
+      observed_at, last_observed_at, account_id, bucket, source_class, comparison_source_class,
       provider_observed_at, comparison_observed_at, provider_value, comparison_value,
       tolerance, resolution
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      now, accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT DO UPDATE SET
+      last_observed_at = excluded.last_observed_at,
+      provider_observed_at = excluded.provider_observed_at,
+      comparison_observed_at = excluded.comparison_observed_at`).run(
+      now, now, accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
       eligible.providerObservedAt, eligible.comparisonObservedAt,
       eligible.providerValue, eligible.comparisonValue,
       USAGE_DISCREPANCY_TOLERANCE_PCT, eligible.resolution,
     );
-    if (Number(inserted.changes) > 0) {
-      db.prepare(`DELETE FROM usage_discrepancies WHERE id IN (
-        SELECT id FROM usage_discrepancies
-        ORDER BY CASE resolution WHEN 'provider-wins-discrepancy' THEN 0 ELSE 1 END,
-                 observed_at DESC, id DESC
-        LIMIT -1 OFFSET ?
-      )`).run(USAGE_DISCREPANCY_MAX_ROWS);
-    }
+    db.prepare(`DELETE FROM usage_discrepancies WHERE id IN (
+      SELECT id FROM usage_discrepancies
+      ORDER BY CASE resolution WHEN 'provider-wins-discrepancy' THEN 0 ELSE 1 END,
+               last_observed_at DESC, id DESC
+      LIMIT -1 OFFSET ?
+    )`).run(USAGE_DISCREPANCY_MAX_ROWS);
   }
 
   db.prepare(`
@@ -1421,8 +1433,9 @@ export function usageDiscrepancyAggregate(
   now = Date.now(),
 ): UsageDiscrepancyAggregate {
   if (!hasUsageDiscrepanciesTable(db)) return { discrepancies: 0, anomalies: 0 };
+  const observedAt = hasUsageDiscrepanciesLastObservedAt(db) ? 'last_observed_at' : 'observed_at';
   const rows = db.prepare(`SELECT resolution, COUNT(*) AS count FROM usage_discrepancies
-    WHERE observed_at >= ? GROUP BY resolution`).all(now - USAGE_DISCREPANCY_RETENTION_MS) as Array<{
+    WHERE ${observedAt} >= ? GROUP BY resolution`).all(now - USAGE_DISCREPANCY_RETENTION_MS) as Array<{
       resolution: string;
       count: number;
     }>;

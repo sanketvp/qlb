@@ -2,7 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { redactSecrets } from './redact';
-import { currentProviderObservation, failedProviderAttemptAfterReadings } from './routing-authority';
+import { currentProviderObservation, failedProviderAttemptAfterReadings, PROVIDER_READING_MAX_AGE_MS } from './routing-authority';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S };
@@ -90,6 +90,8 @@ export function anthropicUsageConfidence(
   nowS: number,
 ): Confidence {
   if (reading.resetAt !== undefined && nowS * 1000 > reading.resetAt) return 'unknown';
+  if ((reading.source === 'provider-poll' || reading.source === 'provider-headers')
+    && nowS * 1000 - reading.fetchedAt > PROVIDER_READING_MAX_AGE_MS) return 'stale';
   if (!decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS)) return 'unknown';
   return nowS - reading.fetchedAt / 1000 <= STALE_OK_S ? 'authoritative' : 'stale';
 }

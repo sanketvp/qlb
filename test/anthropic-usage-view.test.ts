@@ -63,7 +63,6 @@ describe('QLB-owned Anthropic store projection', () => {
     const store = openStore(':memory:');
     try {
       record(store, 'stale', NOW_S - 301, 'provider-poll');
-      store.recordUsagePollResult('anthropic', 'stale', { attemptedAt: NOW_S, status: 'usage-fetch-failed' });
       const result = anthropicStoreSnapshots([slot('stale')], store, NOW_S);
       assert.equal(result.snapshots[0]?.buckets['5h']?.confidence, 'stale');
       assert.equal(result.snapshots[0]?.buckets['5h']?.fetchedAt, (NOW_S - 301) * 1000);

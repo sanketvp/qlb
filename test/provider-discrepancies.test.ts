@@ -122,6 +122,36 @@ describe('provider usage discrepancy records', () => {
     }
   });
 
+  it('keeps a recurring discrepancy in the thirty-day doctor window', () => {
+    const path = dbPath();
+    const firstObservedAt = 1_700_000_000_000;
+    const recurringAt = firstObservedAt + USAGE_DISCREPANCY_RETENTION_MS - 0.1 * 24 * 60 * 60 * 1000;
+    const checkedAt = firstObservedAt + USAGE_DISCREPANCY_RETENTION_MS + 0.1 * 24 * 60 * 60 * 1000;
+    const originalNow = Date.now;
+    const store = openStore(path);
+    try {
+      Date.now = () => firstObservedAt;
+      store.upsertSnapshot('recurring', '5h', local(90, firstObservedAt - 1));
+      store.upsertSnapshot('recurring', '5h', provider(70, firstObservedAt));
+      Date.now = () => recurringAt;
+      store.upsertSnapshot('recurring', '5h', local(90, firstObservedAt - 1));
+
+      const persisted = rows(path);
+      assert.equal(persisted.length, 1);
+      assert.equal(persisted[0]?.observed_at, firstObservedAt);
+      assert.equal(persisted[0]?.last_observed_at, recurringAt);
+      const ledger = new DatabaseSync(path, { readOnly: true });
+      try {
+        assert.deepEqual(usageDiscrepancyAggregate(ledger, checkedAt), { discrepancies: 1, anomalies: 0 });
+      } finally {
+        ledger.close();
+      }
+    } finally {
+      Date.now = originalNow;
+      store.close();
+    }
+  });
+
   it('classifies null as absent, 101 as exhausted, and negative/non-finite as one anomaly', () => {
     const path = dbPath();
     const now = Date.now();
