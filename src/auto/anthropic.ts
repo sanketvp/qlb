@@ -100,8 +100,8 @@ function recent429(row: UsagePollRow | undefined, nowS: number): boolean {
 }
 
 function isAutoAuthoritativeReading(reading: BucketReading | undefined, nowMs: number): boolean {
-  return isProviderAuthoritativeReading(reading, nowMs)
-    && (reading.resetAt === undefined || reading.resetAt > nowMs);
+  if (reading === undefined || !isProviderAuthoritativeReading(reading, nowMs)) return false;
+  return reading.resetAt === undefined || reading.resetAt > nowMs;
 }
 
 function autoBucketIncludes(models: readonly string[]): (label: string) => boolean {

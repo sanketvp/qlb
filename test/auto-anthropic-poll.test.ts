@@ -187,8 +187,8 @@ describe('auto anthropic poll (G8)', () => {
       usedPct: 85, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
     });
     f.store.writeUsagePollPlans('anthropic', {
-      active: { nextDueAt: NOW + 10_000, pollIntervalS: 240 },
-      inactive: { nextDueAt: NOW + 10_000, pollIntervalS: 600 },
+      active: { nextDueAt: NOW + 300, pollIntervalS: 240 },
+      inactive: { nextDueAt: NOW + 300, pollIntervalS: 600 },
     });
 
     const accounts = await pollAnthropic(f.deps());
