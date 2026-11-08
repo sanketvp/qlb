@@ -140,9 +140,13 @@ describe('auto breaker-rows fault drill', () => {
       assert.equal(drill.decision.kind, 'stay');
       assert.equal(drill.decision.reason, 'breaker');
       store.setConfig('auto.anthropic.suspendedUntil', '');
-      const now = NOW;
-      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
-      store.upsertSnapshot('next', '5h', { usedPct: 10, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative' });
+      // Snapshot upserts retain the newer reading, so replacements must be
+      // strictly later than the fixture seeds at NOW. Keep all decision-time
+      // values derived from this single frozen tick clock.
+      const now = NOW + 1_000;
+      const resetAt = now + 60_000;
+      store.upsertSnapshot('active', '5h', { usedPct: 95, fetchedAt: now, resetAt, source: 'provider-poll', confidence: 'authoritative' });
+      store.upsertSnapshot('next', '5h', { usedPct: 10, fetchedAt: now, resetAt, source: 'provider-poll', confidence: 'authoritative' });
       // The production dry-run binding is immutable when no live WAL exists;
       // close the fixture writer so its committed state is checkpointed first.
       store.close();
@@ -152,7 +156,7 @@ describe('auto breaker-rows fault drill', () => {
       });
       assert.deepEqual(output.decisions, [{
         kind: 'switch', targetId: 'next', reason: 'proactive', unhealthyTicks: 0, parkedUntilMs: undefined,
-        leftHeadroom: 5, leftRecoveryAtMs: null, leftTrigger: 'proactive',
+        leftHeadroom: 5, leftRecoveryAtMs: resetAt, leftTrigger: 'proactive',
       }]);
     } finally { if (!closed) store.close(); rmSync(root, { recursive: true, force: true }); }
   });
