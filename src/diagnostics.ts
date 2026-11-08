@@ -63,6 +63,7 @@ import { probeHostEnvironment, type HostCommandRunner } from './checks/hosts-env
 import { autoAgentCheck } from './checks/auto-agent';
 import { autoBreakerCheck } from './checks/auto-breaker';
 import { autoParkedCheck } from './checks/auto-parked';
+import { usageProviderDiscrepanciesCheck } from './checks/usage-provider-discrepancies';
 import { cswapAgentCheck } from './checks/cswap-agent';
 import { cswapProcessesCheck } from './checks/cswap-processes';
 import type { CswapAgentStatus } from './cswap-agent';
@@ -85,7 +86,7 @@ import { undoLineageMatchCheck } from './checks/undo-lineage-match';
 import { guardCheck } from './checks/_check';
 import { lifecyclePhase, lifecyclePhaseCheck, type LifecyclePhaseResult } from './checks/lifecycle-phase';
 import { relogin7dCheck } from './checks/relogin-7d';
-import { openStoreConnection } from './store';
+import { openStoreConnection, usageDiscrepancyAggregate } from './store';
 import { discoverChecks, type CheckDefinition } from './registry';
 import { lifecycleWindowCheck } from './checks/lifecycle-window';
 import { lifecycleDrillCheck } from './checks/lifecycle-drill';
@@ -664,6 +665,7 @@ export async function doctorQlb(
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
+  let usageCounts = { discrepancies: 0, anomalies: 0 };
   const recordedConfig = new Map<string, string>();
 
   if (!existsSync(config.dbPath)) {
@@ -711,6 +713,7 @@ export async function doctorQlb(
         for (const row of rows) recordedConfig.set(row.key, row.value);
         recoveryPending = recordedConfig.has('migrations.recovery_pending');
       }
+      usageCounts = usageDiscrepancyAggregate(db);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       if (sqliteCheck?.level === 'FAIL') {
@@ -749,6 +752,8 @@ export async function doctorQlb(
   } else {
     checks.push({ name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
   }
+
+  checks.push(usageProviderDiscrepanciesCheck(usageCounts));
 
   if (recoveryPending) {
     checks.push({

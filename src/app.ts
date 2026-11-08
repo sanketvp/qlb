@@ -1951,7 +1951,7 @@ async function runAccounts(opts: AccountsOpts): Promise<number> {
         console.log(
           `removed: accounts=${result.removed.accounts} snapshots=${result.removed.snapshots} ` +
             `overrides=${result.removed.overrides} poll_claims=${result.removed.pollClaims} ` +
-            `leases=${result.removed.leases}`,
+            `leases=${result.removed.leases} usage_discrepancies=${result.removed.usageDiscrepancies}`,
         );
       }
       return 0;

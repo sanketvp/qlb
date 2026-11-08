@@ -15,6 +15,7 @@ import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 import type { CodexWatch } from './codex-switch';
+import { classifyProviderPercentage, PROVIDER_READING_MAX_AGE_MS } from './routing-authority';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
 import { assertCodexUsageDiagnosticAttempt, type CodexUsageDiagnosticAttempt } from './codex-usage-diagnostic-shared';
 export { SCHEMA_VERSION };
@@ -78,6 +79,30 @@ export interface UsagePollResult {
   retryAfterS?: number;
   /** Finite redacted result from the explicitly authorized Codex usage refresh. */
   codexDiagnostic?: CodexUsageDiagnosticAttempt;
+}
+
+/** One percentage point absorbs ordinary provider rounding without hiding a mismatch. */
+export const USAGE_DISCREPANCY_TOLERANCE_PCT = 1;
+export const USAGE_DISCREPANCY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const USAGE_DISCREPANCY_MAX_ROWS = 10_000;
+
+export type UsageSourceClass = 'provider-direct' | 'local' | 'import' | 'advisory';
+export type UsageDiscrepancyResolution = 'provider-wins-discrepancy' | 'provider-anomaly-unavailable';
+
+export interface UsageObservation {
+  usedPct: number | null;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  resetAt?: number | null;
+  fetchedAt: number;
+  source: string;
+  confidence: string;
+}
+
+export interface UsageDiscrepancyAggregate {
+  discrepancies: number;
+  anomalies: number;
 }
 
 function usageFailureBackoffS(failures: number, retryAfterS: number | undefined, rateLimited: boolean): number {
@@ -1130,9 +1155,42 @@ function redactJsonText(value: string): string {
   }
 }
 
+export function hasUsageDiscrepanciesTable(db: DatabaseSync): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_discrepancies'").get());
+}
+
+function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS usage_discrepancies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      observed_at INTEGER NOT NULL,
+      account_id TEXT NOT NULL,
+      bucket TEXT NOT NULL,
+      source_class TEXT NOT NULL CHECK (source_class IN ('provider-direct','local','import','advisory')),
+      comparison_source_class TEXT CHECK (comparison_source_class IS NULL OR comparison_source_class IN ('provider-direct','local','import','advisory')),
+      provider_observed_at INTEGER,
+      comparison_observed_at INTEGER,
+      provider_value REAL,
+      comparison_value REAL,
+      tolerance REAL NOT NULL,
+      resolution TEXT NOT NULL CHECK (resolution IN ('provider-wins-discrepancy','provider-anomaly-unavailable'))
+    );
+    CREATE INDEX IF NOT EXISTS usage_discrepancies_observed_at ON usage_discrepancies(observed_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS usage_discrepancies_dedupe ON usage_discrepancies(
+      account_id, bucket, source_class,
+      COALESCE(comparison_source_class, ''),
+      COALESCE(provider_value, 1e308),
+      COALESCE(comparison_value, 1e308),
+      resolution
+    );
+  `);
+}
+
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
-  return version < SCHEMA_VERSION || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db));
+  return version < SCHEMA_VERSION
+    || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db))
+    || !hasUsageDiscrepanciesTable(db);
 }
 
 function normalizedSql(sql: string): string {
@@ -1211,10 +1269,184 @@ function toReading(row: {
   return reading;
 }
 
+function isDirectProviderSource(source: string): boolean {
+  return source === 'provider-poll' || source === 'provider-headers';
+}
+
+function observationSourceClass(reading: Pick<UsageObservation, 'source' | 'confidence'>): UsageSourceClass {
+  if (isDirectProviderSource(reading.source)) return 'provider-direct';
+  if (reading.source === 'plugin' || reading.source === 'cswap-import') return 'import';
+  if (reading.confidence === 'advisory') return 'advisory';
+  return 'local';
+}
+
+function comparablePercentage(usedPct: number | null | undefined): number | null {
+  const classification = classifyProviderPercentage(usedPct);
+  return classification === 'usable' || classification === 'exhausted' ? usedPct as number : null;
+}
+
+function bindFinitePct(value: number | null | undefined): number | null {
+  return value != null && Number.isFinite(value) ? value : null;
+}
+
+/** Unlocked helper: caller supplies the connection already inside a write transaction. */
+export function persistUsageObservation(
+  db: DatabaseSync,
+  accountId: string,
+  bucket: string,
+  reading: UsageObservation,
+): void {
+  const previousRow = db.prepare(
+    'SELECT used_pct, fetched_at, source, confidence FROM snapshots WHERE account_id = ? AND bucket = ?',
+  ).get(accountId, bucket) as {
+    used_pct: number | null;
+    fetched_at: number | null;
+    source: string;
+    confidence: string;
+  } | undefined;
+  const previous = previousRow
+    ? {
+      usedPct: previousRow.used_pct,
+      fetchedAt: previousRow.fetched_at ?? 0,
+      source: previousRow.source || 'poll',
+      confidence: previousRow.confidence || 'unknown',
+    }
+    : null;
+
+  let eligible: {
+    sourceClass: UsageSourceClass;
+    comparisonSourceClass: UsageSourceClass | null;
+    providerObservedAt: number | null;
+    comparisonObservedAt: number | null;
+    providerValue: number | null;
+    comparisonValue: number | null;
+    resolution: UsageDiscrepancyResolution;
+  } | null = null;
+
+  if (isDirectProviderSource(reading.source) && classifyProviderPercentage(reading.usedPct) === 'malformed') {
+    eligible = {
+      sourceClass: 'provider-direct',
+      comparisonSourceClass: null,
+      providerObservedAt: reading.fetchedAt,
+      comparisonObservedAt: null,
+      providerValue: bindFinitePct(reading.usedPct),
+      comparisonValue: null,
+      resolution: 'provider-anomaly-unavailable',
+    };
+  } else if (previous) {
+    const incomingDirect = isDirectProviderSource(reading.source);
+    const previousDirect = isDirectProviderSource(previous.source);
+    const provider = incomingDirect && !previousDirect ? reading : !incomingDirect && previousDirect ? previous : null;
+    const comparison = incomingDirect && !previousDirect ? previous : !incomingDirect && previousDirect ? reading : null;
+    if (provider && comparison) {
+      const providerPct = comparablePercentage(provider.usedPct);
+      const comparisonPct = comparablePercentage(comparison.usedPct);
+      if (providerPct != null && comparisonPct != null
+        && Number.isFinite(provider.fetchedAt) && Number.isFinite(comparison.fetchedAt)
+        && Math.abs(provider.fetchedAt - comparison.fetchedAt) <= PROVIDER_READING_MAX_AGE_MS
+        && Math.abs(providerPct - comparisonPct) > USAGE_DISCREPANCY_TOLERANCE_PCT) {
+        eligible = {
+          sourceClass: 'provider-direct',
+          comparisonSourceClass: observationSourceClass(comparison),
+          providerObservedAt: provider.fetchedAt,
+          comparisonObservedAt: comparison.fetchedAt,
+          providerValue: providerPct,
+          comparisonValue: comparisonPct,
+          resolution: 'provider-wins-discrepancy',
+        };
+      }
+    }
+  }
+
+  if (eligible && hasUsageDiscrepanciesTable(db)) {
+    const now = Date.now();
+    db.prepare('DELETE FROM usage_discrepancies WHERE observed_at < ?').run(now - USAGE_DISCREPANCY_RETENTION_MS);
+    const duplicate = db.prepare(`SELECT 1 FROM usage_discrepancies
+      WHERE account_id IS ? AND bucket IS ? AND source_class IS ?
+        AND comparison_source_class IS ? AND provider_value IS ?
+        AND comparison_value IS ? AND resolution IS ?`).get(
+      accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
+      eligible.providerValue, eligible.comparisonValue, eligible.resolution,
+    );
+    if (!duplicate) {
+      const inserted = db.prepare(`INSERT OR IGNORE INTO usage_discrepancies (
+        observed_at, account_id, bucket, source_class, comparison_source_class,
+        provider_observed_at, comparison_observed_at, provider_value, comparison_value,
+        tolerance, resolution
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        now, accountId, bucket, eligible.sourceClass, eligible.comparisonSourceClass,
+        eligible.providerObservedAt, eligible.comparisonObservedAt,
+        eligible.providerValue, eligible.comparisonValue,
+        USAGE_DISCREPANCY_TOLERANCE_PCT, eligible.resolution,
+      );
+      if (Number(inserted.changes) > 0) {
+        db.prepare(`DELETE FROM usage_discrepancies WHERE id IN (
+          SELECT id FROM usage_discrepancies
+          ORDER BY CASE resolution WHEN 'provider-wins-discrepancy' THEN 0 ELSE 1 END,
+                   observed_at DESC, id DESC
+          LIMIT -1 OFFSET ?
+        )`).run(USAGE_DISCREPANCY_MAX_ROWS);
+      }
+    }
+  }
+
+  db.prepare(`
+    INSERT INTO snapshots (
+      account_id, bucket, used_pct, used, limit_val, remaining,
+      reset_at, fetched_at, source, confidence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_id, bucket) DO UPDATE SET
+      used_pct = excluded.used_pct,
+      used = excluded.used,
+      limit_val = excluded.limit_val,
+      remaining = excluded.remaining,
+      reset_at = excluded.reset_at,
+      fetched_at = excluded.fetched_at,
+      source = excluded.source,
+      confidence = excluded.confidence
+    WHERE (excluded.source IN ('provider-poll', 'provider-headers')
+        AND (snapshots.source NOT IN ('provider-poll', 'provider-headers')
+          OR excluded.fetched_at > snapshots.fetched_at))
+      OR (excluded.source NOT IN ('provider-poll', 'provider-headers')
+        AND snapshots.source NOT IN ('provider-poll', 'provider-headers')
+        AND excluded.fetched_at > snapshots.fetched_at)
+  `).run(
+    accountId,
+    bucket,
+    bindFinitePct(reading.usedPct),
+    reading.used ?? null,
+    reading.limit ?? null,
+    reading.remaining ?? null,
+    reading.resetAt ?? null,
+    reading.fetchedAt,
+    reading.source,
+    reading.confidence,
+  );
+}
+
+/** Missing table and out-of-window rows count as zero. */
+export function usageDiscrepancyAggregate(
+  db: DatabaseSync,
+  now = Date.now(),
+): UsageDiscrepancyAggregate {
+  if (!hasUsageDiscrepanciesTable(db)) return { discrepancies: 0, anomalies: 0 };
+  const rows = db.prepare(`SELECT resolution, COUNT(*) AS count FROM usage_discrepancies
+    WHERE observed_at >= ? GROUP BY resolution`).all(now - USAGE_DISCREPANCY_RETENTION_MS) as Array<{
+      resolution: string;
+      count: number;
+    }>;
+  let discrepancies = 0;
+  let anomalies = 0;
+  for (const row of rows) {
+    if (row.resolution === 'provider-wins-discrepancy') discrepancies = Number(row.count);
+    else if (row.resolution === 'provider-anomaly-unavailable') anomalies = Number(row.count);
+  }
+  return { discrepancies, anomalies };
+}
+
 export class Store {
   readonly dbPath: string;
   private readonly db: DatabaseSync;
-  private readonly upsertSnapStmt: StatementSync;
   private readonly getSnapStmt: StatementSync;
   private readonly getAllSnapStmt: StatementSync;
   private readonly insertDecisionStmt: StatementSync;
@@ -1248,6 +1480,7 @@ export class Store {
   private readonly deleteOverridesByAccountStmt: StatementSync;
   private readonly deletePollClaimsByAccountStmt: StatementSync;
   private readonly deleteLeaseByNameStmt: StatementSync;
+  private readonly deleteUsageDiscrepanciesByAccountStmt: StatementSync;
 
   constructor(dbPath: string = DEFAULT_DB_PATH) {
     this.dbPath = dbPath;
@@ -1327,23 +1560,6 @@ export class Store {
         // best-effort
       }
     }
-
-    this.upsertSnapStmt = this.db.prepare(`
-      INSERT INTO snapshots (
-        account_id, bucket, used_pct, used, limit_val, remaining,
-        reset_at, fetched_at, source, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(account_id, bucket) DO UPDATE SET
-        used_pct = excluded.used_pct,
-        used = excluded.used,
-        limit_val = excluded.limit_val,
-        remaining = excluded.remaining,
-        reset_at = excluded.reset_at,
-        fetched_at = excluded.fetched_at,
-        source = excluded.source,
-        confidence = excluded.confidence
-      WHERE excluded.fetched_at > snapshots.fetched_at
-    `);
 
     this.getSnapStmt = this.db.prepare(
       'SELECT * FROM snapshots WHERE account_id = ? AND bucket = ?',
@@ -1473,6 +1689,9 @@ export class Store {
       'DELETE FROM poll_claims WHERE account_id = ?',
     );
     this.deleteLeaseByNameStmt = this.db.prepare('DELETE FROM leases WHERE name = ?');
+    this.deleteUsageDiscrepanciesByAccountStmt = this.db.prepare(
+      'DELETE FROM usage_discrepancies WHERE account_id = ?',
+    );
     } catch (err) {
       try {
         this.db.close();
@@ -1521,6 +1740,7 @@ export class Store {
           this.db.exec('DROP INDEX IF EXISTS lifecycle_one_open');
           this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
         }
+        ensureUsageDiscrepanciesTable(this.db);
         this.db.exec('PRAGMA user_version = 6');
       }
       this.scrubReloginEvents();
@@ -1685,18 +1905,7 @@ export class Store {
   }
 
   upsertSnapshot(accountId: string, bucket: string, reading: BucketReading): void {
-    this.upsertSnapStmt.run(
-      accountId,
-      bucket,
-      reading.usedPct,
-      reading.used ?? null,
-      reading.limit ?? null,
-      reading.remaining ?? null,
-      reading.resetAt ?? null,
-      reading.fetchedAt,
-      reading.source,
-      reading.confidence,
-    );
+    this.runImmediate(() => persistUsageObservation(this.db, accountId, bucket, reading));
   }
 
   getSnapshot(accountId: string, bucket: string): BucketReading | null {
@@ -1905,10 +2114,9 @@ export class Store {
             last_status = excluded.last_status`)
           .run(provider, accountId, result.attemptedAt, status);
       } else if (result.readings) {
-        for (const [bucket, reading] of Object.entries(result.readings)) this.upsertSnapStmt.run(
-          accountId, bucket, reading.usedPct, reading.used ?? null, reading.limit ?? null,
-          reading.remaining ?? null, reading.resetAt ?? null, reading.fetchedAt, reading.source, reading.confidence,
-        );
+        for (const [bucket, reading] of Object.entries(result.readings)) {
+          persistUsageObservation(this.db, accountId, bucket, reading);
+        }
         this.db.prepare(`INSERT INTO usage_polls (provider, account_id, last_fetch_at, last_attempt_at, last_status, consecutive_failures, backoff_until, last_429_at)
           VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
           ON CONFLICT(provider, account_id) DO UPDATE SET last_fetch_at = excluded.last_fetch_at,
@@ -2049,18 +2257,7 @@ export class Store {
         const claim = this.getPollStmt.get(accountId) as PollClaimRow | undefined;
         if (claim && claim.holder_id === holderId && claim.claimed_at === claimedAt) {
           for (const [bucket, reading] of Object.entries(readings)) {
-            this.upsertSnapStmt.run(
-              accountId,
-              bucket,
-              reading.usedPct,
-              reading.used ?? null,
-              reading.limit ?? null,
-              reading.remaining ?? null,
-              reading.resetAt ?? null,
-              reading.fetchedAt,
-              reading.source,
-              reading.confidence,
-            );
+            persistUsageObservation(this.db, accountId, bucket, reading);
           }
           wrote = true;
         }
@@ -2224,6 +2421,7 @@ export class Store {
     overrides: number;
     pollClaims: number;
     leases: number;
+    usageDiscrepancies: number;
   } {
     return this.runImmediate(() => this.deleteAccountCascadeUnlocked(accountId));
   }
@@ -2234,13 +2432,15 @@ export class Store {
     overrides: number;
     pollClaims: number;
     leases: number;
+    usageDiscrepancies: number;
   } {
     const snapshots = Number(this.deleteSnapshotsByAccountStmt.run(accountId).changes);
     const overrides = Number(this.deleteOverridesByAccountStmt.run(accountId).changes);
     const pollClaims = Number(this.deletePollClaimsByAccountStmt.run(accountId).changes);
     const leases = Number(this.deleteLeaseByNameStmt.run(refreshLeaseName(accountId)).changes);
+    const usageDiscrepancies = Number(this.deleteUsageDiscrepanciesByAccountStmt.run(accountId).changes);
     const accounts = Number(this.deleteAccountStmt.run(accountId).changes);
-    return { accounts, snapshots, overrides, pollClaims, leases };
+    return { accounts, snapshots, overrides, pollClaims, leases, usageDiscrepancies };
   }
 
   /**
@@ -2258,6 +2458,7 @@ export class Store {
           overrides: number;
           pollClaims: number;
           leases: number;
+          usageDiscrepancies: number;
         };
       }
     | { deleted: false; reason: string } {

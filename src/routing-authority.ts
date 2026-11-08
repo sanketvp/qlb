@@ -9,11 +9,22 @@ export interface RoutingAuthority {
   reason: string;
 }
 
+export type ProviderPercentageClass = 'absent' | 'usable' | 'exhausted' | 'malformed';
+
+/** Classify a provider-reported percentage without inferring one from other fields. */
+export function classifyProviderPercentage(usedPct: number | null | undefined): ProviderPercentageClass {
+  if (usedPct == null) return 'absent';
+  if (!Number.isFinite(usedPct) || usedPct < 0) return 'malformed';
+  return usedPct >= 100 ? 'exhausted' : 'usable';
+}
+
 export function isProviderAuthoritativeReading(
   reading: BucketReading | undefined,
   now = Date.now(),
 ): boolean {
-  if (!reading || reading.usedPct == null || !Number.isFinite(reading.usedPct)) return false;
+  if (!reading) return false;
+  const classification = classifyProviderPercentage(reading.usedPct);
+  if (classification !== 'usable' && classification !== 'exhausted') return false;
   if (reading.confidence !== 'authoritative') return false;
   if (reading.source !== 'provider-poll' && reading.source !== 'provider-headers') return false;
   if (!Number.isFinite(reading.fetchedAt) || reading.fetchedAt > now) return false;
