@@ -564,6 +564,25 @@ describe('auto anthropic poll (G8)', () => {
     assert.equal(accounts.find((account) => account.accountId === 'active')?.buckets['5h'], undefined);
   });
 
+  it('fails over after hard active identity failures', async () => {
+    for (const status of ['foreign-credential', 'http-401']) {
+      const f = await fixture();
+      f.store.setConfig('autoswitch.unhealthyTicks', '1');
+      f.store.upsertSnapshot('active', '5h', {
+        usedPct: 20, fetchedAt: (NOW - 181) * 1000, source: 'provider-poll', confidence: 'authoritative',
+      });
+      f.store.upsertSnapshot('inactive', '5h', {
+        usedPct: 10, fetchedAt: NOW * 1000, source: 'provider-poll', confidence: 'authoritative',
+      });
+      f.store.recordUsagePollResult('anthropic', 'active', { attemptedAt: NOW, status });
+
+      const result = await anthropicTick({ store: f.store, slots: f.slots, now: () => NOW * 1000, dryRun: true });
+
+      assert.equal(result.decision.kind, 'switch', status);
+      if (result.decision.kind === 'switch') assert.equal(result.decision.reason, 'failover', status);
+    }
+  });
+
   it('keeps polling and repairs a same-account Claude Code rotation across many ticks', async () => {
     const f = await fixture();
     const rotated = credential('active-rotated', (NOW + 7_200) * 1000);
