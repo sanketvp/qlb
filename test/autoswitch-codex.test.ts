@@ -122,6 +122,9 @@ function autoHarness(overrides: Partial<CodexAutoDeps> = {}) {
       polls[accountId] = { ...polls[accountId], lastAttemptAt: Math.floor(now / 1000), lastStatus: result.status };
       if (result.http429) polls[accountId] = { ...polls[accountId], last429At: Math.floor(now / 1000), backoffUntil: Math.floor(now / 1000) + (result.retryAfterS ?? 30) };
     },
+    upsertSnapshot: (accountId: string, bucket: string, reading: unknown) => {
+      snapshots[accountId] = { ...snapshots[accountId], [bucket]: reading };
+    },
     listUsagePolls: () => polls,
     writeUsagePollPlans: (_provider: string, plans: Record<string, { nextDueAt: number; pollIntervalS: number }>) => {
       for (const [accountId, plan] of Object.entries(plans)) polls[accountId] = { ...polls[accountId], ...plan };
@@ -181,7 +184,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.equal((h.records.at(-1)?.result.readings?.primary as { confidence: string }).confidence, 'authoritative');
   });
 
-  it('does not persist rollout fallback readings as usage success', async () => {
+  it('retains rollout fallback readings as advisory snapshots', async () => {
     const h = autoHarness({
       probeUsage: async () => ({
         status: 500,
@@ -191,11 +194,17 @@ describe('C8 Codex poll and refresh', () => {
       }),
     });
 
-    await codexAutoTick(h.deps);
+    const result = await codexAutoTick(h.deps);
 
+    assert.deepEqual(result.readings, {});
     assert.equal(h.records.at(-1)?.result.readings, undefined);
-    assert.deepEqual((await codexAutoTick(h.deps)).readings, {});
     assert.equal(h.records.at(-1)?.result.status, 'usage-unknown');
+    assert.deepEqual(h.snapshots['user-a:account-a']?.primary, {
+      usedPct: 12,
+      fetchedAt: NOW,
+      source: 'poll',
+      confidence: 'advisory',
+    });
   });
 
   it('does not return stale provider readings to Codex auto consumers', async () => {

@@ -14,7 +14,7 @@ const AUTO_PREFIX = 'auto.openai-codex.';
 
 type PollStore = Pick<Store,
   'getCodexActiveLogin' | 'getAllSnapshots' | 'recordUsagePollResult' | 'listUsagePolls'
-  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'compareAndSetUsagePollHeldUntil' | 'getConfig' | 'setConfig'>;
+  | 'writeUsagePollPlans' | 'getAutoswitchSettings' | 'compareAndSetUsagePollHeldUntil' | 'getConfig' | 'setConfig' | 'upsertSnapshot'>;
 
 export interface CodexAutoDeps {
   /** The live active-refresh binding; it also provides the stable auth-file read. */
@@ -314,6 +314,9 @@ export async function pollOpenAiCodex(deps: CodexAutoDeps): Promise<CodexAutoPol
     const direct = authoritativeReadings(readings, nowMs);
     if (Object.keys(direct).length === 0) {
       if (!(await record('usage-unknown'))) return base(false, null, refresh, false);
+      if (Object.values(readings).every((reading) => reading.confidence === 'advisory')) {
+        for (const [bucket, reading] of Object.entries(readings)) store.upsertSnapshot(accountId, bucket, reading);
+      }
       return base(false, null, refresh, false);
     }
     if (!(await record('ok', readings))) return base(false, null, refresh, false);
