@@ -325,19 +325,19 @@ describe('provider usage discrepancy records', () => {
     const raw = new DatabaseSync(path);
     raw.exec('BEGIN');
     const insert = raw.prepare(`INSERT INTO usage_discrepancies (
-      observed_at, account_id, bucket, source_class, comparison_source_class,
+      observed_at, last_observed_at, account_id, bucket, source_class, comparison_source_class,
       provider_observed_at, comparison_observed_at, provider_value, comparison_value,
       tolerance, resolution
-    ) VALUES (?, 'seed', ?, 'provider-direct', NULL, ?, NULL, -1, NULL, ?, 'provider-anomaly-unavailable')`);
+    ) VALUES (?, ?, 'seed', ?, 'provider-direct', NULL, ?, NULL, -1, NULL, ?, 'provider-anomaly-unavailable')`);
     for (let index = 0; index < USAGE_DISCREPANCY_MAX_ROWS + 1; index += 1) {
-      insert.run(now - 1_000 - index, `b${index}`, now, USAGE_DISCREPANCY_TOLERANCE_PCT);
+      insert.run(now - 1_000 - index, now - 1_000 - index, `b${index}`, now, USAGE_DISCREPANCY_TOLERANCE_PCT);
     }
     raw.prepare(`INSERT INTO usage_discrepancies (
-      observed_at, account_id, bucket, source_class, comparison_source_class,
+      observed_at, last_observed_at, account_id, bucket, source_class, comparison_source_class,
       provider_observed_at, comparison_observed_at, provider_value, comparison_value,
       tolerance, resolution
-    ) VALUES (?, 'expired', '5h', 'provider-direct', NULL, ?, NULL, -2, NULL, ?, 'provider-anomaly-unavailable')`)
-      .run(now - USAGE_DISCREPANCY_RETENTION_MS - 1, now - USAGE_DISCREPANCY_RETENTION_MS - 1, USAGE_DISCREPANCY_TOLERANCE_PCT);
+    ) VALUES (?, ?, 'expired', '5h', 'provider-direct', NULL, ?, NULL, -2, NULL, ?, 'provider-anomaly-unavailable')`)
+      .run(now - USAGE_DISCREPANCY_RETENTION_MS - 1, now - USAGE_DISCREPANCY_RETENTION_MS - 1, now - USAGE_DISCREPANCY_RETENTION_MS - 1, USAGE_DISCREPANCY_TOLERANCE_PCT);
     raw.exec('COMMIT');
     raw.close();
 
@@ -382,11 +382,11 @@ describe('provider usage discrepancy records', () => {
 
     const raw = new DatabaseSync(path);
     raw.prepare(`INSERT INTO usage_discrepancies (
-      observed_at, account_id, bucket, source_class, comparison_source_class,
+      observed_at, last_observed_at, account_id, bucket, source_class, comparison_source_class,
       provider_observed_at, comparison_observed_at, provider_value, comparison_value,
       tolerance, resolution
-    ) VALUES (?, 'old', '5h', 'provider-direct', 'local', ?, ?, 70, 90, ?, 'provider-wins-discrepancy')`)
-      .run(now - USAGE_DISCREPANCY_RETENTION_MS - 1, now, now, USAGE_DISCREPANCY_TOLERANCE_PCT);
+    ) VALUES (?, ?, 'old', '5h', 'provider-direct', 'local', ?, ?, 70, 90, ?, 'provider-wins-discrepancy')`)
+      .run(now - USAGE_DISCREPANCY_RETENTION_MS - 1, now - USAGE_DISCREPANCY_RETENTION_MS - 1, now, now, USAGE_DISCREPANCY_TOLERANCE_PCT);
     raw.close();
 
     const report = await doctorQlb({

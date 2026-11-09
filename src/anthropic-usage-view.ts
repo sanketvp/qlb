@@ -90,10 +90,17 @@ export function anthropicUsageConfidence(
   nowS: number,
 ): Confidence {
   if (reading.resetAt !== undefined && nowS * 1000 > reading.resetAt) return 'unknown';
-  if ((reading.source === 'provider-poll' || reading.source === 'provider-headers')
-    && nowS * 1000 - reading.fetchedAt > PROVIDER_READING_MAX_AGE_MS) return 'stale';
-  if (!decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS)) return 'unknown';
-  return nowS - reading.fetchedAt / 1000 <= STALE_OK_S ? 'authoritative' : 'stale';
+  const trusted = decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS);
+  const ageS = nowS - reading.fetchedAt / 1000;
+  const providerDirect = reading.source === 'provider-poll' || reading.source === 'provider-headers';
+  if (providerDirect && ageS * 1000 > PROVIDER_READING_MAX_AGE_MS) {
+    if (HARD_SENTINEL_STATUSES.has(row?.lastStatus ?? '') || row?.lastStatus === 'http-429') {
+      return trusted ? 'stale' : 'unknown';
+    }
+    return ageS <= TRUST_MAX_AGE_S ? 'stale' : 'unknown';
+  }
+  if (!trusted) return 'unknown';
+  return ageS <= STALE_OK_S ? 'authoritative' : 'stale';
 }
 
 /**

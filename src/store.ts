@@ -1159,16 +1159,12 @@ export function hasUsageDiscrepanciesTable(db: DatabaseSync): boolean {
   return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_discrepancies'").get());
 }
 
-function hasUsageDiscrepanciesLastObservedAt(db: DatabaseSync): boolean {
-  return hasUsageDiscrepanciesTable(db) && hasColumn(db, 'usage_discrepancies', 'last_observed_at');
-}
-
 function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS usage_discrepancies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       observed_at INTEGER NOT NULL,
-      last_observed_at INTEGER NOT NULL DEFAULT 0,
+      last_observed_at INTEGER NOT NULL,
       account_id TEXT NOT NULL,
       bucket TEXT NOT NULL,
       source_class TEXT NOT NULL CHECK (source_class IN ('provider-direct','local','import','advisory')),
@@ -1187,20 +1183,15 @@ function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
       COALESCE(comparison_value, 1e308),
       resolution
     );
+    CREATE INDEX IF NOT EXISTS usage_discrepancies_last_observed_at ON usage_discrepancies(last_observed_at);
   `);
-  if (!hasUsageDiscrepanciesLastObservedAt(db)) {
-    db.exec('ALTER TABLE usage_discrepancies ADD COLUMN last_observed_at INTEGER NOT NULL DEFAULT 0');
-  }
-  db.exec(`UPDATE usage_discrepancies SET last_observed_at = observed_at WHERE last_observed_at = 0;
-    DROP INDEX IF EXISTS usage_discrepancies_observed_at;
-    CREATE INDEX IF NOT EXISTS usage_discrepancies_last_observed_at ON usage_discrepancies(last_observed_at);`);
 }
 
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
   return version < SCHEMA_VERSION
     || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db))
-    || !hasUsageDiscrepanciesLastObservedAt(db);
+    || !hasUsageDiscrepanciesTable(db);
 }
 
 function normalizedSql(sql: string): string {
@@ -1433,9 +1424,8 @@ export function usageDiscrepancyAggregate(
   now = Date.now(),
 ): UsageDiscrepancyAggregate {
   if (!hasUsageDiscrepanciesTable(db)) return { discrepancies: 0, anomalies: 0 };
-  const observedAt = hasUsageDiscrepanciesLastObservedAt(db) ? 'last_observed_at' : 'observed_at';
   const rows = db.prepare(`SELECT resolution, COUNT(*) AS count FROM usage_discrepancies
-    WHERE ${observedAt} >= ? GROUP BY resolution`).all(now - USAGE_DISCREPANCY_RETENTION_MS) as Array<{
+    WHERE last_observed_at >= ? GROUP BY resolution`).all(now - USAGE_DISCREPANCY_RETENTION_MS) as Array<{
       resolution: string;
       count: number;
     }>;

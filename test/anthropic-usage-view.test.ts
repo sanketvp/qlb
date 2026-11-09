@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { anthropicStoreSnapshots, projectAnthropicUsageReadings, readAnthropicStoreSnapshots, readAnthropicUsagePollFreshness } from '../src/anthropic-usage-view';
+import { anthropicStoreSnapshots, projectAnthropicUsageReadings, RATE_LIMIT_TRUST_MAX_AGE_S, readAnthropicStoreSnapshots, readAnthropicUsagePollFreshness } from '../src/anthropic-usage-view';
 import type { ClaudeSlot } from '../src/cc-slots';
 import { openStore } from '../src/store';
 
@@ -70,6 +70,46 @@ describe('QLB-owned Anthropic store projection', () => {
     } finally {
       store.close();
     }
+  });
+
+  it('retains a backoff-protected poll as stale', () => {
+    const store = openStore(':memory:');
+    try {
+      record(store, 'stale', NOW_S - 600);
+      store.recordUsagePollResult('anthropic', 'stale', { attemptedAt: NOW_S, status: 'usage-fetch-failed' });
+      const result = anthropicStoreSnapshots([slot('stale')], store, NOW_S);
+      assert.equal(result.snapshots[0]?.buckets['5h']?.confidence, 'stale');
+      assert.equal(result.snapshots[0]?.error, undefined);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keeps provider trust, sentinel, and 429 age ceilings', () => {
+    const expired = projectAnthropicUsageReadings({
+      '5h': { usedPct: 12, fetchedAt: (NOW_S - 3601) * 1000, source: 'provider-poll', confidence: 'authoritative' },
+    }, {
+      accountId: 'expired', lastFetchAt: NOW_S - 3601, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'ok', consecutiveFailures: 0,
+      backoffUntil: null, last429At: null, heldUntil: null,
+    }, NOW_S);
+    const sentinel = projectAnthropicUsageReadings({
+      '5h': { usedPct: 12, fetchedAt: (NOW_S - 301) * 1000, source: 'provider-poll', confidence: 'authoritative' },
+    }, {
+      accountId: 'sentinel', lastFetchAt: NOW_S - 301, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'token-expired', consecutiveFailures: 0,
+      backoffUntil: null, last429At: null, heldUntil: null,
+    }, NOW_S);
+    const rateLimited = projectAnthropicUsageReadings({
+      '5h': { usedPct: 12, fetchedAt: (NOW_S - RATE_LIMIT_TRUST_MAX_AGE_S - 1) * 1000, source: 'provider-poll', confidence: 'authoritative' },
+    }, {
+      accountId: 'rate-limited', lastFetchAt: NOW_S - RATE_LIMIT_TRUST_MAX_AGE_S - 1, lastAttemptAt: NOW_S,
+      nextDueAt: null, pollIntervalS: null, lastStatus: 'http-429', consecutiveFailures: 0,
+      backoffUntil: null, last429At: NOW_S, heldUntil: null,
+    }, NOW_S);
+    assert.deepEqual(expired, {});
+    assert.deepEqual(sentinel, {});
+    assert.deepEqual(rateLimited, {});
   });
 
   it('does not serve a poll older than the trust maximum', () => {
