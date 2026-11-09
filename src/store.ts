@@ -81,8 +81,8 @@ export interface UsagePollResult {
   codexDiagnostic?: CodexUsageDiagnosticAttempt;
 }
 
-/** One percentage point absorbs ordinary provider rounding without hiding a mismatch. */
-export const USAGE_DISCREPANCY_TOLERANCE_PCT = 1;
+/** Every differing provider and QLB percentage is a discrepancy. */
+export const USAGE_DISCREPANCY_TOLERANCE_PCT = 0;
 export const USAGE_DISCREPANCY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const USAGE_DISCREPANCY_MAX_ROWS = 10_000;
 

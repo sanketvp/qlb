@@ -96,27 +96,31 @@ describe('provider usage discrepancy records', () => {
     }
   });
 
-  it('does not record 70 vs 71 or a pair skewed beyond five minutes, and dedupes value pairs', () => {
+  it('records a one-point disagreement, ignores a pair skewed beyond five minutes, and dedupes value pairs', () => {
     const path = dbPath();
     const now = Date.now();
     const store = openStore(path);
     try {
-      store.upsertSnapshot('bound', '5h', local(70 + USAGE_DISCREPANCY_TOLERANCE_PCT, now - 1));
+      store.upsertSnapshot('bound', '5h', local(71, now - 1));
       store.upsertSnapshot('bound', '5h', provider(70, now));
-      assert.equal(rows(path).length, 0);
+      const onePoint = rows(path).filter((row) => row.account_id === 'bound');
+      assert.equal(onePoint.length, 1);
+      assert.equal(onePoint[0]?.provider_value, 70);
+      assert.equal(onePoint[0]?.comparison_value, 71);
 
       store.upsertSnapshot('skew', '5h', local(90, now - PROVIDER_READING_MAX_AGE_MS - 1));
       store.upsertSnapshot('skew', '5h', provider(70, now));
-      assert.equal(rows(path).length, 0);
+      assert.equal(rows(path).filter((row) => row.account_id === 'skew').length, 0);
 
       store.upsertSnapshot('pair', '5h', local(90, now - 1));
       store.upsertSnapshot('pair', '5h', provider(70, now));
       store.upsertSnapshot('pair', '5h', local(90, now + 2));
-      assert.equal(rows(path).length, 1);
+      assert.equal(rows(path).filter((row) => row.account_id === 'pair').length, 1);
       store.upsertSnapshot('pair', '5h', local(91, now + 3));
       const persisted = rows(path);
-      assert.equal(persisted.length, 2);
-      assert.deepEqual(persisted.map((row) => row.comparison_value).sort(), [90, 91]);
+      const pairRows = persisted.filter((row) => row.account_id === 'pair');
+      assert.equal(pairRows.length, 2);
+      assert.deepEqual(pairRows.map((row) => row.comparison_value).sort(), [90, 91]);
     } finally {
       store.close();
     }
