@@ -665,12 +665,13 @@ export async function doctorQlb(
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
-  let usageCounts: { discrepancies: number; anomalies: number } | null = null;
+  let usageCounts: { discrepancies: number; anomalies: number } | null | undefined;
   const recordedConfig = new Map<string, string>();
 
   if (!existsSync(config.dbPath)) {
     checks.push({ name: 'sqlite', level: 'WARN', message: `database does not exist yet: ${config.dbPath}; run qlb status` });
   } else {
+    usageCounts = null;
     let db: ReturnType<typeof openStoreConnection> | undefined;
     let sqliteCheck: DoctorCheck | undefined;
     try {

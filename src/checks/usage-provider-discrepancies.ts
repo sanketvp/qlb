@@ -4,7 +4,10 @@ import type { HealthCheck } from './claude-slots';
 export default check('usage:provider-discrepancies');
 
 /** Read-only doctor projection of store-owned in-window discrepancy counts. */
-export function usageProviderDiscrepanciesCheck(counts: { discrepancies: number; anomalies: number } | null): HealthCheck {
+export function usageProviderDiscrepanciesCheck(counts: { discrepancies: number; anomalies: number } | null | undefined): HealthCheck {
+  if (counts === undefined) {
+    return { name: 'usage:provider-discrepancies', level: 'N/A', message: 'database does not exist yet' };
+  }
   if (counts === null) {
     return { name: 'usage:provider-discrepancies', level: 'WARN', message: 'could not read discrepancy records' };
   }

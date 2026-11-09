@@ -409,6 +409,31 @@ describe('provider usage discrepancy records', () => {
     assert.equal(report.providers.every((row) => row.live == null), true);
   });
 
+  it('marks discrepancy records N/A when the configured database does not exist', async () => {
+    const path = dbPath();
+    const report = await doctorQlb({
+      ...defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-provider-missing-doctor-'))),
+      dbPath: path,
+    }, { command: () => '', hostCommand: () => '', hostPlatform: 'linux' });
+    const check = report.checks.find(({ name }) => name === 'usage:provider-discrepancies');
+    assert.equal(check?.level, 'N/A');
+    assert.equal(check?.message, 'database does not exist yet');
+    assert.equal(existsSync(path), false);
+  });
+
+  it('passes discrepancy records for an existing database with no records', async () => {
+    const path = dbPath();
+    const store = openStore(path);
+    store.close();
+    const report = await doctorQlb({
+      ...defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-provider-empty-doctor-'))),
+      dbPath: path,
+    }, { command: () => '', hostCommand: () => '', hostPlatform: 'linux' });
+    const check = report.checks.find(({ name }) => name === 'usage:provider-discrepancies');
+    assert.equal(check?.level, 'PASS');
+    assert.equal(check?.message, 'no provider usage discrepancies or anomalies recorded');
+  });
+
   it('reports discrepancy records as unreadable when the database query fails', async () => {
     const path = dbPath();
     writeFileSync(path, 'not a sqlite database');
