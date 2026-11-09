@@ -42,7 +42,11 @@ function safePluginAdapter(adapter: Adapter, fileName: string, warn: PluginWarni
           buckets: Object.fromEntries(
             Object.entries(snapshot.buckets ?? {}).map(([bucket, reading]) => [
               bucket,
-              { ...reading, source: 'plugin' as const },
+              {
+                ...reading,
+                source: 'plugin' as const,
+                confidence: reading.confidence === 'authoritative' ? 'advisory' : reading.confidence,
+              },
             ]),
           ),
         }));

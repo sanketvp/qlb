@@ -8,7 +8,7 @@ export interface BucketReading {
   resetAt?: number;            // epoch ms, if known
   windowMin?: number;          // window size in minutes, if known
   /** provider-* is assigned only by QLB's built-in direct provider readers. */
-  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'error';
+  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'external-cache' | 'plugin' | 'error';
   confidence: Confidence;
   fetchedAt: number;           // epoch ms when this reading was obtained
   detail?: string;             // free-text note, e.g. "advisory: token-bucket, not proven to match in-app meter"

@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { loadCswapUsageSnapshots } from '../src/cswap-usage';
+import { loadCswapUsageSnapshots, STALE_OK_S } from '../src/cswap-usage';
+import { resolveFromSnapshots } from '../src/resolve';
 
 function fixture(opts: {
   sequence?: number[];
@@ -52,7 +53,7 @@ function eligibleLastGood(fetchedAt: number, extra: Record<string, unknown> = {}
 
 describe('cswap cache-only usage projection', () => {
   it('maps fixture lastGood five_hour/seven_day/scoped → 5h/7d/7d:Fable', () => {
-    const nowMs = 1_700_000_000_000;
+    const nowMs = Date.now();
     const snaps = fixture({
       nowMs,
       usageAccounts: { '1': eligibleLastGood(nowMs / 1000) },
@@ -61,7 +62,12 @@ describe('cswap cache-only usage projection', () => {
     assert.equal(snaps[0]?.buckets['5h']?.usedPct, 12);
     assert.equal(snaps[0]?.buckets['7d']?.usedPct, 34);
     assert.equal(snaps[0]?.buckets['7d:Fable']?.usedPct, 56);
+    assert.equal(snaps[0]?.buckets['5h']?.source, 'external-cache');
+    assert.equal(snaps[0]?.buckets['5h']?.confidence, 'advisory');
     assert.equal(snaps[0]?.error, undefined);
+    const decision = resolveFromSnapshots({ model: 'claude-sonnet-5', snapshots: snaps });
+    assert.equal(decision.ok, false);
+    if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');
   });
 
   it('status-cache-eligible', () => {
@@ -76,6 +82,15 @@ describe('cswap cache-only usage projection', () => {
     console.log(`AUTH_EXPIRED_ROWS=${authExpired.length}`);
     assert.equal(authExpired.length, 0);
     assert.equal(snaps[0]?.error, undefined);
+  });
+
+  it('marks cache readings stale after the display freshness window', () => {
+    const nowMs = 1_700_000_000_000;
+    const snaps = fixture({
+      nowMs,
+      usageAccounts: { '1': eligibleLastGood(nowMs / 1000 - STALE_OK_S - 1) },
+    });
+    assert.equal(snaps[0]?.buckets['5h']?.confidence, 'stale');
   });
 
   it('cache-identity-reuse', () => {

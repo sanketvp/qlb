@@ -202,7 +202,7 @@ describe('C8 Codex poll and refresh', () => {
     assert.deepEqual(h.snapshots['user-a:account-a']?.primary, {
       usedPct: 12,
       fetchedAt: NOW,
-      source: 'poll',
+      source: 'external-cache',
       confidence: 'advisory',
     });
   });

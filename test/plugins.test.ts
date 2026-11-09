@@ -63,7 +63,8 @@ describe('custom provider plugins', () => {
         async fetchSnapshots() {
           return [{ accountId: 'plugin', provider: 'anthropic', label: 'plugin', buckets: {
             '5h': { usedPct: 10, source: 'provider-poll', confidence: 'authoritative', fetchedAt: Date.now() },
-            '7d': { usedPct: 10, source: 'provider-poll', confidence: 'authoritative', fetchedAt: Date.now() }
+            '7d': { usedPct: 10, source: 'provider-poll', confidence: 'stale', fetchedAt: Date.now() },
+            monthly: { usedPct: null, source: 'provider-poll', confidence: 'unknown', fetchedAt: Date.now() }
           }}];
         }
       };
@@ -72,7 +73,9 @@ describe('custom provider plugins', () => {
     assert.ok(adapter);
     const snapshots = await adapter.fetchSnapshots();
     assert.equal(snapshots[0]?.buckets['5h']?.source, 'plugin');
-    assert.equal(snapshots[0]?.buckets['5h']?.confidence, 'authoritative');
+    assert.equal(snapshots[0]?.buckets['5h']?.confidence, 'advisory');
+    assert.equal(snapshots[0]?.buckets['7d']?.confidence, 'stale');
+    assert.equal(snapshots[0]?.buckets.monthly?.confidence, 'unknown');
     const decision = resolveFromSnapshots({ model: 'claude-sonnet-5', snapshots });
     assert.equal(decision.ok, false);
     if (!decision.ok) assert.equal(decision.error, 'UNAVAILABLE');

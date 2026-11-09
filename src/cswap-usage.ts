@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { config } from './config';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
 import { STALE_OK_S } from './usage-freshness';
-export { STALE_OK_S };
+export { STALE_OK_S } from './usage-freshness';
 
 export const TRUST_MAX_AGE_S = 3600;
 export const WINDOW_5H_MIN = 5 * 60;
@@ -107,7 +107,7 @@ function reading(
 ): BucketReading {
   const out: BucketReading = {
     usedPct,
-    source: 'poll',
+    source: 'external-cache',
     confidence,
     fetchedAt: fetchedAtMs,
   };
@@ -233,7 +233,7 @@ export function loadCswapUsageSnapshots(opts: CswapUsageLoadOpts = {}): AccountS
         out.push(errorSnap(accountId, label, 'unavailable'));
         continue;
       }
-      const confidence: Confidence = ageS <= STALE_OK_S ? 'authoritative' : 'stale';
+      const confidence: Confidence = ageS <= STALE_OK_S ? 'advisory' : 'stale';
       const buckets = bucketsFromLastGood(lastGood, fetchedAt * 1000, confidence);
       out.push({
         accountId,

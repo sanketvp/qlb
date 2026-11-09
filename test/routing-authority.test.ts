@@ -39,7 +39,7 @@ function codex(id: string, reading: BucketReading): AccountSnapshot {
 
 describe('provider routing authority', () => {
   for (const [name, snapshot] of [
-    ['cache/import/rollout source', anthropic('cache', { ...direct(), source: 'poll' })],
+    ['external-cache/import/rollout source', anthropic('cache', { ...direct(), source: 'external-cache' })],
     ['ordinary cache headers', anthropic('headers', { ...direct(), source: 'headers' })],
     ['advisory reading', anthropic('advisory', { ...direct(), confidence: 'advisory' })],
     ['unknown reading', anthropic('unknown', { ...direct(), confidence: 'unknown' })],

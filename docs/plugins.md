@@ -44,8 +44,8 @@ module.exports = {
       buckets: {
         monthly: {
           usedPct,
-          source: 'poll',
-          confidence: 'authoritative',
+          source: 'plugin',
+          confidence: 'advisory',
           fetchedAt
         }
       }
@@ -71,12 +71,14 @@ Both fields are optional in `Adapter` (`src/types.ts`); absent means `true`.
 
 The returned `accounts` list will include `provider: "mistral"`. Syntax errors, missing exports, and invalid adapter shapes produce a warning on stderr and are skipped.
 
+QLB normalizes plugin readings to `source: "plugin"` and caps `authoritative` confidence at `advisory`; plugin-provided `stale` and `unknown` confidence remains unchanged.
+
 ## Bucket fields
 
 A bucket requires:
 
 - `usedPct`: percentage consumed, or `null` when unknown
-- `source`: `provider-poll`, `provider-headers`, `poll`, `headers`, `plugin`, or `error`
+- `source`: `provider-poll`, `provider-headers`, `poll`, `headers`, `plugin`, `external-cache`, or `error`
 - `confidence`: `authoritative`, `advisory`, `stale`, or `unknown`
 - `fetchedAt`: Unix epoch milliseconds
 
