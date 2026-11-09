@@ -86,7 +86,7 @@ describe('Rule S — spec §4.3.1', () => {
     assert.equal(scoreAccount(H, 'claude-fable-5', DEFAULT_CEILING), 20);
   });
 
-  it('keeps stale values out of scoring (G = 30 from its provider reading)', () => {
+  it('keeps stale values out of scoring (G = 30 from its authoritative reading)', () => {
     const G = anthropic('G', {
       '5h': reading(50, 'authoritative'), // 30
       '7d': reading(40, 'stale'), // display/cross-check only

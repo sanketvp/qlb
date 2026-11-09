@@ -90,6 +90,26 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
 }
 
 describe('cache-only export', () => {
+  it('marks a fresh direct reading without a percentage as display-only', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-no-percentage-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('kimi-a', 'kimi-coding', 'kimi');
+      store.upsertSnapshot('kimi-a', '5h', {
+        usedPct: null,
+        fetchedAt: now,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.equal(cacheOnlyExport(now, path).readings[0]?.routingAuthority, 'display-only');
+  });
+
   it('emits stored readings with timestamps and stale flags without changing the database', () => {
     const fixture = fixtureDb(true);
     const before = hash(fixture.path);

@@ -267,7 +267,7 @@ Emit the last persisted usage readings as JSON without loading provider adapters
 
 ```console
 $ qlb export --cache-only --json
-{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}],"surfaces":[{"id":"anthropic-pi-pool","source":"pool-inventory","recordedAt":1788844000000,"complete":true,"members":[{"target":"pi-slot-a","accountId":"acct-a","readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false}]}]}]}
+{"exportedAt":1788844834325,"readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false,"routingAuthority":"display-only"}],"surfaces":[{"id":"anthropic-pi-pool","source":"pool-inventory","recordedAt":1788844000000,"complete":true,"members":[{"target":"pi-slot-a","accountId":"acct-a","readings":[{"accountId":"acct-a","provider":"anthropic","label":"alice@example.com","bucket":"5h","usedPct":2,"used":null,"limit":null,"remaining":null,"resetAt":1788846834100,"fetchedAt":1788844834100,"source":"poll","confidence":"authoritative","status":"active","stale":false,"routingAuthority":"display-only"}]}]}]}
 ```
 
 `exportedAt`, `fetchedAt`, `resetAt`, and surface `recordedAt` are Unix timestamps in milliseconds; `fetchedAt` and `resetAt` may be `null`. A reading is `stale: true` when its `fetchedAt` is more than 300 seconds old, including a missing timestamp. The remaining reading fields are the stored account and snapshot values. `routingAuthority` labels each persisted row as `fresh-provider` only when it is a current direct provider reading; every other value is `display-only`. This is provenance for consumers, not a route decision: export never selects an account. `surfaces` is additive: `anthropic-pi-pool` records a non-secret Pi Anthropic inventory with `source: "pool-inventory"`, its `recordedAt`, and `complete` flag. `complete` means every non-empty current inventory member was classified exactly against a current slot; unmatched members and an empty pool make the surface incomplete. Re-running `qlb pi pool-inventory --against slots --record` refreshes the inventory without changing an existing non-empty target mapping. Recording is admitted only during `cutting-over`, `cutover`, or steady `retired` lifecycle states; it writes only the non-secret inventory snapshot. Export emits the pool surface only in those serving lifecycle states after an inventory has been recorded; target mappings alone emit no surface. `recordedAt` is membership-inventory time, not quota freshness. Consumers must reject a surface whose `complete` is false. The surface never includes credential data or lineage fingerprints. A missing database succeeds with `{"exportedAt":...,"readings":[],"surfaces":[]}`. A database with a schema newer than this QLB binary is refused without emitting rows; upgrade QLB before retrying.
@@ -288,6 +288,9 @@ Each bucket row reports capacity **both ways** — consumed and remaining — be
 |---|---|
 | `81% used  19% left` | remaining is `100 - used`, clamped to 0–100 |
 | `unknown used  unknown left` | the provider reported the bucket but no number (real case: kimi `5h`) |
+| `(presentation-only)` | consumed/remaining values are display math, never routing input |
+| `provider authority` | current direct provider reading eligible for routing |
+| `<source> (display-only)` | cached, derived, stale, malformed, or failed-probe reading that cannot route |
 | `EXHAUSTED` | 0% left |
 | `LOW` | 0% < left ≤ 5% |
 | `resets in 4h 3m (today 04:20)` | relative **and** absolute local clock time |
@@ -295,7 +298,7 @@ Each bucket row reports capacity **both ways** — consumed and remaining — be
 
 A `5h` and a `7d` row are shown for **every** account, even when the provider reports neither, so a missing window is visible rather than silently absent. Kimi's `weekly` bucket is displayed as `7d` (the raw key is preserved in `--json` and in `--flat`). Providers that report other buckets (`7d:Fable`, `requests`, `tokens`, `credits`) list them after the `5h`/`7d` rows. Account headers repeat any `EXHAUSTED`/`LOW` bucket so a burnt account is identifiable without reading its rows.
 
-Displayed remaining and the `EXHAUSTED`/`LOW` markers are derived from a **single** normalized value (half-up to 1 decimal), so they can never contradict each other: a positive remainder never prints as `0%`, and a remainder above the LOW threshold never prints as exactly `5%`. This `100 - used` arithmetic, its rounding, and the dashboard labels are presentation-only; they cannot admit, exclude, or select an account. Each row identifies whether its value is provider authority or display-only cache/advisory data.
+Displayed remaining and the `EXHAUSTED`/`LOW` markers are derived from a **single** normalized value (half-up to 1 decimal), so they can never contradict each other: a positive remainder never prints as `0%`, and a remainder above the LOW threshold never prints as exactly `5%`. This `100 - used` arithmetic, its rounding, and the dashboard labels are presentation-only; they cannot admit, exclude, or select an account. Each row identifies a current direct provider reading as `provider authority`; all other values are display-only.
 
 There is deliberately **no** "window not started" wording. A bucket with `usedPct: 0` and no `resetAt` is indistinguishable from a provider that never reports resets, so both render `not reported by <provider>` rather than guessing a reason.
 
@@ -308,28 +311,28 @@ There is deliberately **no** "window not started" wording. A bucket with `usedPc
 ```console
 $ qlb status
 ✓  Kimi K3  kimi-coding  NATIVE  override=none
-     5h  unknown used  unknown left  authoritative  resets in 1h 7m (today 01:21)
-     7d  57% used  43% left  authoritative  resets in 65h 7m (Fri 17:21)
+     5h  unknown used  unknown left  (presentation-only)  provider-poll (display-only)  resets in 1h 7m (today 01:21)
+     7d  57% used  43% left  (presentation-only)  provider authority  resets in 65h 7m (Fri 17:21)
 ✓  Grok (xAI)  xai  NATIVE  override=none
      5h        not reported by xai
      7d        not reported by xai
-     requests  0% used  100% left  advisory  reset: not reported by xai
-     tokens    1.2% used  98.8% left  advisory  reset: not reported by xai
+     requests  0% used  100% left  (presentation-only)  advisory (display-only)  reset: not reported by xai
+     tokens    1.2% used  98.8% left  (presentation-only)  advisory (display-only)  reset: not reported by xai
 ✓  codex-default  openai-codex  NATIVE  override=none
      5h  not reported by openai-codex
      7d  not reported by openai-codex
 ✗  alice@example.com  anthropic  NATIVE  override=none  EXHAUSTED (7d:Fable)
-     5h        4% used  96% left  authoritative  resets in 4h 3m (today 04:20)
-     7d        81% used  19% left  authoritative  resets in 101h 43m (Sun 06:00)
-     7d:Fable  100% used  0% left  EXHAUSTED  authoritative  resets in 101h 43m (Sun 06:00)
+     5h        4% used  96% left  (presentation-only)  provider authority  resets in 4h 3m (today 04:20)
+     7d        81% used  19% left  (presentation-only)  provider authority  resets in 101h 43m (Sun 06:00)
+     7d:Fable  100% used  0% left  EXHAUSTED  (presentation-only)  provider authority  resets in 101h 43m (Sun 06:00)
 ✗  bob@example.com  anthropic  NATIVE  override=none  EXHAUSTED (7d)  LOW (7d:Fable)
-     5h        0% used  100% left  authoritative  reset: not reported by anthropic
-     7d        100% used  0% left  EXHAUSTED  authoritative  resets in 8h 45m (today 09:00)
-     7d:Fable  97% used  3% left  LOW  authoritative  resets in 8h 45m (today 09:00)
+     5h        0% used  100% left  (presentation-only)  provider authority  reset: not reported by anthropic
+     7d        100% used  0% left  EXHAUSTED  (presentation-only)  provider authority  resets in 8h 45m (today 09:00)
+     7d:Fable  97% used  3% left  LOW  (presentation-only)  provider authority  resets in 8h 45m (today 09:00)
 ⚠  OpenRouter  openrouter  NATIVE  override=none  LOW (credits)
      5h       not reported by openrouter
      7d       not reported by openrouter
-     credits  98.7% used  1.3% left  LOW  authoritative  reset: not reported by openrouter
+     credits  98.7% used  1.3% left  LOW  (presentation-only)  provider authority  reset: not reported by openrouter
 ```
 
 (First two blocks and the error block are captured output with generic labels; glyph rules and line format are exactly as implemented in `src/dashboard.ts`.)

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
-import { STALE_OK_S } from './usage-freshness';
+import { isProviderAuthoritativeReading, STALE_OK_S } from './usage-freshness';
 
 const CACHE_EXPORT_BUSY_TIMEOUT_MS = 150;
 
@@ -96,7 +96,6 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
     `).all() as SnapshotRow[];
     const readings: CacheExportReading[] = rows.map((row) => {
       const stale = now - row.fetched_at > STALE_OK_S * 1000;
-      const directProvider = row.source === 'provider-poll' || row.source === 'provider-headers';
       return {
         accountId: row.account_id,
         provider: row.provider,
@@ -112,7 +111,12 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
         confidence: row.confidence,
         status: row.status,
         stale,
-        routingAuthority: !stale && directProvider && row.confidence === 'authoritative'
+        routingAuthority: isProviderAuthoritativeReading({
+          usedPct: row.used_pct,
+          source: row.source,
+          confidence: row.confidence,
+          fetchedAt: row.fetched_at,
+        }, now)
           ? 'fresh-provider'
           : 'display-only',
       };

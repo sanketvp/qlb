@@ -103,8 +103,8 @@ export function scarcityDiscount(klass: BucketClass): number {
 }
 
 export function confidenceFactor(confidence: BucketReading['confidence']): number | null {
-  // Routing admission already requires a fresh direct provider reading. Keep
-  // this guard here too so cached, derived, and advisory values cannot score.
+  // Routing admission is the source and freshness gate; this only excludes
+  // non-authoritative confidence levels from scoring.
   return confidence === 'authoritative' ? 1.0 : null;
 }
 

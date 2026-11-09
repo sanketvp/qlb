@@ -11,6 +11,7 @@ import {
   isStaticKeyProvider,
 } from './migration';
 import { platformKeychain } from './keychain';
+import { isProviderAuthoritativeReading } from './usage-freshness';
 import type { Store } from './store';
 import type { AccountSnapshot, BucketReading } from './types';
 
@@ -218,9 +219,9 @@ function unreportedRow(snap: AccountSnapshot, window: string): StatusDisplayRow 
   };
 }
 
-function routingProvenance(reading: BucketReading): string {
-  const directProvider = reading.source === 'provider-poll' || reading.source === 'provider-headers';
-  if (directProvider && reading.confidence === 'authoritative') return 'provider authority';
+function routingProvenance(snap: AccountSnapshot, reading: BucketReading, now: number): string {
+  if (!snap.error && !snap.failed && snap.probe?.outcome !== 'cached-after-failure'
+    && isProviderAuthoritativeReading(reading, now)) return 'provider authority';
   if (reading.confidence === 'stale') return 'stale cache (display-only)';
   if (reading.confidence === 'advisory') return 'advisory (display-only)';
   return `${reading.source} (display-only)`;
@@ -247,7 +248,7 @@ function rowFromReading(
   // Used/left is a rounded 100-used presentation, never a routing input.
   const bits = [`${cap.used} used`, `${cap.left} left`, '(presentation-only)'];
   if (marker) bits.push(marker);
-  bits.push(routingProvenance(reading), reset);
+  bits.push(routingProvenance(snap, reading, now), reset);
   return {
     provider: snap.provider,
     label: snap.label,

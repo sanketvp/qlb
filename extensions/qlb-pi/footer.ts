@@ -415,8 +415,8 @@ export function buildFooterLines(opts: {
     ? opts.paintAccount(`★ ${shortLabel(opts.account.label)}`)
     : opts.paintDim("no selection");
   const usage = opts.account ? formatUsage(opts.account.buckets) : "";
-  // Drop from the end on overflow: account counts first, then drift, then
-  // usage. Priority: real usage numbers > drift summary > account counts.
+  // Drop from the end on overflow: account counts, then cache display, drift,
+  // then usage. Priority: real usage numbers > drift summary > cache display > account counts.
   const line2 = joinFitting(
     [
       accountSeg,
