@@ -66,7 +66,7 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
       usedPct: 12,
       remaining: 88,
       fetchedAt: freshAt,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
     });
     store.upsertSnapshot('anthropic-a', 'seven-day', {
@@ -90,6 +90,89 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
 }
 
 describe('cache-only export', () => {
+  it('demotes fresh readings after a later failed provider attempt', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-failed-poll-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+      store.upsertSnapshot('anthropic-a', '5h', {
+        usedPct: 12,
+        fetchedAt: now - 60_000,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+      });
+      store.recordUsagePollResult('anthropic', 'anthropic-a', {
+        attemptedAt: Math.floor(now / 1_000),
+        status: 'http-429',
+        http429: true,
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.equal(cacheOnlyExport(now, path).readings[0]?.routingAuthority, 'display-only');
+  });
+
+  it('demotes failed providerless legacy usage_polls attempts', () => {
+    const fixture = fixtureDb();
+    const db = new DatabaseSync(fixture.path);
+    try {
+      db.exec('DROP TABLE usage_polls; CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_attempt_at INTEGER, last_status TEXT);');
+      db.prepare('INSERT INTO usage_polls VALUES (?, ?, ?)').run('anthropic-a', Math.floor(Date.now() / 1_000), 'http-429');
+    } finally {
+      db.close();
+    }
+
+    assert.equal(cacheOnlyExport(Date.now(), fixture.path).readings[0]?.routingAuthority, 'display-only');
+  });
+
+  it('demotes provider rows superseded by a newer provider observation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-superseded-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+      store.upsertSnapshot('anthropic-a', '5h', {
+        usedPct: 12, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative',
+      });
+      store.upsertSnapshot('anthropic-a', '7d', {
+        usedPct: 12, fetchedAt: now - 60_000, source: 'provider-poll', confidence: 'authoritative',
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.deepEqual(cacheOnlyExport(now, path).readings.map((reading) => ({
+      bucket: reading.bucket, routingAuthority: reading.routingAuthority,
+    })), [
+      { bucket: '5h', routingAuthority: 'fresh-provider' },
+      { bucket: '7d', routingAuthority: 'display-only' },
+    ]);
+  });
+
+  it('marks a fresh direct reading without a percentage as display-only', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-no-percentage-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('kimi-a', 'kimi-coding', 'kimi');
+      store.upsertSnapshot('kimi-a', '5h', {
+        usedPct: null,
+        fetchedAt: now,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.equal(cacheOnlyExport(now, path).readings[0]?.routingAuthority, 'display-only');
+  });
+
   it('emits stored readings with timestamps and stale flags without changing the database', () => {
     const fixture = fixtureDb(true);
     const before = hash(fixture.path);
@@ -99,7 +182,7 @@ describe('cache-only export', () => {
 
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
-      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; source: string; status: string }>;
+      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; routingAuthority: string; accountId: string; provider: string; source: string; status: string }>;
       surfaces: Array<{ id: string; recordedAt: number; complete: boolean; members: Array<{ target: string; accountId: string | null; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
@@ -111,10 +194,11 @@ describe('cache-only export', () => {
       provider: reading.provider,
       source: reading.source,
       status: reading.status,
+      routingAuthority: reading.routingAuthority,
     })), [
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', source: 'poll', status: 'active' },
-      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', source: 'headers', status: 'active' },
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-b', provider: 'anthropic', source: 'external-cache', status: 'active' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', source: 'provider-poll', status: 'active', routingAuthority: 'fresh-provider' },
+      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', source: 'headers', status: 'active', routingAuthority: 'display-only' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-b', provider: 'anthropic', source: 'external-cache', status: 'active', routingAuthority: 'display-only' },
     ]);
     assert.deepEqual(body.surfaces, [{
       id: 'anthropic-pi-pool',

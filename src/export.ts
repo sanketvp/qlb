@@ -2,7 +2,13 @@ import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
-import { STALE_OK_S } from './usage-freshness';
+import {
+  currentProviderObservation,
+  failedProviderAttemptAfterReadings,
+  isProviderAuthoritativeReading,
+  STALE_OK_S,
+} from './usage-freshness';
+import type { BucketReading } from './types';
 
 const CACHE_EXPORT_BUSY_TIMEOUT_MS = 150;
 
@@ -22,6 +28,13 @@ type SnapshotRow = {
   status: string;
 };
 
+type UsagePollRow = {
+  provider: string;
+  account_id: string;
+  last_attempt_at: number | null;
+  last_status: string | null;
+};
+
 export type CacheExportReading = {
   accountId: string;
   provider: string;
@@ -37,6 +50,8 @@ export type CacheExportReading = {
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
   status: string;
   stale: boolean;
+  /** Per-reading provenance only; this export never performs selection. */
+  routingAuthority: 'fresh-provider' | 'display-only';
 };
 
 export type CacheExportSurfaceMember = {
@@ -67,6 +82,19 @@ function parseArgs(args: string[]): boolean {
   return args.length === 2 && args.includes('--cache-only') && args.includes('--json');
 }
 
+function accountKey(provider: string, accountId: string): string {
+  return `${provider}\u0000${accountId}`;
+}
+
+function readingFromRow(row: SnapshotRow): BucketReading {
+  return {
+    usedPct: row.used_pct,
+    source: row.source,
+    confidence: row.confidence,
+    fetchedAt: row.fetched_at,
+  };
+}
+
 /**
  * Reads the last persisted readings without importing the normal CLI application
  * graph, adapters, credential stores, or network clients. The SQLite connection
@@ -92,22 +120,53 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       JOIN accounts AS a ON a.id = s.account_id
       ORDER BY a.provider, a.id, s.bucket
     `).all() as SnapshotRow[];
-    const readings = rows.map((row) => ({
-      accountId: row.account_id,
-      provider: row.provider,
-      label: row.label,
-      bucket: row.bucket,
-      usedPct: row.used_pct,
-      used: row.used,
-      limit: row.limit_val,
-      remaining: row.remaining,
-      resetAt: row.reset_at,
-      fetchedAt: row.fetched_at,
-      source: row.source,
-      confidence: row.confidence,
-      status: row.status,
-      stale: now - row.fetched_at > STALE_OK_S * 1000,
-    }));
+    const hasUsagePolls = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get());
+    const hasPollProvider = hasUsagePolls && (db.prepare('PRAGMA table_info(usage_polls)').all() as Array<{ name: string }>)
+      .some((column) => column.name === 'provider');
+    const pollRows = !hasUsagePolls
+      ? []
+      : hasPollProvider
+        ? db.prepare('SELECT provider, account_id, last_attempt_at, last_status FROM usage_polls').all() as UsagePollRow[]
+        : db.prepare(`SELECT a.provider, p.account_id, p.last_attempt_at, p.last_status
+            FROM usage_polls AS p JOIN accounts AS a ON a.id = p.account_id`).all() as UsagePollRow[];
+    const polls = new Map(pollRows.map((poll) => [accountKey(poll.provider, poll.account_id), {
+      lastAttemptAt: poll.last_attempt_at,
+      lastStatus: poll.last_status,
+    }]));
+    const bucketsByAccount = new Map<string, Record<string, BucketReading>>();
+    for (const row of rows) {
+      const key = accountKey(row.provider, row.account_id);
+      const buckets = bucketsByAccount.get(key) ?? {};
+      buckets[row.bucket] = readingFromRow(row);
+      bucketsByAccount.set(key, buckets);
+    }
+    const observedByAccount = new Map([...bucketsByAccount].map(([key, buckets]) => [key, currentProviderObservation(buckets)]));
+    const readings: CacheExportReading[] = rows.map((row) => {
+      const stale = now - row.fetched_at > STALE_OK_S * 1000;
+      const key = accountKey(row.provider, row.account_id);
+      const observed = observedByAccount.get(key) ?? {};
+      const failed = failedProviderAttemptAfterReadings(observed, polls.get(key));
+      return {
+        accountId: row.account_id,
+        provider: row.provider,
+        label: row.label,
+        bucket: row.bucket,
+        usedPct: row.used_pct,
+        used: row.used,
+        limit: row.limit_val,
+        remaining: row.remaining,
+        resetAt: row.reset_at,
+        fetchedAt: row.fetched_at,
+        source: row.source,
+        confidence: row.confidence,
+        status: row.status,
+        stale,
+        routingAuthority: !failed && observed[row.bucket] !== undefined
+          && isProviderAuthoritativeReading(observed[row.bucket], now)
+          ? 'fresh-provider'
+          : 'display-only',
+      };
+    });
     const hasInventory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventories'").get());
     const hasMembers = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventory_members'").get());
     const inventory = hasInventory && hasMembers

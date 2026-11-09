@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AccountSnapshot, Adapter, BucketReading } from './types';
 
-export const STALE_DISCOUNT = 0.5;
 export const WEEKLY_SCARCITY = 0.6;
 export const FIVE_H_SCARCITY = 1.0;
 export const DEFAULT_CEILING = 80;
@@ -104,10 +103,9 @@ export function scarcityDiscount(klass: BucketClass): number {
 }
 
 export function confidenceFactor(confidence: BucketReading['confidence']): number | null {
-  if (confidence === 'authoritative') return 1.0;
-  if (confidence === 'stale') return STALE_DISCOUNT;
-  // advisory / unknown never enter min()
-  return null;
+  // Routing admission is the source and freshness gate; this only excludes
+  // non-authoritative confidence levels from scoring.
+  return confidence === 'authoritative' ? 1.0 : null;
 }
 
 /**
@@ -115,7 +113,7 @@ export function confidenceFactor(confidence: BucketReading['confidence']): numbe
  *   score = min over scored buckets of (discount_b × headroom_b × f_b)
  *   headroom_b = ceiling − usedPct_b
  *   discount_b = 1.0 (5h-class) | 0.6 (weekly-class)
- *   f_b        = 1.0 (authoritative) | 0.5 (stale)
+ *   f_b        = 1.0 (fresh provider-authoritative reading only)
  * If no bucket is scored, return negative infinity so it cannot select a route.
  */
 export function scoreAccount(

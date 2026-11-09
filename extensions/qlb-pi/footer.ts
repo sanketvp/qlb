@@ -410,17 +410,19 @@ export function buildFooterLines(opts: {
 
   const health = healthLineParts(opts.health);
   const paintHealth = health.warn ? opts.paintWarn : opts.paintDim;
+  // The footer reads persisted snapshots only; it never selects an account.
   const accountSeg = opts.account
     ? opts.paintAccount(`★ ${shortLabel(opts.account.label)}`)
     : opts.paintDim("no selection");
   const usage = opts.account ? formatUsage(opts.account.buckets) : "";
-  // Drop from the end on overflow: account counts first, then drift, then
-  // usage. Priority: real usage numbers > drift summary > account counts.
+  // Drop from the end on overflow: account counts, then cache display, drift,
+  // then usage. Priority: real usage numbers > drift summary > cache display > account counts.
   const line2 = joinFitting(
     [
       accountSeg,
       usage ? opts.paintAccount(usage) : "",
       health.status ? paintHealth(health.status) : "",
+      opts.paintDim("cache display"),
       paintHealth(health.owned),
       paintHealth(health.accts),
     ],

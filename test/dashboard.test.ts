@@ -7,6 +7,7 @@ import {
   decorateStatusJson,
   enrichAccounts,
   formatDashboard,
+  statusRowsForAccount,
 } from '../src/dashboard';
 import type { AccountSnapshot, BucketReading } from '../src/types';
 
@@ -58,6 +59,28 @@ describe('dashboard health', () => {
 });
 
 describe('dashboard formatting', () => {
+  it('labels only fresh successful provider readings as provider authority', () => {
+    const now = 2_000_000;
+    const direct = (fetchedAt: number): BucketReading => ({
+      usedPct: 40,
+      source: 'provider-poll',
+      confidence: 'authoritative',
+      fetchedAt,
+    });
+    const current = statusRowsForAccount(snap({ accountId: 'current', buckets: { '5h': direct(now - 1) } }), now);
+    const stale = statusRowsForAccount(snap({ accountId: 'stale', buckets: { '5h': direct(now - 300_001) } }), now);
+    assert.match(current[0]!.detail, /provider authority/);
+    assert.doesNotMatch(stale[0]!.detail, /provider authority/);
+    for (const failed of [
+      { accountId: 'cached-after-failure', probe: { outcome: 'cached-after-failure' as const } },
+      { accountId: 'failed', failed: true },
+      { accountId: 'error', error: 'provider unavailable' },
+    ]) {
+      const rows = statusRowsForAccount(snap({ ...failed, buckets: { '5h': direct(now - 1) } }), now);
+      assert.doesNotMatch(rows[0]!.detail, /provider authority/, failed.accountId);
+    }
+  });
+
   it('groups by account with ownership, override=none, and bucket details', () => {
     const accounts = enrichAccounts(
       [
@@ -81,7 +104,7 @@ describe('dashboard formatting', () => {
 
     const text = formatDashboard(accounts);
     assert.match(text, /^✓  Work  anthropic  NATIVE  override=none$/m);
-    assert.match(text, /5h\s+42% used\s+58% left\s+authoritative/);
+    assert.match(text, /5h\s+42% used\s+58% left\s+\(presentation-only\)\s+poll \(display-only\)/);
     assert.match(text, /7d\s+not reported by anthropic/);
   });
 

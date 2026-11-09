@@ -12,7 +12,8 @@ QLB gives one answer to the question *"which account should serve this request?"
  provider adapters          SQLite store               selection
 ┌───────────────────┐   ┌────────────────────┐   ┌──────────────────────┐
 │ anthropic  (poll) │   │ accounts           │   │ scoring (Rule S)     │
-│ kimi-coding(poll) │──▶│ snapshots (cache)  │──▶│ headroom → all-in    │
+│ kimi-coding(poll) │──▶│ snapshots (cache)  │   │ fresh provider only  │
+│                  │   │ display/cross-check │──▶│ headroom → all-in    │
 │ xai      (headers)│   │ decisions (audit)  │   │  → fallback walk     │
 │ openai-codex: both│   │ poll_claims        │   │  → EXHAUSTED         │
 │ openrouter (poll) │   │ leases/migrations  │   └──────────┬───────────┘
@@ -42,7 +43,7 @@ Adapters are strictly read-only with respect to credentials: Phase-0 adapters di
 
 **Consume Option B (v1, code only until live-change approval):** Anthropic *status* is a cache-only projection of cswap `sequence.json` + `usage.json` (never `cswap list`, never the Anthropic usage URL). That cache cannot establish credential-attributable provider capacity, so a `cswap-anthropic=CONSUMED` request fails unavailable before the proxy or Pi extension reads a Claude Code credential. The user-facing journal behavior is documented under [`qlb consume`](CLI.md#qlb-consume).
 
-Each adapter returns `AccountSnapshot`s containing named **buckets** (`5h`, `7d`, `7d:Fable`, `weekly`, `primary`, `tokens`, `credits`, …). Every bucket reading carries a `confidence` level and a `fetchedAt` timestamp, and those two fields drive everything downstream.
+Each adapter returns `AccountSnapshot`s containing named **buckets** (`5h`, `7d`, `7d:Fable`, `weekly`, `primary`, `tokens`, `credits`, …). Every bucket reading carries a `confidence` level and a `fetchedAt` timestamp. Only a fresh direct provider reading drives routing; all other readings remain display and cross-check data.
 
 ## Live-query only: why QLB does not count your usage
 
@@ -76,7 +77,7 @@ Selection is a min-of-headrooms rule ("Rule S" in the design spec), implemented 
 ```
 score = min over scored buckets b of ( discount_b × headroom_b × f_b )
 
-headroom_b = ceiling − usedPct_b            ceiling defaults to 80
+headroom_b = ceiling − usedPct_b            ceiling defaults to 80; fresh provider values only
 discount_b = 1.0 (5-hour-class buckets)
            = 0.6 (weekly-class buckets)     WEEKLY_SCARCITY
 f_b        = 1.0 (fresh direct provider reading)
@@ -107,12 +108,12 @@ G wins (24 > 20). Its unknown pool bucket neither helps nor hurts. I remains vis
 Selection then proceeds in a fixed ladder (`src/resolve.ts`):
 
 1. Admit only accounts with a fresh direct provider reading for every available relevant bucket. If a model admits none, continue down the fallback chain.
-2. Score admitted candidates at ceiling 80. Any candidate with `score > 0` wins (ties: advisory headroom, then least-recently-decided).
+2. Score admitted candidates at ceiling 80. `headroom` keeps the first candidate in snapshot order when best scores are equal. `spread` treats scores within `SPREAD_MARGIN` as near-tied and hashes the session id across those candidates; neither advisory headroom nor least-recently-decided state affects selection.
 3. None → **all-in mode**: recompute at ceiling 100, pick the max. Logged as `mode: "all-in"`.
 4. Still none → walk the caller's fallback list (`--fallback m1,m2`), repeating per model. The served model is always reported (`servedModel` vs `requestedModel`); effort is never silently downgraded.
 5. Still none → `UNAVAILABLE` if no model admitted an account or any pool was unadmitted; otherwise `EXHAUSTED` with the earliest known reset across all candidates and buckets.
 
-Every decision is persisted to the `decisions` table with a per-bucket `snapshot_json` (value, confidence, source, `ageMs`) so any past decision can be audited after the fact.
+Every decision is persisted to the `decisions` table with a per-bucket `snapshot_json` (value, confidence, source, `ageMs`) so any past decision can be audited after the fact. The dashboard's `100 - used` remaining value and its rounded LOW/EXHAUSTED labels are presentation-only; they are never selection inputs.
 
 ## Selection strategies
 
