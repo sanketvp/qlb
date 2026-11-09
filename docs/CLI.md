@@ -67,10 +67,11 @@ Overall: WARN
 
 Flags: `[--json] [--live]`. Exit `1` when overall is `FAIL`. `qlb doctor --list-checks --json` lists the exact registered check names emitted by `qlb doctor --json`; checks not applicable on this host report as passing skips.
 
-Beyond the core and per-provider lines, doctor adds integration checks when the thing they inspect is present. QLB reads the Hermes config with the `yaml` package and never writes it:
+Beyond the core and per-provider lines, doctor also reports provider-usage comparisons and adds integration checks when the thing they inspect is present. QLB reads the Hermes config with the `yaml` package and never writes it:
 
 | Check | Reported when | What it tells you |
 | --- | --- | --- |
+| `usage:provider-discrepancies` | always | Reads the last 30 days of provider-authority records without changing them. `WARN` reports provider/QLB disagreements or malformed direct-provider percentages; when values disagree, the direct-provider value remains canonical. `PASS` means no such records are retained. |
 | `fs:stray-temps` | always | Lists QLB atomic-write temporary files that are over 60 seconds old and whose owner PID is no longer running. It never reads their contents, modifies, or deletes them; `WARN` includes their paths, and also identifies any configured directory it could not inspect. |
 | `claude:active` | always; `N/A` in recognized non-cutover phases and when no Claude slots exist, and `WARN` when lifecycle state is unavailable or unknown | During `cutting-over`, `cutover`, or `retired`, verifies without reading credentials that the active Claude login is set and names a live, unarchived slot. `FAIL` means it is unset, missing, dead, or archived; `WARN` means the active slot requires re-login; `PASS` identifies the active account and when it was set. |
 | `claude:login-expiry` | always | Reads each live Claude slot through QLB's read-only managed Keychain entry; it never refreshes credentials or writes Keychain state. `FAIL` means a reported login expiry has passed, `WARN` means it is within seven days or the slot credential cannot be read or parsed, and `PASS` means there are no live slots or no reported expiry has passed or is within seven days. This advisory row never blocks S64. |
@@ -629,11 +630,11 @@ $ qlb accounts prune --account account-1699999999999 --confirm --json
 {
   "ok": true,
   "accountId": "account-1699999999999",
-  "removed": { "accounts": 1, "snapshots": 3, "overrides": 0, "pollClaims": 0, "leases": 0 }
+  "removed": { "accounts": 1, "snapshots": 3, "overrides": 0, "pollClaims": 0, "leases": 0, "usageDiscrepancies": 0 }
 }
 ```
 
-Deletes **local account metadata only**: `accounts`, `snapshots`, `overrides`, `poll_claims`, and the account's refresh `leases` row. Credentials are never removed, moved, or rewritten (Keychain items, native stores, `.pre-qlb` backups, sidecars, owner files). `decisions` / `errors` rows are left untouched (audit history, not live state).
+Deletes **local account metadata only**: `accounts`, `snapshots`, `overrides`, `poll_claims`, the account's refresh `leases` row, and its provider-usage discrepancy records. Credentials are never removed, moved, or rewritten (Keychain items, native stores, `.pre-qlb` backups, sidecars, owner files). `decisions` / `errors` rows are left untouched (audit history, not live state).
 
 **Refused (exit 2)** with a stable reason token:
 
