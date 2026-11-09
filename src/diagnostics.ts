@@ -665,7 +665,7 @@ export async function doctorQlb(
   let migrations: Array<{ store: string; state: string; detail_json?: string }> = [];
   let accounts: Array<{ id: string; provider: string; label: string }> = [];
   let recoveryPending = false;
-  let usageCounts = { discrepancies: 0, anomalies: 0 };
+  let usageCounts: { discrepancies: number; anomalies: number } | null = null;
   const recordedConfig = new Map<string, string>();
 
   if (!existsSync(config.dbPath)) {

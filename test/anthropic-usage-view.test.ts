@@ -72,6 +72,24 @@ describe('QLB-owned Anthropic store projection', () => {
     }
   });
 
+  it('does not treat an aged provider reading as doctor-fresh', () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-anthropic-freshness-')), 'qlb.db');
+    const store = openStore(dbPath);
+    try {
+      record(store, 'stale', NOW_S - 301, 'provider-poll');
+    } finally {
+      store.close();
+    }
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(`INSERT INTO claude_slots (account_id, slot_num, config_json, fingerprint, added_at)
+        VALUES ('stale', 1, '{}', 'fp-stale', 1)`).run();
+    } finally {
+      db.close();
+    }
+    assert.deepEqual(readAnthropicUsagePollFreshness(dbPath, NOW_S), { hasPolls: true, fresh: false });
+  });
+
   it('retains a backoff-protected poll as stale', () => {
     const store = openStore(':memory:');
     try {

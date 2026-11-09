@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -398,6 +398,18 @@ describe('provider usage discrepancy records', () => {
     assert.match(check?.message ?? '', /1 provider-wins discrepancy/);
     assert.doesNotMatch(JSON.stringify(report), /sk-ant-|Authorization|Bearer /);
     assert.equal(report.providers.every((row) => row.live == null), true);
+  });
+
+  it('reports discrepancy records as unreadable when the database query fails', async () => {
+    const path = dbPath();
+    writeFileSync(path, 'not a sqlite database');
+    const report = await doctorQlb({
+      ...defaultConfig(mkdtempSync(join(tmpdir(), 'qlb-provider-unreadable-'))),
+      dbPath: path,
+    }, { command: () => '', hostCommand: () => '', hostPlatform: 'linux' });
+    const check = report.checks.find(({ name }) => name === 'usage:provider-discrepancies');
+    assert.equal(check?.level, 'WARN');
+    assert.equal(check?.message, 'could not read discrepancy records');
   });
 
   it('never persists token-shaped detail or headers', async () => {

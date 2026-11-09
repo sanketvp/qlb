@@ -235,8 +235,12 @@ function hasFreshAnthropicUsagePoll(
   const polls = store.listUsagePolls('anthropic');
   return slots.filter((slot) => slot.archivedAt == null).some((slot) => {
     const row = polls[slot.accountId];
-    return row !== undefined
-      && Object.keys(projectAnthropicUsageReadings(store.getAllSnapshots(slot.accountId), row, nowS)).length > 0;
+    if (row === undefined) return false;
+    const snapshot = store.getAllSnapshots(slot.accountId);
+    const newest = newestFetchedAt(snapshot, () => true);
+    const snapshotResetAt = earliestResetAt(snapshot, () => true, newest);
+    return Object.values(projectAnthropicUsageReadings(snapshot, row, nowS))
+      .some((reading) => decisionTrusts(row, reading.fetchedAt, snapshotResetAt, nowS));
   });
 }
 
