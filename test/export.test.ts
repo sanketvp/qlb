@@ -90,6 +90,56 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
 }
 
 describe('cache-only export', () => {
+  it('demotes fresh readings after a later failed provider attempt', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-failed-poll-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+      store.upsertSnapshot('anthropic-a', '5h', {
+        usedPct: 12,
+        fetchedAt: now - 60_000,
+        source: 'provider-poll',
+        confidence: 'authoritative',
+      });
+      store.recordUsagePollResult('anthropic', 'anthropic-a', {
+        attemptedAt: Math.floor(now / 1_000),
+        status: 'http-429',
+        http429: true,
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.equal(cacheOnlyExport(now, path).readings[0]?.routingAuthority, 'display-only');
+  });
+
+  it('demotes provider rows superseded by a newer provider observation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-export-superseded-'));
+    const path = join(root, 'qlb.db');
+    const now = Date.now();
+    const store = openStore(path);
+    try {
+      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
+      store.upsertSnapshot('anthropic-a', '5h', {
+        usedPct: 12, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative',
+      });
+      store.upsertSnapshot('anthropic-a', '7d', {
+        usedPct: 12, fetchedAt: now - 60_000, source: 'provider-poll', confidence: 'authoritative',
+      });
+    } finally {
+      store.close();
+    }
+
+    assert.deepEqual(cacheOnlyExport(now, path).readings.map((reading) => ({
+      bucket: reading.bucket, routingAuthority: reading.routingAuthority,
+    })), [
+      { bucket: '5h', routingAuthority: 'fresh-provider' },
+      { bucket: '7d', routingAuthority: 'display-only' },
+    ]);
+  });
+
   it('marks a fresh direct reading without a percentage as display-only', () => {
     const root = mkdtempSync(join(tmpdir(), 'qlb-export-no-percentage-'));
     const path = join(root, 'qlb.db');
