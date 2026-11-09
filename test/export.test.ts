@@ -37,7 +37,7 @@ function hash(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolRecordedAt: number } {
+function fixtureDb(includeExternalCache = false): { path: string; freshAt: number; staleAt: number; poolRecordedAt: number } {
   const root = mkdtempSync(join(tmpdir(), 'qlb-export-'));
   const path = join(root, 'qlb.db');
   const now = Date.now();
@@ -75,12 +75,14 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
       source: 'headers',
       confidence: 'advisory',
     });
-    store.upsertSnapshot('anthropic-b', 'five-hour', {
-      usedPct: 25,
-      fetchedAt: freshAt,
-      source: 'external-cache',
-      confidence: 'unknown',
-    });
+    if (includeExternalCache) {
+      store.upsertSnapshot('anthropic-b', 'five-hour', {
+        usedPct: 25,
+        fetchedAt: freshAt,
+        source: 'external-cache',
+        confidence: 'unknown',
+      });
+    }
   } finally {
     store.close();
   }
@@ -89,7 +91,7 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
 
 describe('cache-only export', () => {
   it('emits stored readings with timestamps and stale flags without changing the database', () => {
-    const fixture = fixtureDb();
+    const fixture = fixtureDb(true);
     const before = hash(fixture.path);
     const result = runExport(fixture.path);
     assert.equal(result.status, 0, result.stderr);
@@ -120,8 +122,8 @@ describe('cache-only export', () => {
       recordedAt: fixture.poolRecordedAt,
       complete: false,
       members: [
-        { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings },
-        { target: 'pi-b', accountId: 'anthropic-b', readings: [] },
+        { target: 'pi-a', accountId: 'anthropic-a', readings: body.readings.slice(0, 2) },
+        { target: 'pi-b', accountId: 'anthropic-b', readings: body.readings.slice(2) },
         { target: 'pi-unmatched', accountId: null, readings: [] },
       ],
     }]);

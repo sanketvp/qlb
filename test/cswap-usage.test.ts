@@ -53,7 +53,7 @@ function eligibleLastGood(fetchedAt: number, extra: Record<string, unknown> = {}
 
 describe('cswap cache-only usage projection', () => {
   it('maps fixture lastGood five_hour/seven_day/scoped → 5h/7d/7d:Fable', () => {
-    const nowMs = 1_700_000_000_000;
+    const nowMs = Date.now();
     const snaps = fixture({
       nowMs,
       usageAccounts: { '1': eligibleLastGood(nowMs / 1000) },
