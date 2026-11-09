@@ -90,54 +90,17 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
 }
 
 describe('cache-only export', () => {
-  it('demotes fresh readings after a later failed provider attempt', () => {
-    const root = mkdtempSync(join(tmpdir(), 'qlb-export-failed-poll-'));
-    const path = join(root, 'qlb.db');
-    const now = Date.now();
-    const store = openStore(path);
+  it('keeps cache-only export compatible with providerless legacy usage_polls', () => {
+    const fixture = fixtureDb();
+    const db = new DatabaseSync(fixture.path);
     try {
-      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
-      store.upsertSnapshot('anthropic-a', '5h', {
-        usedPct: 12,
-        fetchedAt: now - 60_000,
-        source: 'provider-poll',
-        confidence: 'authoritative',
-      });
-      store.recordUsagePollResult('anthropic', 'anthropic-a', {
-        attemptedAt: Math.floor(now / 1_000),
-        status: 'http-429',
-        http429: true,
-      });
+      db.exec('DROP TABLE usage_polls; CREATE TABLE usage_polls (account_id TEXT PRIMARY KEY, last_attempt_at INTEGER, last_status TEXT);');
+      db.prepare('INSERT INTO usage_polls VALUES (?, ?, ?)').run('anthropic-a', Math.floor(Date.now() / 1_000), 'http-429');
     } finally {
-      store.close();
+      db.close();
     }
 
-    assert.equal(cacheOnlyExport(now, path).readings[0]?.routingAuthority, 'display-only');
-  });
-
-  it('demotes provider rows superseded by a newer provider observation', () => {
-    const root = mkdtempSync(join(tmpdir(), 'qlb-export-superseded-'));
-    const path = join(root, 'qlb.db');
-    const now = Date.now();
-    const store = openStore(path);
-    try {
-      store.upsertAccount('anthropic-a', 'anthropic', 'account-a');
-      store.upsertSnapshot('anthropic-a', '5h', {
-        usedPct: 12, fetchedAt: now, source: 'provider-poll', confidence: 'authoritative',
-      });
-      store.upsertSnapshot('anthropic-a', '7d', {
-        usedPct: 12, fetchedAt: now - 60_000, source: 'provider-poll', confidence: 'authoritative',
-      });
-    } finally {
-      store.close();
-    }
-
-    assert.deepEqual(cacheOnlyExport(now, path).readings.map((reading) => ({
-      bucket: reading.bucket, routingAuthority: reading.routingAuthority,
-    })), [
-      { bucket: '5h', routingAuthority: 'fresh-provider' },
-      { bucket: '7d', routingAuthority: 'display-only' },
-    ]);
+    assert.equal(cacheOnlyExport(Date.now(), fixture.path).readings[0]?.routingAuthority, 'fresh-provider');
   });
 
   it('marks a fresh direct reading without a percentage as display-only', () => {

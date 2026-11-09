@@ -108,7 +108,7 @@ G wins (24 > 20). Its unknown pool bucket neither helps nor hurts. I remains vis
 Selection then proceeds in a fixed ladder (`src/resolve.ts`):
 
 1. Admit only accounts with a fresh direct provider reading for every available relevant bucket. If a model admits none, continue down the fallback chain.
-2. Score admitted candidates at ceiling 80. Any candidate with `score > 0` wins (ties: advisory headroom, then least-recently-decided).
+2. Score admitted candidates at ceiling 80. `headroom` keeps the first candidate in snapshot order when best scores are equal. `spread` treats scores within `SPREAD_MARGIN` as near-tied and hashes the session id across those candidates; neither advisory headroom nor least-recently-decided state affects selection.
 3. None → **all-in mode**: recompute at ceiling 100, pick the max. Logged as `mode: "all-in"`.
 4. Still none → walk the caller's fallback list (`--fallback m1,m2`), repeating per model. The served model is always reported (`servedModel` vs `requestedModel`); effort is never silently downgraded.
 5. Still none → `UNAVAILABLE` if no model admitted an account or any pool was unadmitted; otherwise `EXHAUSTED` with the earliest known reset across all candidates and buckets.

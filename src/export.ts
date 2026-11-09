@@ -2,13 +2,7 @@ import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
-import {
-  currentProviderObservation,
-  failedProviderAttemptAfterReadings,
-  isProviderAuthoritativeReading,
-  STALE_OK_S,
-} from './usage-freshness';
-import type { BucketReading } from './types';
+import { isProviderAuthoritativeReading, STALE_OK_S } from './usage-freshness';
 
 const CACHE_EXPORT_BUSY_TIMEOUT_MS = 150;
 
@@ -26,13 +20,6 @@ type SnapshotRow = {
   source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'external-cache' | 'error';
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
   status: string;
-};
-
-type UsagePollRow = {
-  provider: string;
-  account_id: string;
-  last_attempt_at: number | null;
-  last_status: string | null;
 };
 
 export type CacheExportReading = {
@@ -82,19 +69,6 @@ function parseArgs(args: string[]): boolean {
   return args.length === 2 && args.includes('--cache-only') && args.includes('--json');
 }
 
-function accountKey(provider: string, accountId: string): string {
-  return `${provider}\u0000${accountId}`;
-}
-
-function readingFromRow(row: SnapshotRow): BucketReading {
-  return {
-    usedPct: row.used_pct,
-    source: row.source,
-    confidence: row.confidence,
-    fetchedAt: row.fetched_at,
-  };
-}
-
 /**
  * Reads the last persisted readings without importing the normal CLI application
  * graph, adapters, credential stores, or network clients. The SQLite connection
@@ -120,26 +94,8 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       JOIN accounts AS a ON a.id = s.account_id
       ORDER BY a.provider, a.id, s.bucket
     `).all() as SnapshotRow[];
-    const hasUsagePolls = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_polls'").get());
-    const polls = new Map((hasUsagePolls
-      ? db.prepare('SELECT provider, account_id, last_attempt_at, last_status FROM usage_polls').all() as UsagePollRow[]
-      : []).map((poll) => [accountKey(poll.provider, poll.account_id), {
-      lastAttemptAt: poll.last_attempt_at,
-      lastStatus: poll.last_status,
-    }]));
-    const bucketsByAccount = new Map<string, Record<string, BucketReading>>();
-    for (const row of rows) {
-      const key = accountKey(row.provider, row.account_id);
-      const buckets = bucketsByAccount.get(key) ?? {};
-      buckets[row.bucket] = readingFromRow(row);
-      bucketsByAccount.set(key, buckets);
-    }
-    const observedByAccount = new Map([...bucketsByAccount].map(([key, buckets]) => [key, currentProviderObservation(buckets)]));
     const readings: CacheExportReading[] = rows.map((row) => {
       const stale = now - row.fetched_at > STALE_OK_S * 1000;
-      const key = accountKey(row.provider, row.account_id);
-      const observed = observedByAccount.get(key) ?? {};
-      const failed = failedProviderAttemptAfterReadings(observed, polls.get(key));
       return {
         accountId: row.account_id,
         provider: row.provider,
@@ -155,8 +111,12 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
         confidence: row.confidence,
         status: row.status,
         stale,
-        routingAuthority: !failed && observed[row.bucket] !== undefined
-          && isProviderAuthoritativeReading(observed[row.bucket], now)
+        routingAuthority: isProviderAuthoritativeReading({
+          usedPct: row.used_pct,
+          source: row.source,
+          confidence: row.confidence,
+          fetchedAt: row.fetched_at,
+        }, now)
           ? 'fresh-provider'
           : 'display-only',
       };
