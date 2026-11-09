@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { loadCswapUsageSnapshots } from '../src/cswap-usage';
+import { loadCswapUsageSnapshots, STALE_OK_S } from '../src/cswap-usage';
 import { resolveFromSnapshots } from '../src/resolve';
 
 function fixture(opts: {
@@ -82,6 +82,15 @@ describe('cswap cache-only usage projection', () => {
     console.log(`AUTH_EXPIRED_ROWS=${authExpired.length}`);
     assert.equal(authExpired.length, 0);
     assert.equal(snaps[0]?.error, undefined);
+  });
+
+  it('marks cache readings stale after the display freshness window', () => {
+    const nowMs = 1_700_000_000_000;
+    const snaps = fixture({
+      nowMs,
+      usageAccounts: { '1': eligibleLastGood(nowMs / 1000 - STALE_OK_S - 1) },
+    });
+    assert.equal(snaps[0]?.buckets['5h']?.confidence, 'stale');
   });
 
   it('cache-identity-reuse', () => {

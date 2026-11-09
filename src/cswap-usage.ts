@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import { config } from './config';
 import type { AccountSnapshot, BucketReading, Confidence } from './types';
+import { STALE_OK_S } from './usage-freshness';
 export { STALE_OK_S } from './usage-freshness';
 
 export const TRUST_MAX_AGE_S = 3600;
@@ -232,9 +233,7 @@ export function loadCswapUsageSnapshots(opts: CswapUsageLoadOpts = {}): AccountS
         out.push(errorSnap(accountId, label, 'unavailable'));
         continue;
       }
-      // C-swap's files are useful display and discrepancy evidence, never a
-      // QLB-owned provider receipt. Age limits their display lifetime only.
-      const confidence: Confidence = 'advisory';
+      const confidence: Confidence = ageS <= STALE_OK_S ? 'advisory' : 'stale';
       const buckets = bucketsFromLastGood(lastGood, fetchedAt * 1000, confidence);
       out.push({
         accountId,

@@ -75,6 +75,12 @@ function fixtureDb(): { path: string; freshAt: number; staleAt: number; poolReco
       source: 'headers',
       confidence: 'advisory',
     });
+    store.upsertSnapshot('anthropic-b', 'five-hour', {
+      usedPct: 25,
+      fetchedAt: freshAt,
+      source: 'external-cache',
+      confidence: 'unknown',
+    });
   } finally {
     store.close();
   }
@@ -91,7 +97,7 @@ describe('cache-only export', () => {
 
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
-      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; status: string }>;
+      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; source: string; status: string }>;
       surfaces: Array<{ id: string; recordedAt: number; complete: boolean; members: Array<{ target: string; accountId: string | null; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
@@ -101,10 +107,12 @@ describe('cache-only export', () => {
       stale: reading.stale,
       accountId: reading.accountId,
       provider: reading.provider,
+      source: reading.source,
       status: reading.status,
     })), [
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
-      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', status: 'active' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', source: 'poll', status: 'active' },
+      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', source: 'headers', status: 'active' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-b', provider: 'anthropic', source: 'external-cache', status: 'active' },
     ]);
     assert.deepEqual(body.surfaces, [{
       id: 'anthropic-pi-pool',

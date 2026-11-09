@@ -522,7 +522,7 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
           usedPct: snapshot.usedPct,
           fetchedAt: snapshot.fetchedAt,
           source: 'external-cache',
-          confidence: 'advisory',
+          confidence: 'unknown',
         });
       }
       if (input.activeAccountId) {

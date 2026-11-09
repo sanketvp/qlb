@@ -17,7 +17,7 @@ type SnapshotRow = {
   remaining: number | null;
   reset_at: number | null;
   fetched_at: number;
-  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'error';
+  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'external-cache' | 'error';
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
   status: string;
 };
@@ -33,7 +33,7 @@ export type CacheExportReading = {
   remaining: number | null;
   resetAt: number | null;
   fetchedAt: number;
-  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'error';
+  source: 'provider-poll' | 'provider-headers' | 'poll' | 'headers' | 'plugin' | 'external-cache' | 'error';
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
   status: string;
   stale: boolean;

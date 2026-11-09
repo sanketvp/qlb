@@ -363,7 +363,7 @@ describe('C-swap import (K10 / AC16)', () => {
       assert.equal(reopened.listAccounts('anthropic').length, 2);
       assert.equal(reopened.listLineageTransitions('anthropic', 'account-a').length, 1);
       assert.equal(reopened.getSnapshot('account-a', 'five_hour')?.source, 'external-cache');
-      assert.equal(reopened.getSnapshot('account-a', 'five_hour')?.confidence, 'advisory');
+      assert.equal(reopened.getSnapshot('account-a', 'five_hour')?.confidence, 'unknown');
       assert.equal(reopened.getConfig('autoswitch.threshold'), '80');
     } finally {
       reopened.close();
