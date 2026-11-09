@@ -160,7 +160,8 @@ Fencing coordinates QLB's processes against each other; it cannot coordinate wit
 `src/store.ts` uses Node's built-in `node:sqlite` (synchronous, so a `BEGIN IMMEDIATE` transaction is a straight-line code block with no awaits). The database (default `~/.qlb/qlb.db`) runs in WAL mode with `busy_timeout` and holds:
 
 - `accounts` — accounts discovered by adapters (plus `grant_generation` for owned grants)
-- `snapshots` — the gauge cache, one row per `(account, bucket)`, upsert-guarded by `fetched_at` so a late-landing older reading never overwrites a newer one
+- `snapshots` — the gauge cache, one row per `(account, bucket)`; among non-provider readings it is upsert-guarded by `fetched_at`, while a direct provider reading replaces a non-provider reading regardless of order
+- `usage_discrepancies` — retained provider-authority records for disagreeing provider and QLB-side percentages, plus malformed direct-provider percentages; `qlb doctor` reports their aggregate
 - `config` — a generic `key`/`value` table; besides round-robin and failover state it holds one **persisted per-provider observation** under the key `observed:<provider>` (`observationConfigKey()` in `src/candidates.ts`), written by `qlb resolve`, `qlb refresh --allow-probe`, and `qlb status`. Each entry carries a monotonically increasing generation counter, the fetch outcome (`ok` / `failed`), and the normalized snapshots QLB saw — including per-account bucket readings — with a per-account `failed` flag set by refresh when a probe failed (`cached-after-failure` or an error snapshot). `qlb why` reproduces a pick from exactly this record.
 - `decisions` — audit of every resolve (inputs, reason, mode, per-bucket ages), with the **additive** `strategy` and `provider` columns persisted on new rows (added by `ensureDecisionColumnsOn()` in `src/store.ts` via `ALTER TABLE`; the schema stays version-neutral so `user_version` remains 4, and legacy rows fall back to derived strategy/provider)
 - `poll_claims` / `leases` — the two single-flight mechanisms above
@@ -168,7 +169,7 @@ Fencing coordinates QLB's processes against each other; it cannot coordinate wit
 - `policies` — virtual-model → real-model mappings for the proxy
 - `overrides` — pin/reserve/drain-first rows, written and managed by `qlb override pin|reserve|drain-first|clear|list`; `qlb status` displays any active row, and `resolve` honors them (pin beats any strategy, reserved accounts are excluded, drain-first accounts are tried first)
 
-Snapshot caching is *politeness*, not correctness: a caller reuses its last observation rather than re-fetching, and any newer reading from any source replaces it for display. Routing relies only on fresh direct provider readings; it never depends on data QLB generated itself.
+Snapshot caching is *politeness*, not correctness: a caller reuses its last observation rather than re-fetching. Direct provider readings are authoritative over QLB-derived readings, so QLB keeps the provider value when the two disagree and records the conflict for `qlb doctor`; QLB-derived values remain display/cross-check data. Routing relies only on fresh direct provider readings; it never depends on data QLB generated itself.
 
 The `qlb-pi` Pi extension's footer (`extensions/qlb-pi/footer.ts`) is a live, read-only view into this same store — the same `accounts`/`snapshots`/`decisions`/`migrations` rows described above, just rendered in Pi's status bar instead of `qlb status`. See [README · qlb-pi footer](../README.md#qlb-pi-footer) and [CLI.md · /qlb](CLI.md#qlb-pi-in-session-command) for what it shows and how to expand it.
 

@@ -31,6 +31,7 @@ export interface PruneStore {
           overrides: number;
           pollClaims: number;
           leases: number;
+          usageDiscrepancies: number;
         };
       }
     | { deleted: false; reason: string };
@@ -197,6 +198,7 @@ export interface PruneAccountResult {
     overrides: number;
     pollClaims: number;
     leases: number;
+    usageDiscrepancies: number;
   };
 }
 

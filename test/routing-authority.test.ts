@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { AccountSnapshot, BucketReading } from '../src/types';
 import { resolveFromSnapshots } from '../src/resolve';
+import {
+  classifyProviderPercentage,
+  isProviderAuthoritativeReading,
+} from '../src/routing-authority';
 import { openStore } from '../src/store';
 import { explainWhy } from '../src/why';
 
@@ -174,3 +178,44 @@ describe('provider routing authority', () => {
     assert.match(report.losers[0]?.detail ?? '', /non-actionable/);
   });
 });
+
+describe('provider percentage classification',
+  () => {
+    it('maps absent, usable, exhausted, and malformed values',
+      () => {
+        assert.equal(classifyProviderPercentage(null), 'absent');
+        assert.equal(classifyProviderPercentage(undefined), 'absent');
+        assert.equal(classifyProviderPercentage(0), 'usable');
+        assert.equal(classifyProviderPercentage(99.9), 'usable');
+        assert.equal(classifyProviderPercentage(100), 'exhausted');
+        assert.equal(classifyProviderPercentage(101), 'exhausted');
+        assert.equal(classifyProviderPercentage(-1), 'malformed');
+        assert.equal(classifyProviderPercentage(Number.NaN), 'malformed');
+        assert.equal(classifyProviderPercentage(Number.POSITIVE_INFINITY), 'malformed');
+      });
+
+    it('treats overspend as authoritative exhausted and malformed as unavailable',
+      () => {
+        const now = Date.now();
+        assert.equal(isProviderAuthoritativeReading(direct(101)), true);
+        assert.equal(isProviderAuthoritativeReading(direct(100)), true);
+        assert.equal(isProviderAuthoritativeReading(direct(-1)), false);
+        assert.equal(isProviderAuthoritativeReading({ ...direct(), usedPct: Number.NaN }), false);
+        assert.equal(isProviderAuthoritativeReading({ ...direct(), usedPct: null }), false);
+        assert.equal(isProviderAuthoritativeReading({ ...direct(), fetchedAt: now - 300_001 }, now), false);
+
+        const overspend = resolveFromSnapshots({
+          model: 'claude-sonnet-5',
+          snapshots: [anthropic('overspend', direct(101))],
+        });
+        assert.equal(overspend.ok, false);
+        if (!overspend.ok) assert.equal(overspend.error, 'EXHAUSTED');
+
+        const malformed = resolveFromSnapshots({
+          model: 'claude-sonnet-5',
+          snapshots: [anthropic('malformed', direct(-1))],
+        });
+        assert.equal(malformed.ok, false);
+        if (!malformed.ok) assert.equal(malformed.error, 'UNAVAILABLE');
+      });
+  });

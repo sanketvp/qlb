@@ -12,7 +12,7 @@
 import { createHash } from 'node:crypto';
 import { chmod, link, lstat, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { openStoreConnection } from './store';
+import { openStoreConnection, persistUsageObservation } from './store';
 import { assertAdmittedInConnection } from './lifecycle';
 import { credentialFingerprint, parseCredentialBlob } from './anthropic-oauth';
 import { withClaudeSwitchLock } from './cc-locks';
@@ -518,11 +518,12 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
         });
       }
       for (const snapshot of input.snapshots ?? []) {
-        this.db.prepare(`INSERT INTO snapshots (account_id, bucket, used_pct, used, limit_val, remaining, reset_at, fetched_at, source, confidence)
-          VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, 'cswap-import', 'unknown')
-          ON CONFLICT(account_id, bucket) DO UPDATE SET used_pct = excluded.used_pct, fetched_at = excluded.fetched_at,
-          source = excluded.source, confidence = excluded.confidence WHERE excluded.fetched_at > snapshots.fetched_at`)
-          .run(snapshot.accountId, snapshot.bucket, snapshot.usedPct, snapshot.fetchedAt);
+        persistUsageObservation(this.db, snapshot.accountId, snapshot.bucket, {
+          usedPct: snapshot.usedPct,
+          fetchedAt: snapshot.fetchedAt,
+          source: 'cswap-import',
+          confidence: 'unknown',
+        });
       }
       if (input.activeAccountId) {
         this.db.prepare(`INSERT INTO active_login (provider, account_id, since, set_by) VALUES ('anthropic', ?, ?, 'import')
