@@ -410,6 +410,7 @@ export function buildFooterLines(opts: {
 
   const health = healthLineParts(opts.health);
   const paintHealth = health.warn ? opts.paintWarn : opts.paintDim;
+  // The footer reads persisted snapshots only; it never selects an account.
   const accountSeg = opts.account
     ? opts.paintAccount(`★ ${shortLabel(opts.account.label)}`)
     : opts.paintDim("no selection");
@@ -421,6 +422,7 @@ export function buildFooterLines(opts: {
       accountSeg,
       usage ? opts.paintAccount(usage) : "",
       health.status ? paintHealth(health.status) : "",
+      opts.paintDim("cache display"),
       paintHealth(health.owned),
       paintHealth(health.accts),
     ],

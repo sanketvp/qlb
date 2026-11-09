@@ -86,13 +86,13 @@ describe('Rule S — spec §4.3.1', () => {
     assert.equal(scoreAccount(H, 'claude-fable-5', DEFAULT_CEILING), 20);
   });
 
-  it('mixed authoritative + stale: stale weekly is scored at ×0.5 (G = 12)', () => {
+  it('keeps stale values out of scoring (G = 30 from its provider reading)', () => {
     const G = anthropic('G', {
       '5h': reading(50, 'authoritative'), // 30
-      '7d': reading(40, 'stale'), // 0.6×40×0.5 = 12
+      '7d': reading(40, 'stale'), // display/cross-check only
       // 7d:Fable unknown — omitted, must neither help nor hurt
     });
-    assert.equal(scoreAccount(G, 'claude-fable-5', DEFAULT_CEILING), 12);
+    assert.equal(scoreAccount(G, 'claude-fable-5', DEFAULT_CEILING), 30);
   });
 
   it('all-unknown / all-advisory account cannot select a route', () => {

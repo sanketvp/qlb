@@ -1,6 +1,6 @@
 # QLB — Cross-Provider Quota Load Balancer
 
-**The headline feature: if you have multiple Claude accounts, multiple Codex accounts, or both, QLB automatically load-balances your usage across all of them.** Run out of headroom on one Claude account and QLB routes the next request to whichever of your other Claude accounts still has room — same for Codex — so you stop babysitting which login is about to hit its 5-hour or weekly limit and manually switching. It picks the best account for every request based on real, live usage data (not guesses), spreads normal usage so no single account gets drained first, and only reaches for a genuinely different model/provider as a fallback when you've explicitly said that's OK. And when you *want* a specific session on a specific account — deliberate multi-account parallel use — you can pin it explicitly with `qlb override pin` for a guaranteed parallel spread instead of relying on automatic scoring, or switch the automatic policy itself with `qlb resolve --strategy headroom|spread|round-robin|failover` (see the [CLI reference](docs/CLI.md)).
+**The headline feature: if you have multiple Claude accounts, multiple Codex accounts, or both, QLB automatically load-balances your usage across all of them.** Run out of headroom on one Claude account and QLB routes the next request to whichever of your other Claude accounts still has room — same for Codex — so you stop babysitting which login is about to hit its 5-hour or weekly limit and manually switching. It picks the best account for every request only from fresh, direct provider readings (not guesses or its cache), spreads normal usage so no single account gets drained first, and only reaches for a genuinely different model/provider as a fallback when you've explicitly said that's OK. And when you *want* a specific session on a specific account — deliberate multi-account parallel use — you can pin it explicitly with `qlb override pin` for a guaranteed parallel spread instead of relying on automatic scoring, or switch the automatic policy itself with `qlb resolve --strategy headroom|spread|round-robin|failover` (see the [CLI reference](docs/CLI.md)).
 
 QLB extends the same account-pooling idea to Grok, Kimi K3, and OpenRouter too — the same load-balancing engine works across any number of accounts on any provider, not just Claude and Codex.
 
@@ -78,11 +78,11 @@ Once active, `qlb-pi` replaces Pi's footer with a compact 2-line status view ren
 
 ```
 sid:a1b2c3d4 · qlb · main · 42%ctx · claude-opus-5-5
-★ user · 5h 12% · 7d 38% · sync ok · 4 owned · 9 accts
+★ user (cache) · 5h 12% · 7d 38% · sync ok · 4 owned · 9 accts
 ```
 
 - Line 1 is the same identity info Pi's footer already showed: session id, repo, git branch, context-window percent, and the active model.
-- Line 2 is QLB's own summary: the currently selected account (colored, `★`-marked), its top usage buckets, then native-credential drift status (`sync ok`, `N drift`, or `FAIL`), QLB_OWNED store count, and total account count — joined with ` · `. Email labels are shortened to the local part (`user@example.com` → `user`).
+- Line 2 is QLB's own **cache display**: the last selected account (colored, `★`-marked), its persisted top usage buckets, then native-credential drift status (`sync ok`, `N drift`, or `FAIL`), QLB_OWNED store count, and total account count — joined with ` · `. These labels cannot select or retain an account; only a fresh direct provider reading can do that. Email labels are shortened to the local part (`user@example.com` → `user`).
 
 Press **`ctrl+alt+q`** (or run **`/qlb expand`**, alias `/qlb details`) to toggle an expanded detail panel above the compact footer, showing every configured provider grouped by ownership state, each account's full per-bucket usage, any native-sync drift rows from `qlb doctor`, and the last few `qlb resolve` decisions made in this session. Press the same shortcut (or run the command again) to collapse it back to the 2-line view.
 
@@ -124,7 +124,7 @@ qlb status --flat          # original provider | account | bucket table
 qlb status --json          # additive machine-readable status; see docs/CLI.md#qlb-status
 ```
 
-`--json` does not remove or rename fields, so existing parsers of `qlb status --json` keep working.
+`--json` does not remove or rename fields, so existing parsers of `qlb status --json` keep working. Its `usedPct`, derived `leftPct`, rounded labels, and health glyphs are presentation/cross-check data; they cannot affect selection.
 
 ### Explaining and auditing decisions
 

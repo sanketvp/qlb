@@ -81,7 +81,7 @@ describe('dashboard formatting', () => {
 
     const text = formatDashboard(accounts);
     assert.match(text, /^✓  Work  anthropic  NATIVE  override=none$/m);
-    assert.match(text, /5h\s+42% used\s+58% left\s+authoritative/);
+    assert.match(text, /5h\s+42% used\s+58% left\s+\(presentation-only\)\s+poll \(display-only\)/);
     assert.match(text, /7d\s+not reported by anthropic/);
   });
 

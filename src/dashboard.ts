@@ -218,6 +218,14 @@ function unreportedRow(snap: AccountSnapshot, window: string): StatusDisplayRow 
   };
 }
 
+function routingProvenance(reading: BucketReading): string {
+  const directProvider = reading.source === 'provider-poll' || reading.source === 'provider-headers';
+  if (directProvider && reading.confidence === 'authoritative') return 'provider authority';
+  if (reading.confidence === 'stale') return 'stale cache (display-only)';
+  if (reading.confidence === 'advisory') return 'advisory (display-only)';
+  return `${reading.source} (display-only)`;
+}
+
 function rowFromReading(
   snap: AccountSnapshot,
   rawKey: string,
@@ -236,9 +244,10 @@ function rowFromReading(
     resetAt: reading.resetAt,
     now,
   });
-  const bits = [`${cap.used} used`, `${cap.left} left`];
+  // Used/left is a rounded 100-used presentation, never a routing input.
+  const bits = [`${cap.used} used`, `${cap.left} left`, '(presentation-only)'];
   if (marker) bits.push(marker);
-  bits.push(reading.confidence, reset);
+  bits.push(routingProvenance(reading), reset);
   return {
     provider: snap.provider,
     label: snap.label,

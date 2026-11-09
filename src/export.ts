@@ -37,6 +37,8 @@ export type CacheExportReading = {
   confidence: 'authoritative' | 'advisory' | 'stale' | 'unknown';
   status: string;
   stale: boolean;
+  /** Per-reading provenance only; this export never performs selection. */
+  routingAuthority: 'fresh-provider' | 'display-only';
 };
 
 export type CacheExportSurfaceMember = {
@@ -92,22 +94,29 @@ export function cacheOnlyExport(now = Date.now(), dbPath = exportDbPath()): Cach
       JOIN accounts AS a ON a.id = s.account_id
       ORDER BY a.provider, a.id, s.bucket
     `).all() as SnapshotRow[];
-    const readings = rows.map((row) => ({
-      accountId: row.account_id,
-      provider: row.provider,
-      label: row.label,
-      bucket: row.bucket,
-      usedPct: row.used_pct,
-      used: row.used,
-      limit: row.limit_val,
-      remaining: row.remaining,
-      resetAt: row.reset_at,
-      fetchedAt: row.fetched_at,
-      source: row.source,
-      confidence: row.confidence,
-      status: row.status,
-      stale: now - row.fetched_at > STALE_OK_S * 1000,
-    }));
+    const readings: CacheExportReading[] = rows.map((row) => {
+      const stale = now - row.fetched_at > STALE_OK_S * 1000;
+      const directProvider = row.source === 'provider-poll' || row.source === 'provider-headers';
+      return {
+        accountId: row.account_id,
+        provider: row.provider,
+        label: row.label,
+        bucket: row.bucket,
+        usedPct: row.used_pct,
+        used: row.used,
+        limit: row.limit_val,
+        remaining: row.remaining,
+        resetAt: row.reset_at,
+        fetchedAt: row.fetched_at,
+        source: row.source,
+        confidence: row.confidence,
+        status: row.status,
+        stale,
+        routingAuthority: !stale && directProvider && row.confidence === 'authoritative'
+          ? 'fresh-provider'
+          : 'display-only',
+      };
+    });
     const hasInventory = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventories'").get());
     const hasMembers = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_export_inventory_members'").get());
     const inventory = hasInventory && hasMembers

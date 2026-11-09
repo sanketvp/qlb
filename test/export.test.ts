@@ -66,7 +66,7 @@ function fixtureDb(includeExternalCache = false): { path: string; freshAt: numbe
       usedPct: 12,
       remaining: 88,
       fetchedAt: freshAt,
-      source: 'poll',
+      source: 'provider-poll',
       confidence: 'authoritative',
     });
     store.upsertSnapshot('anthropic-a', 'seven-day', {
@@ -99,7 +99,7 @@ describe('cache-only export', () => {
 
     const body = JSON.parse(result.stdout) as {
       exportedAt: number;
-      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; accountId: string; provider: string; source: string; status: string }>;
+      readings: Array<{ bucket: string; fetchedAt: number; stale: boolean; routingAuthority: string; accountId: string; provider: string; source: string; status: string }>;
       surfaces: Array<{ id: string; recordedAt: number; complete: boolean; members: Array<{ target: string; accountId: string | null; readings: unknown[] }> }>;
     };
     assert.equal(typeof body.exportedAt, 'number');
@@ -111,10 +111,11 @@ describe('cache-only export', () => {
       provider: reading.provider,
       source: reading.source,
       status: reading.status,
+      routingAuthority: reading.routingAuthority,
     })), [
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', source: 'poll', status: 'active' },
-      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', source: 'headers', status: 'active' },
-      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-b', provider: 'anthropic', source: 'external-cache', status: 'active' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-a', provider: 'anthropic', source: 'provider-poll', status: 'active', routingAuthority: 'fresh-provider' },
+      { bucket: 'seven-day', fetchedAt: fixture.staleAt, stale: true, accountId: 'anthropic-a', provider: 'anthropic', source: 'headers', status: 'active', routingAuthority: 'display-only' },
+      { bucket: 'five-hour', fetchedAt: fixture.freshAt, stale: false, accountId: 'anthropic-b', provider: 'anthropic', source: 'external-cache', status: 'active', routingAuthority: 'display-only' },
     ]);
     assert.deepEqual(body.surfaces, [{
       id: 'anthropic-pi-pool',

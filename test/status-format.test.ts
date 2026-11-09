@@ -152,7 +152,7 @@ describe('missing buckets and resetAt', () => {
       },
     });
     const text = dashboard([account], 1_000);
-    assert.match(text, /5h\s+0% used\s+100% left\s+authoritative\s+reset: not reported by synthetic/);
+    assert.match(text, /5h\s+0% used\s+100% left\s+\(presentation-only\)\s+poll \(display-only\)\s+reset: not reported by synthetic/);
     assert.doesNotMatch(text, /window not started/);
   });
 
@@ -176,7 +176,7 @@ describe('missing buckets and resetAt', () => {
     const text = dashboard([account]);
     assert.match(text, /5h\s+not reported by xai/);
     assert.match(text, /7d\s+not reported by xai/);
-    assert.match(text, /requests\s+0\.1% used\s+99\.9% left\s+advisory\s+reset: not reported by xai/);
+    assert.match(text, /requests\s+0\.1% used\s+99\.9% left\s+\(presentation-only\)\s+advisory \(display-only\)\s+reset: not reported by xai/);
     assert.doesNotMatch(text, /resets -/);
   });
 });
@@ -217,7 +217,7 @@ describe('reset times', () => {
 });
 
 describe('exhausted rendering', () => {
-  it('marks 0% left as EXHAUSTED on the bucket line and account header', () => {
+  it('marks 0% left as EXHAUSTED on the presentation-only bucket line and account header', () => {
     const now = new Date(2026, 8, 16, 12, 0, 0).getTime();
     const resetAt = new Date(2026, 8, 17, 9, 0, 0).getTime();
     const account = snap({
@@ -231,9 +231,9 @@ describe('exhausted rendering', () => {
     });
     const text = dashboard([account], now);
     assert.match(text, /✗  sanket@modustech.com  anthropic  QLB_OWNED  override=none  EXHAUSTED \(7d, 7d:Fable\)/);
-    assert.match(text, /7d\s+100% used\s+0% left\s+EXHAUSTED\s+authoritative/);
-    assert.match(text, /7d:Fable\s+100% used\s+0% left\s+EXHAUSTED\s+authoritative/);
-    assert.match(text, /5h\s+4% used\s+96% left\s+authoritative/);
+    assert.match(text, /7d\s+100% used\s+0% left\s+\(presentation-only\)\s+EXHAUSTED\s+poll \(display-only\)/);
+    assert.match(text, /7d:Fable\s+100% used\s+0% left\s+\(presentation-only\)\s+EXHAUSTED\s+poll \(display-only\)/);
+    assert.match(text, /5h\s+4% used\s+96% left\s+\(presentation-only\)\s+poll \(display-only\)/);
     assert.equal(accountHealthGlyph(account), '✗');
   });
 });
@@ -327,7 +327,7 @@ describe('displayed remaining and LOW/EXHAUSTED markers share one value', () => 
     if (expectedLeft === '0%') assert.equal(expectedMarker, 'EXHAUSTED');
     if (expectedLeft === '5%') assert.equal(expectedMarker, 'LOW');
     if (row.exhausted) {
-      assert.match(row.detail, /(^|\s)0% left\s+EXHAUSTED/);
+      assert.match(row.detail, /(^|\s)0% left\s+\(presentation-only\)\s+EXHAUSTED/);
     } else {
       assert.doesNotMatch(row.left, /^0%/);
       assert.doesNotMatch(row.detail, /(^|\s)0% left/);
