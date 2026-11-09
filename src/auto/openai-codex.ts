@@ -52,7 +52,7 @@ function readingsFrom(result: CodexUsageProbeResult, nowMs: number): Record<stri
     usedPct: window.usedPct,
     ...(window.resetAt === undefined ? {} : { resetAt: window.resetAt }),
     fetchedAt: nowMs,
-    source: directProviderReading ? 'provider-poll' as const : 'poll' as const,
+    source: directProviderReading ? 'provider-poll' as const : 'external-cache' as const,
     confidence: directProviderReading ? 'authoritative' as const : 'advisory' as const,
   }]));
 }

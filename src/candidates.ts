@@ -39,7 +39,7 @@ interface StoredObservation {
 }
 
 const OBSERVATION_SOURCES: readonly ObservationSource[] = ['resolve', 'refresh', 'status'];
-const BUCKET_SOURCES = ['provider-poll', 'provider-headers', 'poll', 'headers', 'plugin', 'error'] as const;
+const BUCKET_SOURCES = ['provider-poll', 'provider-headers', 'poll', 'headers', 'external-cache', 'plugin', 'error'] as const;
 const CONFIDENCES: readonly Confidence[] = ['authoritative', 'advisory', 'stale', 'unknown'];
 
 let observationWarnOnce = false;

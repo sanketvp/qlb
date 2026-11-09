@@ -1276,8 +1276,10 @@ function isDirectProviderSource(source: string): boolean {
 
 function observationSourceClass(reading: Pick<UsageObservation, 'source' | 'confidence'>): UsageSourceClass {
   if (isDirectProviderSource(reading.source)) return 'provider-direct';
-  if (reading.source === 'plugin' || reading.source === 'cswap-import') return 'import';
-  if (reading.confidence === 'advisory') return 'advisory';
+  // Keep the legacy import spelling so pre-change rows remain comparable;
+  // new C-swap and Codex rollouts name their external-cache provenance.
+  if (reading.source === 'external-cache' || reading.source === 'cswap-import') return 'import';
+  if (reading.confidence === 'advisory' || reading.source === 'plugin') return 'advisory';
   return 'local';
 }
 

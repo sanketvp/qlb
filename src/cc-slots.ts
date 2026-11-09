@@ -521,8 +521,8 @@ export class SqliteClaudeSlotRepository implements ClaudeSlotRepository {
         persistUsageObservation(this.db, snapshot.accountId, snapshot.bucket, {
           usedPct: snapshot.usedPct,
           fetchedAt: snapshot.fetchedAt,
-          source: 'cswap-import',
-          confidence: 'unknown',
+          source: 'external-cache',
+          confidence: 'advisory',
         });
       }
       if (input.activeAccountId) {

@@ -260,6 +260,8 @@ describe('provider usage discrepancy records', () => {
       assert.equal(persisted.length, 4);
       assert.ok(persisted.every((row) => row.resolution === 'provider-wins-discrepancy'));
       assert.ok(persisted.every((row) => row.provider_value === 70 && row.comparison_value === 90));
+      const imported = persisted.find((row) => row.account_id === 'import');
+      assert.equal(imported?.comparison_source_class, 'import');
     } finally {
       reopened.close();
     }
