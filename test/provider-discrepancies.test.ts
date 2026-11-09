@@ -11,7 +11,7 @@ import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
 import { parseUsageHeaders } from '../src/proxy';
 import { resolveFromSnapshots } from '../src/resolve';
-import { classifyProviderPercentage, PROVIDER_READING_MAX_AGE_MS } from '../src/routing-authority';
+import { classifyProviderPercentage } from '../src/routing-authority';
 import {
   openStore,
   readOnlySchemaRefusal,
@@ -96,7 +96,7 @@ describe('provider usage discrepancy records', () => {
     }
   });
 
-  it('records a one-point disagreement, ignores a pair skewed beyond five minutes, and dedupes value pairs', () => {
+  it('records one-point and time-skewed disagreements, and dedupes value pairs', () => {
     const path = dbPath();
     const now = Date.now();
     const store = openStore(path);
@@ -108,9 +108,12 @@ describe('provider usage discrepancy records', () => {
       assert.equal(onePoint[0]?.provider_value, 70);
       assert.equal(onePoint[0]?.comparison_value, 71);
 
-      store.upsertSnapshot('skew', '5h', local(90, now - PROVIDER_READING_MAX_AGE_MS - 1));
+      store.upsertSnapshot('skew', '5h', local(90, now - 5 * 60_000 - 1));
       store.upsertSnapshot('skew', '5h', provider(70, now));
-      assert.equal(rows(path).filter((row) => row.account_id === 'skew').length, 0);
+      const skewed = rows(path).filter((row) => row.account_id === 'skew');
+      assert.equal(skewed.length, 1);
+      assert.equal(skewed[0]?.provider_value, 70);
+      assert.equal(skewed[0]?.comparison_value, 90);
 
       store.upsertSnapshot('pair', '5h', local(90, now - 1));
       store.upsertSnapshot('pair', '5h', provider(70, now));

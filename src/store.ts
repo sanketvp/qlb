@@ -15,7 +15,7 @@ import { redactJson, redactKeyValueText, redactSecrets } from './redact';
 import type { BucketReading, Confidence } from './types';
 import { parseCodexRecoveryFence, type CodexRecoveryFence } from './codex-sessions';
 import type { CodexWatch } from './codex-switch';
-import { classifyProviderPercentage, PROVIDER_READING_MAX_AGE_MS } from './routing-authority';
+import { classifyProviderPercentage } from './routing-authority';
 import { newerSchemaMessage, readUserVersion, SCHEMA_VERSION } from './schema-version';
 import { assertCodexUsageDiagnosticAttempt, type CodexUsageDiagnosticAttempt } from './codex-usage-diagnostic-shared';
 export { SCHEMA_VERSION };
@@ -1344,7 +1344,6 @@ export function persistUsageObservation(
       const comparisonPct = comparablePercentage(comparison.usedPct);
       if (providerPct != null && comparisonPct != null
         && Number.isFinite(provider.fetchedAt) && Number.isFinite(comparison.fetchedAt)
-        && Math.abs(provider.fetchedAt - comparison.fetchedAt) <= PROVIDER_READING_MAX_AGE_MS
         && Math.abs(providerPct - comparisonPct) > USAGE_DISCREPANCY_TOLERANCE_PCT) {
         eligible = {
           sourceClass: 'provider-direct',
