@@ -905,7 +905,6 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     const h = setup();
     try {
       const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
-      mkdirSync(join(h.dir, 'missing-agent'), { mode: 0o700 });
       const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
       installHistory(h, ANTHROPIC_POOL_HISTORY.legacyAbsentParent, h.ownerPath, absentAuthPath);
 
