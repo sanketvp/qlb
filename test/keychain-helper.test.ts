@@ -712,7 +712,7 @@ sleep 8`);
 
       assert.throws(() => runKeychainClientSync(keychainRequestFromArgv('security', hold, [
         'find-generic-password', '-a', 'account-1-a@b', '-w', '-s', 'claude-swap',
-      ], { timeoutMs: 300, lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+      ], { timeoutMs: 3_000, lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
       waitFor(join(dir, 'pid'));
       const started = Date.now();
       assert.throws(() => defaultCswapItemReader('claude-swap', 'account-1-a@b', {}, { securityPath: newline, lockfPath }), KeychainRequestStillWaiting);

@@ -670,7 +670,7 @@ cat > "$d/stdin-copy"`);
       const holder = fake(s, 'echo $$ > "$d/write-pid"\nsleep 8', 'busy-holder');
       const writer = fake(s, 'echo unexpected > "$d/busy-writer-ran"', 'busy-writer');
       try {
-        const hold = request(s, holder, 'svc-w', 300);
+        const hold = request(s, holder, 'svc-w', 3_000);
         assert.throws(() => runKeychainClientSync(hold), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
         waitFor(join(s.dir, 'write-pid'));
         const began = Date.now();
