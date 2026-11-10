@@ -275,12 +275,8 @@ export function classifySwitchError(error: unknown): string {
 
 function journalOptions(deps: ClaudeSwitchDeps, paths: ReturnType<typeof claudePaths>): ClaudeSwitchJournalOptions { return { journalDir: deps.journalDir, home: deps.home, env: deps.env, configPath: paths.globalConfigPath, keychainService: paths.keychainService }; }
 function refusal(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string): ClaudeSwitchResult {
-  // A CLI can refuse before its raw destination text is resolved to a slot.
-  // Persist only a destination admitted by the Claude slot inventory; retain
-  // the useful refusal result even when neither side is a durable destination.
-  const durableTo = deps.slots.getSlot(input.to) === null ? from : input.to;
-  if (durableTo !== null) {
-    deps.store.recordClaudeSwitchRefusal({ from, to: durableTo, trigger: input.trigger, reason, republish: input.republish === true, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
+  if (deps.slots.listSlots().some((slot) => slot.accountId === input.to)) {
+    deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, republish: input.republish === true, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
   }
   return { outcome: 'refused', from, to: input.to, reason, attempt, injected: switchWasInjected(deps, input), exitCode: 3 };
 }

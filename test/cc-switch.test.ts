@@ -457,16 +457,13 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
   });
 
-  it('records CLI refusal diagnostics without persisting an unrecognized or oversized destination', async () => {
+  it('does not persist CLI refusals with unrecognized destinations', async () => {
     const subject = await transactionFixture();
     for (const target of ['not-a-slot', 'x'.repeat(16 * 1024)]) {
       const result = await switchClaude(subject.deps, { to: target, trigger: 'manual' });
       assert.deepEqual({ outcome: result.outcome, reason: result.reason, to: result.to }, { outcome: 'refused', reason: 'target-missing', to: target });
     }
-    assert.deepEqual(subject.refusals.map((row) => ({ from: row.from, to: row.to, reason: row.reason })), [
-      { from: 'account-a', to: 'account-a', reason: 'target-missing' },
-      { from: 'account-a', to: 'account-a', reason: 'target-missing' },
-    ]);
+    assert.deepEqual(subject.refusals, []);
   });
 
   it('T7 true noop: identical account credentials with production shared fields remain a noop', async () => {
@@ -1061,9 +1058,11 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'outgoing-backup-failed' });
   });
 
-  it('a malformed journal refuses and is left in place', async () => {
+  it('a malformed journal refuses raw invalid targets and is left in place', async () => {
     const subject = await transactionFixture(); mkdirSync(subject.deps.journalDir!, { recursive: true }); const path = join(subject.deps.journalDir!, 'switch-anthropic.json'); writeFileSync(path, '{}');
-    assert.equal((await switchClaude(subject.deps, manual)).reason, 'switch-journal-malformed'); assert.equal(existsSync(path), true);
+    const result = await switchClaude(subject.deps, { to: 'acct:typo', trigger: 'manual' });
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason, exitCode: result.exitCode }, { outcome: 'refused', reason: 'switch-journal-malformed', exitCode: 3 });
+    assert.equal(subject.refusals.length, 0); assert.equal(existsSync(path), true);
   });
 
   it('an orphaned unfinished journal refuses before Phase A with zero writes', async () => {

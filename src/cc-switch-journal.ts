@@ -2,6 +2,7 @@ import { chmodSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSy
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { type JsonObject } from './anthropic-oauth';
+import { type ClaudeCredentialClassificationKind } from './cc-classify';
 import { type ClaudeSlot, type ClaudeSlotBackend } from './cc-slots';
 import { withProperLockfile, type HeldProperLockfile } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
@@ -22,8 +23,11 @@ const JOURNAL_TRIGGER_ALLOWLIST = new Set([
   // Current autoswitch trigger when it parks a switch decision.
   'parked',
 ]);
-const JOURNAL_DECISION_TRIGGER_ALLOWLIST = new Set(['proactive', 'at-limit', 'failover', 'consume-first', 'parked']);
-const OUTGOING_KIND_ALLOWLIST = new Set(['own-bytes', 'own-family', 'own-rotated', 'foreign', 'foreign-synced', 'wiped', 'alien', 'known-foreign', 'unresolved']);
+const JOURNAL_DECISION_TRIGGER_ALLOWLIST = new Set([...JOURNAL_TRIGGER_ALLOWLIST].filter((trigger) => trigger !== 'manual'));
+const OUTGOING_KIND_ALLOWLIST: Record<ClaudeCredentialClassificationKind, true> = {
+  'own-bytes': true, 'own-family': true, 'own-rotated': true, foreign: true, 'foreign-synced': true,
+  wiped: true, alien: true, 'known-foreign': true, unresolved: true,
+};
 const MAX_ATTEMPT_ID_LENGTH = 4 * 1024;
 const MAX_BINDING_JSON_BYTES = 16 * 1024;
 const journalOwnerHandle = Symbol('claude-switch-journal-owner');
@@ -125,6 +129,9 @@ function finiteNumber(value: unknown): value is number { return typeof value ===
 function nullableString(value: unknown): value is string | null { return value === null || isString(value); }
 function nullableFiniteNumber(value: unknown): value is number | null { return value === null || finiteNumber(value); }
 function isJsonObject(value: unknown): value is JsonObject { return isRecord(value); }
+function isOutgoingKind(value: unknown): value is ClaudeCredentialClassificationKind {
+  return isString(value) && Object.hasOwn(OUTGOING_KIND_ALLOWLIST, value);
+}
 function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   if (!isRecord(value) || !nullableFiniteNumber(value.leftHeadroom)
     || !nullableFiniteNumber(value.leftRecoveryAt)
@@ -148,7 +155,7 @@ export function parseClaudeSwitchJournal(value: unknown, expected: ClaudeSwitchJ
     || !isString(value.attemptId) || value.attemptId.length === 0 || value.attemptId.length > MAX_ATTEMPT_ID_LENGTH
     || !isString(value.from) || !isString(value.to) || !isString(value.trigger)
     || !isString(value.by) || typeof value.republish !== 'boolean' || typeof value.injected !== 'boolean'
-    || !nullableString(value.detail) || (value.outgoingKind !== null && (!isString(value.outgoingKind) || !OUTGOING_KIND_ALLOWLIST.has(value.outgoingKind)))
+    || !nullableString(value.detail) || (value.outgoingKind !== null && !isOutgoingKind(value.outgoingKind))
     || !nullableString(value.bindingJson) || !validBindingJson(value.bindingJson)
     || !isString(value.stagedBlobService) || !value.stagedBlobService.startsWith(STAGED_PREFIX)
     || value.stagedAccount !== QLB_KEYCHAIN_ACCOUNT || value.configPath !== expected.configPath
