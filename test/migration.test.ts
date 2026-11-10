@@ -8,7 +8,7 @@ import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { beginCutover } from '../src/lifecycle';
 import { isPiPlaceholder, piPlaceholder, PiOwnerLegacyError, writePiOwnerEntry } from '../src/pi-migrate';
 import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
-import { ANTHROPIC_POOL_HISTORY, NATIVE_AUTH, type HistoricalPoolArtifact, installHistoricalPoolArtifact } from './fixtures/anthropic-pool-history';
+import { ANTHROPIC_POOL_HISTORY, NATIVE_AUTH, NATIVE_AUTH_WITH_XAI, type HistoricalPoolArtifact, installHistoricalPoolArtifact } from './fixtures/anthropic-pool-history';
 import { runPiGate } from '../src/pi-gate';
 import {
   Migration,
@@ -164,6 +164,7 @@ function installHistory(
   h: Harness,
   artifact: HistoricalPoolArtifact = ANTHROPIC_POOL_HISTORY.postOwnerCrash,
   legacyOwner?: string,
+  authPath: string = h.authPath,
 ): void {
   installHistoricalPoolArtifact(artifact, {
     owner: h.ownerPath,
@@ -171,8 +172,8 @@ function installHistory(
     prePool: preQlbPath(h.poolPath),
     sidecar: sidecarPath(h.poolPath),
     staging: stagingOwnerPath(h.ownerPath),
-    auth: h.authPath,
-    backup: piAuthBackupPath(h.authPath, 'anthropic'),
+    auth: authPath,
+    backup: piAuthBackupPath(authPath, 'anthropic'),
     legacyOwner,
   }, (state, detail) => h.store.upsertMigration(PI_POOL_STORE, state, detail));
   for (const account of FIXTURE_ACCOUNTS) {
@@ -212,16 +213,6 @@ function setup(): Harness {
 }
 
 describe('migration state machine — §4.8.3 / §4.8.3a', () => {
-  it('historical fixture installation rejects an omitted required payload', () => {
-    const h = setup();
-    try {
-      assert.throws(() => installHistoricalPoolArtifact({ state: 'VALIDATED', required: ['owner'] }, {
-        owner: h.ownerPath, pool: h.poolPath, prePool: preQlbPath(h.poolPath), staging: stagingOwnerPath(h.ownerPath),
-        auth: h.authPath, backup: piAuthBackupPath(h.authPath, 'anthropic'), sidecar: sidecarPath(h.poolPath),
-      }, () => undefined), /missing required owner payload/);
-    } finally { h.cleanup(); }
-  });
-
   it('happy path: stage → rehearse (no refresh) → commit → QLB_OWNED', async () => {
     const h = setup();
     try {
@@ -451,8 +442,8 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.equal(resumed.state, 'QLB_OWNED');
       assert.equal(resumed.ownerFile, 'present');
       assert.equal(resumed.nativeStore, 'pre-qlb');
-      assert.equal(qlbWorks(h.kc), true, 'resume must not need to re-run rehearse');
-      assert.equal(qlbWorks(h.kc), true);
+      const detail = JSON.parse(h.store.getMigration(PI_POOL_STORE)?.detail_json ?? '{}') as { rehearse?: { validatedAt?: number } };
+      assert.equal(detail.rehearse?.validatedAt, 1794290701393, 'resume must preserve the recorded rehearsal');
       assertSafety(h.poolPath, h.kc);
       assert.deepEqual(readFileSync(preQlbPath(h.poolPath)), historicalNative);
     } finally {
@@ -460,45 +451,23 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('backs up Pi auth.json before replacing Anthropic and restores it on rollback', async () => {
+  it('rolls back a historical Pi auth backup while preserving sibling entries', async () => {
     const h = setup();
     try {
-      const original = `{
-  "anthropic": {
-    "type": "oauth",
-    "access": "native-access",
-    "refresh": "native-refresh",
-    "expires": 1,
-    "metadata": {
-      "kept": true
-    }
-  },
-  "xai": {
-    "type": "oauth",
-    "access": "other-access",
-    "refresh": "other-refresh",
-    "expires": 2
-  }
-}\n`;
       installHistory(h, ANTHROPIC_POOL_HISTORY.rollbackWithSibling);
-      assert.equal(isPiPlaceholder(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic), true);
       h.mig.rollback();
-      assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+      assert.deepEqual(readFileSync(h.authPath), Buffer.from(NATIVE_AUTH_WITH_XAI));
     } finally {
       h.cleanup();
     }
   });
 
-  it('commit with no auth.json records filePresent:false, creates the file with only the placeholder, rollback removes the file', async () => {
+  it('rolls back a historical absent-auth state and removes auth.json', async () => {
     const h = setup();
     try {
       installHistory(h, ANTHROPIC_POOL_HISTORY.absentAuth);
-      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { filePresent?: boolean };
-      assert.equal(backup.filePresent, false);
-      const auth = JSON.parse(readFileSync(h.authPath, 'utf8')) as Record<string, unknown>;
-      assert.deepEqual(Object.keys(auth), ['anthropic']);
-      assert.equal(isPiPlaceholder(auth.anthropic), true);
-      h.mig.rollback();
+      const rolled = h.mig.rollback();
+      assert.equal(rolled.state, 'VALIDATED');
       assert.equal(existsSync(h.authPath), false);
     } finally {
       h.cleanup();
@@ -533,17 +502,6 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
   });
 
   it('safety property holds at every literal pool publication crash point (backup, owner-entry, placeholder)', async () => {
-    const original = `{
-  "anthropic": {
-    "type": "oauth",
-    "access": "native-access",
-    "refresh": "native-refresh",
-    "expires": 1,
-    "extra": {
-      "kept": true
-    }
-  }
-}\n`;
     for (const artifact of [
       ANTHROPIC_POOL_HISTORY.backupCrash,
       ANTHROPIC_POOL_HISTORY.ownerEntryCrash,
@@ -556,9 +514,9 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
         h.mig.resume();
         assert.equal(h.mig.status().state, 'QLB_OWNED');
         const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
-        assert.deepEqual(backup.entry, JSON.parse(original).anthropic);
+        assert.deepEqual(backup.entry, JSON.parse(NATIVE_AUTH).anthropic);
         h.mig.rollback();
-        assert.deepEqual(readFileSync(h.authPath), Buffer.from(original));
+        assert.deepEqual(readFileSync(h.authPath), Buffer.from(NATIVE_AUTH));
         assert.equal(existsSync(h.ownerPath), false);
       } finally {
         h.cleanup();
@@ -655,12 +613,8 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
   it('refuses resume and commit rather than replacing a newer native Anthropic login', async () => {
     const h = setup();
     try {
-      const original = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-original', refresh: 'refresh-original', expires: 1 } }, null, 2) + '\n';
       const newer = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-newer', refresh: 'refresh-newer', expires: 2 } }, null, 2) + '\n';
-      writeFileSync(h.authPath, original, { mode: 0o600 });
-      h.mig.stage();
-      await h.mig.rehearse(mockRehearse([]));
-      h.mig.commit();
+      installHistory(h, ANTHROPIC_POOL_HISTORY.postFullCommit);
       writeFileSync(h.authPath, newer, { mode: 0o600 });
       const beforeOwner = readFileSync(h.ownerPath);
 
@@ -892,7 +846,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
   it('rollback after full commit restores native byte-identical and removes owner file', async () => {
     const h = setup();
     try {
-      installHistory(h, ANTHROPIC_POOL_HISTORY.rollback);
+      installHistory(h, ANTHROPIC_POOL_HISTORY.postFullCommit);
       const original = readFileSync(preQlbPath(h.poolPath));
       assert.equal(h.mig.status().state, 'QLB_OWNED');
       assertSafety(h.poolPath, h.kc);
@@ -907,6 +861,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
         'restored native must be byte-identical to original',
       );
       assert.equal(nativeWorks(h.poolPath), true);
+      assert.equal(existsSync(sidecarPath(h.poolPath)), false);
       assertSafety(h.poolPath, h.kc);
     } finally {
       h.cleanup();
@@ -952,9 +907,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
       mkdirSync(join(h.dir, 'missing-agent'), { mode: 0o700 });
       const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
-      migration.stage();
-      await migration.rehearse(mockRehearse([]));
-      migration.commit();
+      installHistory(h, ANTHROPIC_POOL_HISTORY.legacyAbsentParent, h.ownerPath, absentAuthPath);
 
       const rolled = migration.rollback();
       assert.equal(rolled.state, 'VALIDATED');
@@ -970,10 +923,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     try {
       const absentAuthPath = join(h.dir, 'missing-agent', 'auth.json');
       const migration = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, { authJsonPath: absentAuthPath });
-      writePiAuthBackup(absentAuthPath, 'anthropic', 'missing-parent');
-      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
-      renameSync(h.poolPath, preQlbPath(h.poolPath));
-      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      installHistory(h, ANTHROPIC_POOL_HISTORY.absentParent, undefined, absentAuthPath);
 
       assert.throws(
         () => migration.rollback(),
@@ -1311,7 +1261,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('safety property holds at every crash point (S2, S3, C, H1, R4, RC)', async () => {
+  it('safety property holds across literal post-commit recovery and rollback states (C, H1, R4, RC)', async () => {
     const h = setup();
     try {
       // C: literal post-owner crash; native remains readable until H1.

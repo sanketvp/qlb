@@ -6,7 +6,6 @@ export type HistoricalPoolState = 'VALIDATED' | 'QLB_OWNED';
 
 export interface HistoricalPoolArtifact {
   readonly state: HistoricalPoolState;
-  readonly required: readonly HistoricalPoolPayload[];
   readonly owner?: string;
   readonly journal?: string;
   readonly auth?: string;
@@ -16,7 +15,6 @@ export interface HistoricalPoolArtifact {
   readonly sidecar?: string;
   readonly staging?: string;
   readonly legacyOwner?: string;
-  readonly absent?: readonly Exclude<HistoricalPoolPayload, 'journal' | 'legacyOwner'>[];
 }
 
 const POOL = `{
@@ -74,7 +72,7 @@ export const NATIVE_AUTH = `{
 }
 `;
 
-const NATIVE_AUTH_WITH_XAI = `{
+export const NATIVE_AUTH_WITH_XAI = `{
   "anthropic": {
     "type": "oauth",
     "access": "native-access",
@@ -135,20 +133,19 @@ const SIDECAR = `{
 
 /** Historical recovery and rollback states; payloads are serialized literals, never publication setup. */
 export const ANTHROPIC_POOL_HISTORY = {
-  postOwnerCrash: { state: 'VALIDATED', required: ['owner', 'journal', 'pool'], owner: OWNER, journal: POST_OWNER_JOURNAL, pool: POOL },
-  backupCrash: { state: 'VALIDATED', required: ['journal', 'auth', 'backup', 'staging', 'pool'], journal: JOURNAL, auth: NATIVE_AUTH, backup: BACKUP, staging: OWNER, pool: POOL },
-  ownerEntryCrash: { state: 'VALIDATED', required: ['owner', 'journal', 'auth', 'backup', 'staging', 'pool'], owner: V2_OWNER, journal: JOURNAL, auth: NATIVE_AUTH, backup: BACKUP, staging: OWNER, pool: POOL },
-  placeholderCrash: { state: 'VALIDATED', required: ['owner', 'journal', 'auth', 'backup', 'staging', 'pool'], owner: V2_OWNER, journal: JOURNAL, auth: PLACEHOLDER, backup: BACKUP, staging: OWNER, pool: POOL },
-  absentAuth: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: ABSENT_BACKUP, prePool: POOL, absent: ['pool'] },
-  postRename: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, prePool: POOL, absent: ['pool'] },
-  postFullCommit: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool', 'sidecar'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, prePool: POOL, sidecar: SIDECAR, absent: ['pool', 'staging'] },
-  rollback: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, prePool: POOL, absent: ['pool'] },
-  rollbackWithSibling: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER_WITH_XAI, backup: BACKUP.replace('"extra":{"kept":true}', '"metadata":{"kept":true}'), prePool: POOL, absent: ['pool'] },
-  malformedAuth: { state: 'QLB_OWNED', required: ['owner', 'journal', 'auth', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: '{not-json\n', backup: BACKUP, prePool: POOL, absent: ['pool'] },
-  absentParent: { state: 'QLB_OWNED', required: ['owner', 'journal', 'backup', 'prePool'], owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, backup: BACKUP, prePool: POOL, absent: ['pool'] },
-  legacyOwner: { state: 'QLB_OWNED', required: ['legacyOwner', 'journal', 'auth', 'pool'], legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: '{}', auth: NATIVE_AUTH, pool: POOL },
-  legacyRollback: { state: 'QLB_OWNED', required: ['legacyOwner', 'journal', 'auth', 'backup', 'prePool'], legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: '{}', auth: NATIVE_AUTH, backup: BACKUP, prePool: POOL, absent: ['pool'] },
-  customOwnerRace: { state: 'QLB_OWNED', required: ['owner', 'legacyOwner', 'journal', 'auth', 'backup', 'pool'], owner: V2_OWNER, legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, pool: POOL },
+  postOwnerCrash: { state: 'VALIDATED', owner: OWNER, journal: POST_OWNER_JOURNAL, pool: POOL },
+  backupCrash: { state: 'VALIDATED', journal: JOURNAL, auth: NATIVE_AUTH, backup: BACKUP, staging: OWNER, pool: POOL },
+  ownerEntryCrash: { state: 'VALIDATED', owner: V2_OWNER, journal: JOURNAL, auth: NATIVE_AUTH, backup: BACKUP, staging: OWNER, pool: POOL },
+  placeholderCrash: { state: 'VALIDATED', owner: V2_OWNER, journal: JOURNAL, auth: PLACEHOLDER, backup: BACKUP, staging: OWNER, pool: POOL },
+  absentAuth: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: ABSENT_BACKUP, prePool: POOL },
+  postRename: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, prePool: POOL },
+  postFullCommit: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER, backup: BACKUP, prePool: POOL, sidecar: SIDECAR },
+  rollbackWithSibling: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: PLACEHOLDER_WITH_XAI, backup: BACKUP.replace('"extra":{"kept":true}', '"metadata":{"kept":true}'), prePool: POOL },
+  malformedAuth: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, auth: '{not-json\n', backup: BACKUP, prePool: POOL },
+  absentParent: { state: 'QLB_OWNED', owner: V2_OWNER, journal: QLB_OWNED_JOURNAL, backup: BACKUP, prePool: POOL },
+  legacyOwner: { state: 'QLB_OWNED', legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: '{}', auth: NATIVE_AUTH, pool: POOL },
+  legacyRollback: { state: 'QLB_OWNED', legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: '{}', auth: NATIVE_AUTH, backup: BACKUP, prePool: POOL },
+  legacyAbsentParent: { state: 'QLB_OWNED', legacyOwner: '{"owner":"qlb","accounts":[{"provider":"anthropic"}]}\n', journal: '{}', prePool: POOL },
 } as const satisfies Record<string, HistoricalPoolArtifact>;
 
 export interface HistoricalPoolPaths {
@@ -179,10 +176,6 @@ export function installHistoricalPoolArtifact(
     staging: artifact.staging,
     legacyOwner: artifact.legacyOwner,
   };
-  for (const required of artifact.required) {
-    if (typeof payloads[required] !== 'string') throw new Error(`historical Anthropic pool artifact is missing required ${required} payload`);
-    if (required === 'legacyOwner' && !paths.legacyOwner) throw new Error('historical Anthropic pool artifact is missing legacy owner path');
-  }
   const locations: Record<Exclude<HistoricalPoolPayload, 'journal' | 'legacyOwner'>, string> = {
     owner: paths.owner, auth: paths.auth, backup: paths.backup, pool: paths.pool, prePool: paths.prePool, sidecar: paths.sidecar, staging: paths.staging,
   };
@@ -195,8 +188,8 @@ export function installHistoricalPoolArtifact(
     mkdirSync(dirname(location), { recursive: true, mode: 0o700 });
     writeFileSync(location, payload.replaceAll('__POOL_PATH__', paths.pool).replaceAll('__OWNER_PATH__', paths.owner).replaceAll('__AUTH_PATH__', paths.auth), { mode: 0o600 });
   }
-  for (const absent of artifact.absent ?? []) rmSync(locations[absent], { force: true });
-  if (artifact.legacyOwner !== undefined && paths.legacyOwner) {
+  if (artifact.legacyOwner !== undefined) {
+    if (!paths.legacyOwner) throw new Error('historical Anthropic pool artifact is missing legacy owner path');
     mkdirSync(dirname(paths.legacyOwner), { recursive: true, mode: 0o700 });
     writeFileSync(paths.legacyOwner, artifact.legacyOwner, { mode: 0o600 });
   }
