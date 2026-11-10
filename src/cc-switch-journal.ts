@@ -2,6 +2,8 @@ import { chmodSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSy
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { type JsonObject } from './anthropic-oauth';
+import { type AutoswitchSwitchDecision } from './autoswitch';
+import { type ClaudeCredentialClassificationKind } from './cc-classify';
 import { type ClaudeSlot, type ClaudeSlotBackend } from './cc-slots';
 import { withProperLockfile, type HeldProperLockfile } from './cc-locks';
 import { isCredentialNotFound } from './credential-backends';
@@ -13,15 +15,16 @@ const JOURNAL_FILE = 'switch-anthropic.json';
 const OWNER_LOCK_STALENESS_MS = 300_000;
 const OWNER_LOCK_TIMEOUT_MS = 10_000;
 const STAGED_PREFIX = 'qlb:anthropic:staged-rollback:';
-const JOURNAL_TRIGGER_ALLOWLIST = new Set([
-  'manual',
-  'proactive',
-  'at-limit',
-  'failover',
-  'consume-first',
-  // Current autoswitch trigger when it parks a switch decision.
-  'parked',
-]);
+const JOURNAL_DECISION_TRIGGER_ALLOWLIST: Record<AutoswitchSwitchDecision['leftTrigger'], true> = {
+  proactive: true, 'at-limit': true, failover: true, 'consume-first': true, parked: true,
+};
+const JOURNAL_TRIGGER_ALLOWLIST = new Set(['manual', ...Object.keys(JOURNAL_DECISION_TRIGGER_ALLOWLIST)]);
+const OUTGOING_KIND_ALLOWLIST: Record<ClaudeCredentialClassificationKind, true> = {
+  'own-bytes': true, 'own-family': true, 'own-rotated': true, foreign: true, 'foreign-synced': true,
+  wiped: true, alien: true, 'known-foreign': true, unresolved: true,
+};
+const MAX_ATTEMPT_ID_LENGTH = 4 * 1024;
+const MAX_BINDING_JSON_BYTES = 16 * 1024;
 const journalOwnerHandle = Symbol('claude-switch-journal-owner');
 
 export type ClaudeSwitchDecision = {
@@ -121,9 +124,13 @@ function finiteNumber(value: unknown): value is number { return typeof value ===
 function nullableString(value: unknown): value is string | null { return value === null || isString(value); }
 function nullableFiniteNumber(value: unknown): value is number | null { return value === null || finiteNumber(value); }
 function isJsonObject(value: unknown): value is JsonObject { return isRecord(value); }
+function isOutgoingKind(value: unknown): value is ClaudeCredentialClassificationKind {
+  return isString(value) && Object.hasOwn(OUTGOING_KIND_ALLOWLIST, value);
+}
 function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   if (!isRecord(value) || !nullableFiniteNumber(value.leftHeadroom)
-    || !nullableFiniteNumber(value.leftRecoveryAt) || !nullableString(value.leftTrigger)) return null;
+    || !nullableFiniteNumber(value.leftRecoveryAt)
+    || (value.leftTrigger !== null && (!isString(value.leftTrigger) || !Object.hasOwn(JOURNAL_DECISION_TRIGGER_ALLOWLIST, value.leftTrigger)))) return null;
   return {
     leftHeadroom: value.leftHeadroom,
     leftRecoveryAt: value.leftRecoveryAt,
@@ -131,12 +138,20 @@ function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   };
 }
 
+function validBindingJson(value: string | null): boolean {
+  if (value === null) return true;
+  if (Buffer.byteLength(value, 'utf8') > MAX_BINDING_JSON_BYTES) return false;
+  try { return isRecord(JSON.parse(value)); } catch { return false; }
+}
+
 /** Parse only the credential-free, allowlisted v1 journal shape. */
 export function parseClaudeSwitchJournal(value: unknown, expected: ClaudeSwitchJournalExpected): ClaudeSwitchJournal | null {
   if (!isRecord(value) || value.v !== 1 || value.provider !== 'anthropic'
-    || !isString(value.attemptId) || !isString(value.from) || !isString(value.to) || !isString(value.trigger)
+    || !isString(value.attemptId) || value.attemptId.length === 0 || value.attemptId.length > MAX_ATTEMPT_ID_LENGTH
+    || !isString(value.from) || !isString(value.to) || !isString(value.trigger)
     || !isString(value.by) || typeof value.republish !== 'boolean' || typeof value.injected !== 'boolean'
-    || !nullableString(value.detail) || !nullableString(value.outgoingKind) || !nullableString(value.bindingJson)
+    || !nullableString(value.detail) || (value.outgoingKind !== null && !isOutgoingKind(value.outgoingKind))
+    || !nullableString(value.bindingJson) || !validBindingJson(value.bindingJson)
     || !isString(value.stagedBlobService) || !value.stagedBlobService.startsWith(STAGED_PREFIX)
     || value.stagedAccount !== QLB_KEYCHAIN_ACCOUNT || value.configPath !== expected.configPath
     || value.keychainService !== expected.keychainService || !nullableString(value.configText)

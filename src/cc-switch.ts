@@ -275,7 +275,9 @@ export function classifySwitchError(error: unknown): string {
 
 function journalOptions(deps: ClaudeSwitchDeps, paths: ReturnType<typeof claudePaths>): ClaudeSwitchJournalOptions { return { journalDir: deps.journalDir, home: deps.home, env: deps.env, configPath: paths.globalConfigPath, keychainService: paths.keychainService }; }
 function refusal(deps: ClaudeSwitchDeps, input: SwitchClaudeInput, attempt: string, from: string | null, reason: string): ClaudeSwitchResult {
-  deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, republish: input.republish === true, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
+  if (deps.slots.listSlots().some((slot) => slot.accountId === input.to)) {
+    deps.store.recordClaudeSwitchRefusal({ from, to: input.to, trigger: input.trigger, reason, republish: input.republish === true, injected: switchWasInjected(deps, input), attempt, now: deps.now() });
+  }
   return { outcome: 'refused', from, to: input.to, reason, attempt, injected: switchWasInjected(deps, input), exitCode: 3 };
 }
 function writeError(error: unknown, fallback: 'keychain-write-failed' | 'config-write-failed'): string {

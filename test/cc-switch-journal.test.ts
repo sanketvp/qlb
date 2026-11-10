@@ -93,6 +93,27 @@ describe('Claude switch journal (K5-2)', () => {
     } finally { cleanup(h); }
   });
 
+  it('rejects hostile recovery fields while retaining the valid journal shape', () => {
+    const h = harness();
+    try {
+      for (const patch of [
+        { attemptId: '' },
+        { attemptId: 'x'.repeat(4 * 1024 + 1) },
+        { outgoingKind: 'caller-controlled-kind' },
+        { bindingJson: 'not-json' },
+        { bindingJson: '[]' },
+        { bindingJson: JSON.stringify({ payload: 'x'.repeat(16 * 1024) }) },
+        { decision: { leftHeadroom: 1, leftRecoveryAt: 2, leftTrigger: 'caller-controlled-trigger' } },
+        { decision: { leftHeadroom: Infinity, leftRecoveryAt: null, leftTrigger: null } },
+        { injected: 1 },
+        { republish: 'true' },
+      ]) assert.equal(parseClaudeSwitchJournal({ ...h.journal, ...patch }, h.options), null);
+      assert.deepEqual(parseClaudeSwitchJournal({ ...h.journal, bindingJson: '{"window":"7d"}', decision: { leftHeadroom: 1, leftRecoveryAt: 2, leftTrigger: 'consume-first' } }, h.options), {
+        ...h.journal, bindingJson: '{"window":"7d"}', decision: { leftHeadroom: 1, leftRecoveryAt: 2, leftTrigger: 'consume-first' },
+      });
+    } finally { cleanup(h); }
+  });
+
   it('configText and configWrittenHash round-trip byte-exact, including a fixture primaryApiKey (it is a restore target, not redacted)', async () => {
     const h = harness();
     try {
