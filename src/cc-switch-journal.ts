@@ -2,6 +2,7 @@ import { chmodSync, closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSy
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { type JsonObject } from './anthropic-oauth';
+import { type AutoswitchSwitchDecision } from './autoswitch';
 import { type ClaudeCredentialClassificationKind } from './cc-classify';
 import { type ClaudeSlot, type ClaudeSlotBackend } from './cc-slots';
 import { withProperLockfile, type HeldProperLockfile } from './cc-locks';
@@ -14,16 +15,10 @@ const JOURNAL_FILE = 'switch-anthropic.json';
 const OWNER_LOCK_STALENESS_MS = 300_000;
 const OWNER_LOCK_TIMEOUT_MS = 10_000;
 const STAGED_PREFIX = 'qlb:anthropic:staged-rollback:';
-const JOURNAL_TRIGGER_ALLOWLIST = new Set([
-  'manual',
-  'proactive',
-  'at-limit',
-  'failover',
-  'consume-first',
-  // Current autoswitch trigger when it parks a switch decision.
-  'parked',
-]);
-const JOURNAL_DECISION_TRIGGER_ALLOWLIST = new Set([...JOURNAL_TRIGGER_ALLOWLIST].filter((trigger) => trigger !== 'manual'));
+const JOURNAL_DECISION_TRIGGER_ALLOWLIST: Record<AutoswitchSwitchDecision['leftTrigger'], true> = {
+  proactive: true, 'at-limit': true, failover: true, 'consume-first': true, parked: true,
+};
+const JOURNAL_TRIGGER_ALLOWLIST = new Set(['manual', ...Object.keys(JOURNAL_DECISION_TRIGGER_ALLOWLIST)]);
 const OUTGOING_KIND_ALLOWLIST: Record<ClaudeCredentialClassificationKind, true> = {
   'own-bytes': true, 'own-family': true, 'own-rotated': true, foreign: true, 'foreign-synced': true,
   wiped: true, alien: true, 'known-foreign': true, unresolved: true,
@@ -135,7 +130,7 @@ function isOutgoingKind(value: unknown): value is ClaudeCredentialClassification
 function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   if (!isRecord(value) || !nullableFiniteNumber(value.leftHeadroom)
     || !nullableFiniteNumber(value.leftRecoveryAt)
-    || (value.leftTrigger !== null && (!isString(value.leftTrigger) || !JOURNAL_DECISION_TRIGGER_ALLOWLIST.has(value.leftTrigger)))) return null;
+    || (value.leftTrigger !== null && (!isString(value.leftTrigger) || !Object.hasOwn(JOURNAL_DECISION_TRIGGER_ALLOWLIST, value.leftTrigger)))) return null;
   return {
     leftHeadroom: value.leftHeadroom,
     leftRecoveryAt: value.leftRecoveryAt,
