@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess = require('node:child_process');
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, mock } from 'node:test';
@@ -130,6 +130,33 @@ it('uses the native lockf on darwin', () => {
 });
 
 describe('keychain client lockf runner', () => {
+  it('reads the wait-script clock in milliseconds when date misreads %3N', () => {
+    if (existsSync(KEYCHAIN_LOCKF_BIN)) return;
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-lockf-clock-'));
+    try {
+      const lockfPath = portableLockf(dir);
+      const broken = join(dir, 'broken-bin');
+      mkdirSync(broken, { mode: 0o700 });
+      const brokenDate = join(broken, 'date');
+      writeFileSync(brokenDate, "#!/bin/sh\nprintf '%s\\n' 1794343558865895271\n", { mode: 0o700 });
+      chmodSync(brokenDate, 0o700);
+      const out = join(dir, 'now');
+      const lock = join(dir, 'lock');
+      writeFileSync(lock, '');
+      const started = Date.now();
+      const result = spawnSync(lockfPath, ['-k', '-t', '0', lock, '/bin/sh', '-c', 'date +%s%3N > "$1"', 'clock', out], {
+        env: { PATH: `${broken}:/usr/bin:/bin`, LC_ALL: 'C', TZ: 'UTC' },
+      });
+      assert.equal(result.status, 0);
+      const stamp = readFileSync(out, 'utf8').trim();
+      assert.equal(/^\d{13}$/.test(stamp), true);
+      assert.ok(Math.abs(Number(stamp) - started) < 2_000);
+      assert.equal(readFileSync(join(dir, 'hires-date', 'date'), 'utf8').includes('Time::HiRes'), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed before spawn for an unsupported busy-probe lockf and spawns once for portable lockf', () => {
     const s = state();
     withState(s, () => {
