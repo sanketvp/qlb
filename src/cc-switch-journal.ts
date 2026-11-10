@@ -22,6 +22,10 @@ const JOURNAL_TRIGGER_ALLOWLIST = new Set([
   // Current autoswitch trigger when it parks a switch decision.
   'parked',
 ]);
+const JOURNAL_DECISION_TRIGGER_ALLOWLIST = new Set(['proactive', 'at-limit', 'failover', 'consume-first', 'parked']);
+const OUTGOING_KIND_ALLOWLIST = new Set(['own-bytes', 'own-family', 'own-rotated', 'foreign', 'foreign-synced', 'wiped', 'alien', 'known-foreign', 'unresolved']);
+const MAX_ATTEMPT_ID_LENGTH = 4 * 1024;
+const MAX_BINDING_JSON_BYTES = 16 * 1024;
 const journalOwnerHandle = Symbol('claude-switch-journal-owner');
 
 export type ClaudeSwitchDecision = {
@@ -123,7 +127,8 @@ function nullableFiniteNumber(value: unknown): value is number | null { return v
 function isJsonObject(value: unknown): value is JsonObject { return isRecord(value); }
 function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   if (!isRecord(value) || !nullableFiniteNumber(value.leftHeadroom)
-    || !nullableFiniteNumber(value.leftRecoveryAt) || !nullableString(value.leftTrigger)) return null;
+    || !nullableFiniteNumber(value.leftRecoveryAt)
+    || (value.leftTrigger !== null && (!isString(value.leftTrigger) || !JOURNAL_DECISION_TRIGGER_ALLOWLIST.has(value.leftTrigger)))) return null;
   return {
     leftHeadroom: value.leftHeadroom,
     leftRecoveryAt: value.leftRecoveryAt,
@@ -131,12 +136,20 @@ function parsedDecision(value: unknown): ClaudeSwitchDecision | null {
   };
 }
 
+function validBindingJson(value: string | null): boolean {
+  if (value === null) return true;
+  if (Buffer.byteLength(value, 'utf8') > MAX_BINDING_JSON_BYTES) return false;
+  try { return isRecord(JSON.parse(value)); } catch { return false; }
+}
+
 /** Parse only the credential-free, allowlisted v1 journal shape. */
 export function parseClaudeSwitchJournal(value: unknown, expected: ClaudeSwitchJournalExpected): ClaudeSwitchJournal | null {
   if (!isRecord(value) || value.v !== 1 || value.provider !== 'anthropic'
-    || !isString(value.attemptId) || !isString(value.from) || !isString(value.to) || !isString(value.trigger)
+    || !isString(value.attemptId) || value.attemptId.length === 0 || value.attemptId.length > MAX_ATTEMPT_ID_LENGTH
+    || !isString(value.from) || !isString(value.to) || !isString(value.trigger)
     || !isString(value.by) || typeof value.republish !== 'boolean' || typeof value.injected !== 'boolean'
-    || !nullableString(value.detail) || !nullableString(value.outgoingKind) || !nullableString(value.bindingJson)
+    || !nullableString(value.detail) || (value.outgoingKind !== null && (!isString(value.outgoingKind) || !OUTGOING_KIND_ALLOWLIST.has(value.outgoingKind)))
+    || !nullableString(value.bindingJson) || !validBindingJson(value.bindingJson)
     || !isString(value.stagedBlobService) || !value.stagedBlobService.startsWith(STAGED_PREFIX)
     || value.stagedAccount !== QLB_KEYCHAIN_ACCOUNT || value.configPath !== expected.configPath
     || value.keychainService !== expected.keychainService || !nullableString(value.configText)

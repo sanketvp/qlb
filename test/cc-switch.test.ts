@@ -457,6 +457,18 @@ describe('Claude switch transaction (K5-5)', () => {
     assert.equal(subject.backend.listServices().some((service) => service.startsWith('qlb:anthropic:staged-rollback:')), false);
   });
 
+  it('records CLI refusal diagnostics without persisting an unrecognized or oversized destination', async () => {
+    const subject = await transactionFixture();
+    for (const target of ['not-a-slot', 'x'.repeat(16 * 1024)]) {
+      const result = await switchClaude(subject.deps, { to: target, trigger: 'manual' });
+      assert.deepEqual({ outcome: result.outcome, reason: result.reason, to: result.to }, { outcome: 'refused', reason: 'target-missing', to: target });
+    }
+    assert.deepEqual(subject.refusals.map((row) => ({ from: row.from, to: row.to, reason: row.reason })), [
+      { from: 'account-a', to: 'account-a', reason: 'target-missing' },
+      { from: 'account-a', to: 'account-a', reason: 'target-missing' },
+    ]);
+  });
+
   it('T7 true noop: identical account credentials with production shared fields remain a noop', async () => {
     const subject = await transactionFixture();
     const head = credentialWithSharedFields('a');
