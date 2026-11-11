@@ -1287,6 +1287,21 @@ export class Migration {
     );
   }
 
+  private poolProofUnavailable(): Error {
+    return Object.assign(new Error('proof-unavailable'), { exitCode: 3 });
+  }
+
+  /** Fresh pre-owner publish, or a legacy conversion that would write the v2 map. */
+  private poolForwardBlocked(current: MigrationStatus, forResume: boolean): boolean {
+    if (current.detail.poolV2PublicationStarted === true || this.ownerEntryPresentAt(this.ownerMapPath)) return false;
+    if (this.poolLegacyOwnerPresent()) {
+      return forResume
+        ? this.allowPoolLegacyConversion && current.state === 'QLB_OWNED'
+        : current.state === 'VALIDATED' || current.state === 'QLB_OWNED';
+    }
+    return current.state === 'MIRRORED' || current.state === 'VALIDATED';
+  }
+
   /** P7b8's ordered pool publication: B → O → placeholder → hygiene. */
   private commitPoolV2(current: MigrationStatus): MigrationStatus {
     const staging = this.stagingPath();
@@ -1678,10 +1693,8 @@ export class Migration {
       resumeAction = ownerPresent
         ? 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`'
         : 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic` or re-stage';
-    } else if (poolLegacyOwner && state === 'QLB_OWNED') {
-      resumeAction = !this.allowPoolLegacyConversion
-        ? 'legacy Anthropic conversion requires `qlb migrate resume --provider anthropic`'
-        : 'convert legacy Anthropic owner: back up Pi auth.json, publish v2 ownership, then write placeholder';
+    } else if (poolLegacyOwner && state === 'QLB_OWNED' && !poolV2Owner && detail.poolV2PublicationStarted !== true) {
+      resumeAction = 'proof-unavailable';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey
         ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
@@ -1710,9 +1723,13 @@ export class Migration {
     } else if (preCommitRollbackIntent) {
       resumeAction = 'before commit: roll back staging (native untouched)';
     } else if (state === 'VALIDATED' && ownerStaging && this.readStagingOwnerFile() !== null) {
-      resumeAction = 'rehearsal succeeded; complete commit';
+      resumeAction = this.kind === 'pool' && detail.poolV2PublicationStarted !== true && !poolV2Owner
+        ? 'proof-unavailable'
+        : 'rehearsal succeeded; complete commit';
     } else if (state === 'MIRRORED' || ownerStaging) {
-      resumeAction = 'before commit: roll back staging (native untouched)';
+      resumeAction = this.kind === 'pool' && detail.poolV2PublicationStarted !== true && !poolV2Owner
+        ? 'proof-unavailable'
+        : 'before commit: roll back staging (native untouched)';
     } else {
       resumeAction = this.kind === 'single-grant' ? 'nothing to roll back' : 'noop';
     }
@@ -1879,7 +1896,10 @@ export class Migration {
     // document. Read before checking or mutating any migration artifact.
     if (this.kind === 'static-key') readPiOwnerProviders(this.ownerMapPath);
     const current = this.status();
-    if (this.kind === 'pool') return this.commitPoolV2(current);
+    if (this.kind === 'pool') {
+      if (this.poolForwardBlocked(current, false)) throw this.poolProofUnavailable();
+      return this.commitPoolV2(current);
+    }
     if (this.ownerEntryPresent()) {
       this.assertCommittedOwnerFileRevalidated();
       this.completeSingleGrantClaimForward(current);
@@ -2072,6 +2092,7 @@ export class Migration {
       return this.continueRollback();
     }
     this.assertNoOrphanOwnershipClaim();
+    if (this.kind === 'pool' && this.poolForwardBlocked(current, true)) throw this.poolProofUnavailable();
     // P7b8 resumes only the Anthropic pool's v2 publication window, or the
     // explicit QLB_OWNED v1-to-v2 conversion. Other ownership claims keep
     // their existing forward-recovery path.

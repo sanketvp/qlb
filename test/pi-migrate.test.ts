@@ -9,7 +9,7 @@ import { MacosKeychainBackend, markFakeExecutor, MockKeychain, NativeOpenRouterK
 import { openStore } from '../src/store';
 import { ADAPTER_ACCOUNT_IDS, Migration, PI_POOL_STORE } from '../src/migration';
 import { sharedSingleGrantCoords } from '../src/single-grant-ownership';
-import { piAuthBackupPath } from '../src/pi-auth-backup';
+import { piAuthBackupPath, writePiAuthBackup } from '../src/pi-auth-backup';
 import { exitCodeForError, runExecutingCommand } from '../src/app';
 import { executePiRollback } from '../src/commands/pi-rollback';
 import {
@@ -210,11 +210,15 @@ describe('Pi migration S58 credential-first barrier', () => {
       h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
 
       const originalAuth = readFileSync(h.paths.authJsonPath);
+      writePiAuthBackup(h.paths.authJsonPath, 'anthropic', '6809dd58-5c4b-44fa-abfe-93df5da1794f');
+      const published = JSON.parse(originalAuth.toString()) as { anthropic: unknown };
+      published.anthropic = { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 };
+      writeFileSync(h.paths.authJsonPath, JSON.stringify(published, null, 2) + '\n', { mode: 0o600 });
+      writeFileSync(h.paths.ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }) + '\n', { mode: 0o600 });
       const pool = new Migration(h.store, h.keychain, h.paths.poolFilePath, h.paths.ownerPath, undefined, {
         authJsonPath: h.paths.authJsonPath,
         allowPoolLegacyConversion: true,
       });
-      pool.resume();
       const converted = JSON.parse(readFileSync(h.paths.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
       assert.equal(converted.providers.anthropic?.mode, 'qlb');
       assert.equal(placeholderPresent(h.paths, 'anthropic'), true);
