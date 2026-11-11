@@ -68,7 +68,7 @@ function safeIdentity(read: () => ReturnType<typeof liveIdentity>): ReturnType<t
   try { return read(); } catch { return null; }
 }
 
-function credentialParts(credentials: string): { token: string; expiresAt?: number } | null {
+export function credentialParts(credentials: string): { token: string; expiresAt?: number } | null {
   const oauth = parseCredentialBlob(credentials)?.oauth;
   if (!oauth || typeof oauth.accessToken !== 'string' || !oauth.accessToken) return null;
   const expiresAt = oauth.expiresAt;

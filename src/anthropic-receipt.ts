@@ -18,6 +18,10 @@ export const RECEIPT_PHASES = ['stage', 'rehearse', 'commit', 'failure'] as cons
 
 export type AnthropicReceiptPhase = (typeof RECEIPT_PHASES)[number];
 
+export function receiptPhaseList(): string {
+  return [...RECEIPT_PHASES, 'preflight'].join('|');
+}
+
 /** Codes this slice can put on a receipt. Later slices add the other fixed public codes. */
 export type AnthropicReceiptCode =
   | 'source-membership-invalid'
@@ -91,8 +95,8 @@ const BINDING_KEYS = ['version', 'cycle', 'stagedAt', 'memberCount', 'aliases', 
 const COMMITMENT_KEYS = ['version', 'memberCount', 'digest'];
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 
-export function isReceiptPhase(value: string | undefined): value is AnthropicReceiptPhase {
-  return !!value && (RECEIPT_PHASES as readonly string[]).includes(value);
+export function isReceiptPhase(value: string | undefined): value is AnthropicReceiptPhase | 'preflight' {
+  return value === 'preflight' || (!!value && (RECEIPT_PHASES as readonly string[]).includes(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
