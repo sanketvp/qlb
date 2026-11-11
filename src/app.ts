@@ -43,6 +43,7 @@ import {
   createSingleGrantMigration,
   createStaticKeyMigration,
   defaultOwnerFileFor,
+  anthropicPoolFetchTransport,
   defaultRehearseFn,
   isMigrateProvider,
   isSingleGrantProvider,
@@ -1721,7 +1722,10 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
         status = mig.stage();
         break;
       case 'rehearse':
-        status = await mig.rehearse(defaultRehearseFn);
+        status = await mig.rehearse(
+          defaultRehearseFn,
+          process.env.QLB_TEST_MODE === '1' ? undefined : anthropicPoolFetchTransport(),
+        );
         break;
       case 'commit':
         status = mig.commit();

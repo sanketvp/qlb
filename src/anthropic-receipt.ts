@@ -7,6 +7,7 @@ import {
   type AdmittedAnthropicPool,
   type AnthropicIdentityKind,
 } from './anthropic-complete-set';
+import { identityMismatchRefusal, identityProofBuckets } from './anthropic-rehearsal-proof';
 import { distinctAnthropicStageAccounts, stagingOwnerPath } from './migration';
 
 export const RECEIPT_SCHEMA_VERSION = 1;
@@ -16,7 +17,7 @@ export const RECEIPT_PHASES = ['stage', 'rehearse', 'commit', 'failure'] as cons
 export type AnthropicReceiptPhase = (typeof RECEIPT_PHASES)[number];
 
 /** Codes this slice can put on a receipt. Later slices add the other fixed public codes. */
-export type AnthropicReceiptCode = 'source-membership-invalid' | 'proof-unavailable';
+export type AnthropicReceiptCode = 'source-membership-invalid' | 'proof-unavailable' | 'identity-mismatch';
 
 /**
  * `proof-unavailable` is the no-forward plan's fixed code for a phase that
@@ -24,6 +25,11 @@ export type AnthropicReceiptCode = 'source-membership-invalid' | 'proof-unavaila
  * in the activation PR; this projection only reports the code.
  */
 export const ANTHROPIC_PROOF_UNAVAILABLE = 'proof-unavailable' as const;
+
+export interface ReceiptBuckets {
+  '5h': number;
+  '7d': number;
+}
 
 export type AnthropicReceipt =
   | {
@@ -33,6 +39,15 @@ export type AnthropicReceipt =
       membership: 'complete';
       count: number;
       aliases: string[];
+    }
+  | {
+      schemaVersion: 1;
+      phase: 'rehearse';
+      disposition: 'success';
+      membership: 'complete';
+      count: number;
+      aliases: string[];
+      buckets: ReceiptBuckets[];
     }
   | {
       schemaVersion: 1;
@@ -166,6 +181,26 @@ export function projectAnthropicReceipt(
   if (admission.invalid) {
     return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: 'source-membership-invalid' };
   }
+  if (phase === 'rehearse' && matched && journal) {
+    const buckets = identityProofBuckets(
+      isRecord(sources.journalDetail) ? sources.journalDetail.identityProof : null,
+      journal,
+    );
+    if (buckets) {
+      return {
+        schemaVersion: RECEIPT_SCHEMA_VERSION,
+        phase: 'rehearse',
+        disposition: 'success',
+        membership: 'complete',
+        count: journal.memberCount,
+        aliases: journal.aliases.slice(),
+        buckets,
+      };
+    }
+    if (identityMismatchRefusal(sources.journalDetail)) {
+      return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: 'identity-mismatch' };
+    }
+  }
   if (phase !== 'stage') {
     return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: ANTHROPIC_PROOF_UNAVAILABLE };
   }
@@ -180,12 +215,19 @@ export function anthropicReceiptBody(receipt: AnthropicReceipt): Record<string, 
     disposition: receipt.disposition,
   };
   if (receipt.disposition === 'refused') {
-    if (receipt.code === 'source-membership-invalid' || receipt.code === ANTHROPIC_PROOF_UNAVAILABLE) body.code = receipt.code;
+    if (
+      receipt.code === 'source-membership-invalid'
+      || receipt.code === ANTHROPIC_PROOF_UNAVAILABLE
+      || receipt.code === 'identity-mismatch'
+    ) body.code = receipt.code;
     return body;
   }
   body.membership = 'complete';
   body.count = receipt.count;
   body.aliases = receipt.aliases.map((alias) => alias);
+  if (receipt.phase === 'rehearse') {
+    body.buckets = receipt.buckets.map((bucket) => ({ '5h': bucket['5h'], '7d': bucket['7d'] }));
+  }
   return body;
 }
 
@@ -201,6 +243,13 @@ export function formatAnthropicReceipt(receipt: AnthropicReceipt, json: boolean)
   if (body.membership === 'complete') lines.push('membership: complete');
   if (typeof body.count === 'number') lines.push(`count: ${body.count}`);
   if (Array.isArray(body.aliases)) lines.push(`aliases: ${body.aliases.join(',')}`);
+  if (Array.isArray(body.buckets)) {
+    const rendered = body.buckets.map((entry) => {
+      const bucket = entry as ReceiptBuckets;
+      return `5h=${bucket['5h']},7d=${bucket['7d']}`;
+    });
+    lines.push(`buckets: ${rendered.join(';')}`);
+  }
   return lines.join('\n');
 }
 

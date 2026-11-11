@@ -32,6 +32,7 @@ import { canonicalDigest, keychainDigest, restoreRecordFor } from '../src/pi-han
 import { bindDetectAndResync } from '../src/native-resync';
 import { hasLegacyPiOwnerEntry, isPiPlaceholder } from '../src/pi-migrate';
 import { openStore } from '../src/store';
+import { uuidPoolTransport } from './support/anthropic-pool-rehearse';
 
 const fs = require('node:fs') as typeof import('node:fs');
 
@@ -1875,7 +1876,13 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       const ownerPath = join(dir, 'qlb-owner.json');
       const store = openStore(join(dir, 'qlb.db'));
       const kc = new MockKeychain();
-      const mig = new Migration(store, kc, poolPath, ownerPath, undefined, { authJsonPath: join(dir, 'auth.json') });
+      const mig = new Migration(store, kc, poolPath, ownerPath, undefined, {
+        authJsonPath: join(dir, 'auth.json'),
+        anthropicPoolTransport: uuidPoolTransport([{
+          access: 'pool-access-fake',
+          uuid: '00000000-0000-4000-8000-0000000000e1',
+        }]),
+      });
       writeFileSync(poolPath, JSON.stringify({
         version: 1,
         accounts: [{

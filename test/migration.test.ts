@@ -23,6 +23,7 @@ import {
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
 import { openStore } from '../src/store';
+import { uuidPoolTransport } from './support/anthropic-pool-rehearse';
 
 const FIXTURE_ACCOUNTS = [
   {
@@ -119,6 +120,7 @@ interface Harness {
   store: ReturnType<typeof openStore>;
   kc: MockKeychain;
   mig: Migration;
+  rehearseLog: string[];
   cleanup: () => void;
 }
 
@@ -153,7 +155,14 @@ function setup(): Harness {
   const originalBytes = readFileSync(poolPath);
   const store = openStore(join(dir, 'qlb.db'));
   const kc = new MockKeychain();
-  const mig = new Migration(store, kc, poolPath, ownerPath, undefined, { authJsonPath: authPath });
+  const rehearseLog: string[] = [];
+  const mig = new Migration(store, kc, poolPath, ownerPath, undefined, {
+    authJsonPath: authPath,
+    anthropicPoolTransport: uuidPoolTransport(
+      FIXTURE_ACCOUNTS.map((account) => ({ access: account.credentials.access, uuid: account.accountUuid })),
+      rehearseLog,
+    ),
+  });
   return {
     dir,
     poolPath,
@@ -163,6 +172,7 @@ function setup(): Harness {
     store,
     kc,
     mig,
+    rehearseLog,
     cleanup: () => {
       try {
         store.close();
@@ -191,10 +201,14 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const rehearseCalls: StagedAccount[] = [];
       const rehearsed = await h.mig.rehearse(mockRehearse(rehearseCalls));
       assert.equal(rehearsed.state, 'VALIDATED');
-      assert.equal(rehearseCalls.length, 2);
-      assert.equal(rehearseCalls[0]?.grant.access, 'sk-ant-oat-fake-a');
-      assert.equal(rehearseCalls[1]?.grant.access, 'sk-ant-oat-fake-b');
-      // Migration.rehearse has no refresh hook — staged tokens are used as-is.
+      assert.deepEqual(rehearseCalls, [], 'pool rehearsal does not use the per-account rehearse hook');
+      assert.deepEqual(h.rehearseLog, [
+        'profile:sk-ant-oat-fake-a',
+        'usage:sk-ant-oat-fake-a',
+        'profile:sk-ant-oat-fake-b',
+        'usage:sk-ant-oat-fake-b',
+      ]);
+      // Profile then usage, once each. The transport has no refresh hook.
       assert.deepEqual(readFileSync(h.poolPath), before, 'rehearse must not touch native');
       assertSafety(h.poolPath, h.kc);
 
