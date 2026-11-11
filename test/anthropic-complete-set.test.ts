@@ -144,10 +144,26 @@ function assertUntouched(ctx: {
   }
 }
 
+const STAGE_WITNESS = {
+  minimal: 'n1BGi3Q0XTct2IOb9D-m1Vwxp0UsODqXIp5Lbq28n3g',
+  two: 'Zmm75qtpTYlQ3V0Whq3i7yV8HHAUsefer_1a14HC_tY',
+  reordered: '60ZEM2FP77_v03ibQoNFDDgT5iUA6KsgUPrUL6ndDEA',
+  max: 'j3zBI0XZ8VmRxqAQQP_WMNXktg-6C3bpfZ3OtUQh4Ug',
+  rollback: 'GbVskH-bHchv3WLF-87vgksQkQS0IZA8fCGZNu-hWas',
+} as const;
+
+function storedDetail(store: Store): Record<string, unknown> {
+  return JSON.parse(store.getMigration(PI_POOL_STORE)?.detail_json ?? 'null') as Record<string, unknown>;
+}
+
 function storedBinding(store: Store): NonNullable<OwnerFile['binding']> {
-  const parsed = JSON.parse(store.getMigration(PI_POOL_STORE)?.detail_json ?? 'null') as { binding?: OwnerFile['binding'] };
-  if (!parsed?.binding?.completeSetCommitment) throw new Error('stored binding missing');
-  return parsed.binding;
+  const binding = storedDetail(store).binding as OwnerFile['binding'];
+  if (!binding?.completeSetCommitment) throw new Error('stored binding missing');
+  return binding;
+}
+
+function assertWitness(store: Store, digest: string): void {
+  assert.deepEqual(storedDetail(store).sourceWitness, { version: 1, algorithm: 'sha256', digest });
 }
 
 function assertRejected(raw: string, leaked?: { id: string; label: string }): void {
@@ -284,7 +300,14 @@ describe('anthropic complete-set binding', () => {
       assert.deepEqual(binding?.aliases, ['member-0001', 'member-0002']);
       assert.deepEqual(binding?.identityKinds, ['email', 'accountUuid']);
       assert.deepEqual(binding?.completeSetCommitment, { version: 1, memberCount: 2, digest: VECTORS[1]!.digest });
+      assertWitness(ctx.store, STAGE_WITNESS.two);
       assert.equal('sourceWitness' in detail, false);
+      assert.equal(JSON.stringify(status).includes(STAGE_WITNESS.two), false);
+      assert.equal(JSON.stringify(staged).includes('sourceWitness'), false);
+      assert.equal(JSON.stringify(staged).includes(STAGE_WITNESS.two), false);
+      const journal = ctx.store.getMigration(PI_POOL_STORE)?.detail_json ?? '';
+      assert.equal(journal.includes('distinct-access-token'), false);
+      assert.equal(journal.includes('distinct-refresh-token'), false);
       assert.deepEqual(detail.qlbAccountIds, ['id-a', 'id-b']);
       assert.deepEqual(staged.qlbAccountIds, ['id-a', 'id-b']);
       assert.equal(staged.accounts[0]?.label, 'a');
@@ -299,16 +322,20 @@ describe('anthropic complete-set binding', () => {
       assert.deepEqual(binding?.aliases, ['member-0001', 'member-0002']);
       assert.deepEqual(binding?.identityKinds, ['accountUuid', 'email']);
       assert.equal(binding?.completeSetCommitment.digest, VECTORS[2]!.digest);
+      assertWitness(ctx.store, STAGE_WITNESS.reordered);
       assert.notEqual(binding?.completeSetCommitment.digest, firstDigest);
     });
     withPool(pool([emailMember('a', 0)]), (ctx) => {
       ctx.mig.stage();
       assert.equal(storedBinding(ctx.store).completeSetCommitment.digest, VECTORS[0]!.digest);
+      assertWitness(ctx.store, STAGE_WITNESS.minimal);
       assert.equal(JSON.stringify(ctx.mig.status()).includes(VECTORS[0]!.digest), false);
+      assert.equal(JSON.stringify(ctx.mig.status()).includes(STAGE_WITNESS.minimal), false);
     });
     withPool(pool([emailMember('a', MAX_EXPIRY)]), (ctx) => {
       ctx.mig.stage();
       assert.equal(storedBinding(ctx.store).completeSetCommitment.digest, VECTORS[3]!.digest);
+      assertWitness(ctx.store, STAGE_WITNESS.max);
     });
   });
 
@@ -323,13 +350,18 @@ describe('anthropic complete-set binding', () => {
     withPool(pool([emailMember('a@example.com', 0, { id: 'acct-a', name: 'A' })]), (ctx) => {
       const staged = ctx.mig.stage();
       assert.equal(typeof staged.detail.binding, 'object');
+      assertWitness(ctx.store, STAGE_WITNESS.rollback);
+      assert.equal('sourceWitness' in staged.detail, false);
       const rolled = ctx.mig.rollback();
       assert.equal(rolled.state, 'NATIVE');
       assert.equal(rolled.detail.rolledBackFrom, 'pre-commit');
       assert.equal(Object.hasOwn(rolled.detail, 'binding'), false);
+      assert.equal(Object.hasOwn(rolled.detail, 'sourceWitness'), false);
       assert.equal(existsSync(stagingOwnerPath(ctx.ownerPath)), false);
       const stored = JSON.parse(ctx.store.getMigration(PI_POOL_STORE)!.detail_json) as Record<string, unknown>;
       assert.equal(Object.hasOwn(stored, 'binding'), false);
+      assert.equal(Object.hasOwn(stored, 'sourceWitness'), false);
+      assert.equal(JSON.stringify(stored).includes(STAGE_WITNESS.rollback), false);
     });
   });
 });

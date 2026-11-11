@@ -313,6 +313,55 @@ describe('anthropic pool rehearsal', () => {
     }
   });
 
+  it('restage drops a stale refusal and proof without dropping the source witness', async () => {
+    const mismatchLog: string[] = [];
+    const refused = openPool(poolText([emailMember(TOKEN_A)]), scripted([
+      { op: 'profile', body: { account: { uuid: UUID_A, email: OTHER_EMAIL } } },
+    ], mismatchLog));
+    try {
+      const error = await rehearseError(refused);
+      assert.equal(error.message, 'identity-mismatch');
+      const stale = detail(refused);
+      assert.deepEqual(stale.rehearseRefusal, { code: 'identity-mismatch' });
+      const witness = stale.sourceWitness;
+      assert.equal(typeof (witness as { digest?: unknown }).digest, 'string');
+      refused.mig.stage();
+      const restaged = detail(refused);
+      assert.equal(refused.mig.status().state, 'MIRRORED');
+      assert.equal(Object.hasOwn(restaged, 'rehearseRefusal'), false);
+      assert.equal(Object.hasOwn(restaged, 'identityProof'), false);
+      assert.deepEqual(restaged.sourceWitness, witness);
+      const receipt = projectAnthropicReceipt('rehearse', readAnthropicReceiptSources(
+        refused.poolPath,
+        refused.ownerPath,
+        refused.store.getMigration(PI_POOL_STORE)?.detail_json,
+      ));
+      assert.equal(receipt.disposition === 'refused' && receipt.code, 'proof-unavailable');
+    } finally {
+      refused.close();
+    }
+
+    const proofLog: string[] = [];
+    const proved = openPool(poolText([emailMember(TOKEN_A)]), scripted([
+      { op: 'profile', body: { account: { uuid: UUID_A, email: EMAIL } } },
+      { op: 'usage', body: usage() },
+    ], proofLog));
+    try {
+      const witness = detail(proved).sourceWitness;
+      const rehearsed = await proved.mig.rehearse(async () => { throw new Error('rehearse hook must not run'); });
+      assert.equal(rehearsed.state, 'VALIDATED');
+      assert.deepEqual(detail(proved).sourceWitness, witness);
+      assert.equal(Object.hasOwn(detail(proved), 'identityProof'), true);
+      proved.mig.stage();
+      const restaged = detail(proved);
+      assert.equal(Object.hasOwn(restaged, 'identityProof'), false);
+      assert.equal(Object.hasOwn(restaged, 'rehearseRefusal'), false);
+      assert.deepEqual(restaged.sourceWitness, witness);
+    } finally {
+      proved.close();
+    }
+  });
+
   it('refuses an expired staged grant before either request', async () => {
     const log: string[] = [];
     const pool = openPool(
