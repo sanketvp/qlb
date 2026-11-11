@@ -23,6 +23,7 @@ import {
 } from '../src/migration';
 import { parseGrant } from '../src/refresh-lease';
 import { openStore } from '../src/store';
+import { seedActiveSlots } from './support/adoption-slots';
 import { uuidPoolTransport } from './support/anthropic-pool-rehearse';
 
 const FIXTURE_ACCOUNTS = [
@@ -160,8 +161,14 @@ function setup(): Harness {
   const store = openStore(join(dir, 'qlb.db'));
   const kc = new MockKeychain();
   const rehearseLog: string[] = [];
+  seedActiveSlots(
+    store,
+    FIXTURE_ACCOUNTS.map((account) => ({ accountId: account.accountUuid })),
+    FIXTURE_ACCOUNTS[0]!.accountUuid,
+  );
   const mig = new Migration(store, kc, poolPath, ownerPath, undefined, {
     authJsonPath: authPath,
+    initialActiveAlias: 'member-0001',
     anthropicPoolTransport: uuidPoolTransport(
       FIXTURE_ACCOUNTS.map((account) => ({ access: account.credentials.access, uuid: account.accountUuid })),
       rehearseLog,

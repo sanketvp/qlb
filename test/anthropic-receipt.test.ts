@@ -83,7 +83,7 @@ function assertAllowlisted(value: unknown): void {
   assert.equal(typeof value, 'object');
   assert.ok(value);
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    assert.match(key, /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets)$/);
+    assert.match(key, /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets|adoption|initialActive)$/);
     if (key === 'aliases') assertAllowlisted(item);
     else if (key === 'buckets') {
       assert.ok(Array.isArray(item));
@@ -341,7 +341,16 @@ describe('anthropic migration receipt', () => {
           buckets: index === 0 ? { '5h': 11, '7d': 22 } : { '5h': 33, '7d': 44 },
         })),
       };
-      ctx.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', JSON.stringify({ ...detail, identityProof: proof }));
+      const adoptionBinding = {
+        version: 1,
+        cycle: binding.cycle,
+        members: binding.aliases.map((alias, index) => ({
+          alias,
+          slotAccountId: index === 0 ? EMAIL_ID : UUID,
+        })),
+        initialActiveAlias: 'member-0001',
+      };
+      ctx.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', JSON.stringify({ ...detail, identityProof: proof, adoptionBinding }));
       const success = receiptTexts(ctx, 'rehearse');
       assert.deepEqual(success.body, {
         schemaVersion: 1,
@@ -351,6 +360,8 @@ describe('anthropic migration receipt', () => {
         count: 2,
         aliases: ['member-0001', 'member-0002'],
         buckets: [{ '5h': 11, '7d': 22 }, { '5h': 33, '7d': 44 }],
+        adoption: 'verified',
+        initialActive: 'member-0001',
       });
       assertAllowlisted(success.body);
       assert.equal(success.human.includes('buckets: 5h=11,7d=22;5h=33,7d=44'), true);

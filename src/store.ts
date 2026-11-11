@@ -3416,6 +3416,19 @@ export class Store {
       .all() as unknown as AnthropicSlotLineageRow[];
   }
 
+  /** Every Claude slot row, including dead and archived, for adoption matching. */
+  listClaudeAdoptionSlots(): Array<{ accountId: string; email: string | null; dead: boolean; archivedAt: number | null }> {
+    const rows = this.db.prepare(
+      'SELECT account_id, email, dead, archived_at FROM claude_slots ORDER BY account_id',
+    ).all() as Array<{ account_id: string; email: string | null; dead: number; archived_at: number | null }>;
+    return rows.map((row) => ({
+      accountId: row.account_id,
+      email: row.email,
+      dead: row.dead !== 0,
+      archivedAt: row.archived_at,
+    }));
+  }
+
   /**
    * Return each active slot's connected lineage component.  The graph is
    * deliberately traversed by recorded edges rather than by hash ordering:
