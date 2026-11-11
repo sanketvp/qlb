@@ -125,6 +125,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
   admitAnthropicCompleteSet,
+  SourceMembershipInvalidError,
   type AdmittedAnthropicMember,
   type AnthropicStageBinding,
 } from './anthropic-complete-set';
@@ -613,6 +614,14 @@ function stagedPoolAccount(member: AdmittedAnthropicMember): {
     grant,
     fingerprint: fingerprintRefresh(grant.refresh),
   };
+}
+
+function assertDistinctStagedAccountIds(accounts: Array<{ id: string }>): void {
+  const seen = new Set<string>();
+  for (const account of accounts) {
+    if (seen.has(account.id)) throw new SourceMembershipInvalidError();
+    seen.add(account.id);
+  }
 }
 
 export function parsePoolFile(raw: string): {
@@ -1831,6 +1840,7 @@ export class Migration {
     const stagedAt = Date.now();
     const authBackupCycle = randomUUID();
     const accounts = admitted.members.map((member) => stagedPoolAccount(member));
+    assertDistinctStagedAccountIds(accounts);
     const binding: AnthropicStageBinding = {
       version: 1,
       cycle: authBackupCycle,
@@ -2833,6 +2843,7 @@ export class Migration {
     if (authKey !== undefined) this.removeCurrentCycleAuthBackup(authKey);
     this.journal('NATIVE', {
       intent: undefined,
+      binding: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',
     });

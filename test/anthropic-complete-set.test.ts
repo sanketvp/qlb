@@ -301,4 +301,25 @@ describe('anthropic complete-set binding', () => {
       assert.equal(binding.completeSetCommitment.digest, VECTORS[3]!.digest);
     });
   });
+
+  it('rejects two eligible members that derive the same account id before any write', () => {
+    assertRejected(pool([
+      { email: 'same@example.com', name: 'One', credentials: oauth(0) },
+      uuidMember('11111111-1111-4111-8111-111111111111', 1, { id: 'same@example.com', name: 'Two' }),
+    ]), { id: 'same@example.com', label: 'same@example.com' });
+  });
+
+  it('removes binding from the journal when a staged pool is rolled back', () => {
+    withPool(pool([emailMember('a@example.com', 0, { id: 'acct-a', name: 'A' })]), (ctx) => {
+      const staged = ctx.mig.stage();
+      assert.equal(typeof staged.detail.binding, 'object');
+      const rolled = ctx.mig.rollback();
+      assert.equal(rolled.state, 'NATIVE');
+      assert.equal(rolled.detail.rolledBackFrom, 'pre-commit');
+      assert.equal(Object.hasOwn(rolled.detail, 'binding'), false);
+      assert.equal(existsSync(stagingOwnerPath(ctx.ownerPath)), false);
+      const stored = JSON.parse(ctx.store.getMigration(PI_POOL_STORE)!.detail_json) as Record<string, unknown>;
+      assert.equal(Object.hasOwn(stored, 'binding'), false);
+    });
+  });
 });
