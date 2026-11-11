@@ -20,8 +20,10 @@ import {
   isReceiptPhase,
   projectAnthropicReceipt,
   readAnthropicReceiptSources,
+  receiptPhaseList,
   type AnthropicReceiptPhase,
 } from './anthropic-receipt';
+import { formatAnthropicPreflight, runAnthropicPreflight } from './anthropic-preflight';
 import { loginExpiresAtIso } from './anthropic-oauth';
 import { qlbOwnsAnthropicUsage } from './anthropic-usage-view';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
@@ -135,7 +137,7 @@ const USAGE = `Usage:
   qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
-  qlb migrate receipt  --provider anthropic --phase stage|rehearse|commit|failure [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
+  qlb migrate receipt  --provider anthropic --phase stage|rehearse|commit|failure|preflight [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
   qlb retire native status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire native execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
   qlb accounts prune --account <id> --confirm [--json] [--db <path>]
@@ -258,7 +260,7 @@ type MigrateOpts = {
   protectedPiAuthJsonPath: string;
   db?: string;
   confirmRealCutover: boolean;
-  phase?: AnthropicReceiptPhase;
+  phase?: AnthropicReceiptPhase | 'preflight';
 };
 type PolicySetOpts = {
   cmd: 'policy';
@@ -467,7 +469,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
       process.exit(1);
     }
     if (!isReceiptPhase(phaseRaw)) {
-      console.error('qlb migrate receipt: --phase must be stage|rehearse|commit|failure');
+      console.error(`qlb migrate receipt: --phase must be ${receiptPhaseList()}`);
       process.exit(1);
     }
   } else if (phaseRaw !== undefined) {
@@ -1610,6 +1612,25 @@ async function runWhy(opts: WhyOpts): Promise<number> {
   return 0;
 }
 
+async function printAnthropicPreflight(opts: MigrateOpts): Promise<number> {
+  if (process.env.QLB_TEST_MODE === '1') {
+    console.error('qlb migrate receipt: preflight-credentials-unavailable');
+    return 1;
+  }
+  try {
+    const receipt = await runAnthropicPreflight({
+      dbPath: opts.db ?? config.dbPath,
+      poolFile: opts.poolFile,
+      backend: platformKeychain,
+    });
+    console.log(formatAnthropicPreflight(receipt, opts.json));
+    return receipt.disposition === 'go' ? 0 : 1;
+  } catch {
+    console.error('qlb migrate receipt: preflight-failed');
+    return 1;
+  }
+}
+
 function printMigrate(status: ReturnType<Migration['status']>, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(status, null, 2));
@@ -1658,6 +1679,9 @@ const FORWARD_MIGRATE_SUBS = new Set(['stage', 'rehearse', 'commit', 'resume']);
 
 async function runMigrate(opts: MigrateOpts): Promise<number> {
   const paths = prepareMigratePathAdmission(opts);
+  if (opts.phase === 'preflight') {
+    return printAnthropicPreflight(opts);
+  }
   let store: Store;
   let opened = false;
   if (opts.db) {
@@ -1685,7 +1709,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     if (opts.sub === 'receipt') {
       const phase = opts.phase;
       if (opts.provider !== 'anthropic' || phase === undefined) {
-        console.error('qlb migrate receipt: --provider must be anthropic and --phase must be stage|rehearse|commit|failure');
+        console.error(`qlb migrate receipt: --provider must be anthropic and --phase must be ${receiptPhaseList()}`);
         return 1;
       }
       const receipt = projectAnthropicReceipt(phase, readAnthropicReceiptSources(

@@ -464,7 +464,7 @@ describe('qlb migrate receipt command', () => {
     assert.equal(human.stdout.includes('membership: complete'), true);
     assert.equal(missingPhase.status, 1);
     assert.equal(missingPhase.stdout, '');
-    assert.match(missingPhase.stderr, /--phase must be stage\|rehearse\|commit\|failure/);
+    assert.match(missingPhase.stderr, /--phase must be stage\|rehearse\|commit\|failure\|preflight/);
     assert.equal(otherProvider.status, 1);
     assert.equal(otherProvider.stdout, '');
     assert.match(otherProvider.stderr, /--provider must be anthropic/);
