@@ -591,7 +591,13 @@ Anthropic-only read-only receipt, and the only operational migration receipt:
 $ qlb migrate receipt --provider anthropic --phase stage --pool-file /tmp/demo/anthropic-pool.json --owner-file /tmp/demo/qlb-owner.json --db /tmp/demo/qlb.db --json
 ```
 
-`--phase` is `stage`, `rehearse`, `commit`, or `failure`. The command reads the pool file, the migration journal, and the staging owner file. It does not stage, rehearse, commit, resume, roll back, write a Keychain item, or call a provider. It does not take `--confirm-real-cutover` because it does not mutate.
+`--phase` is `stage`, `rehearse`, `commit`, `failure`, `preflight`, or `smoke`. The command reads the pool file, the migration journal, and the staging owner file. It does not stage, rehearse, commit, resume, roll back, write a Keychain item, or call a provider. It does not take `--confirm-real-cutover` because it does not mutate.
+
+`preflight` is read-only. It opens SQLite read-only, classifies each pool member against existing Claude slots (`matched`, `missing`, `ambiguous`, `dead-or-archived`) and expiry (`fresh`, `under-2h`, `expired`, `none`), and prints `disposition: "go"` or `"no-go"`. Email matching is exact. Ambiguity in either direction is `adoption-ambiguous`. It also prints `claudeCodeActiveToken` as `fresh`, `expiring`, `expired`, `expiry-unknown`, or `unreadable` from one in-process read of the live Claude Code credential. The receipt contains the class only, never the token, its expiry, or the account.
+
+`qlb migrate rehearse --provider anthropic --initial-active member-000N` requires that alias to be the current Anthropic active login. R1b does not write `active_login`. An expired staged access token is the fixed code `token-expired`. A successful rehearse receipt adds `adoption: "verified"` and `initialActive`.
+
+`smoke` prints `servedAlias`, `matchesInitialActive`, and `servedAfterCommit` for the account last served by `qlb gate anthropic --no-refresh`. It does not print the account id. `--no-refresh` fails closed with `smoke-token-expired` or `smoke-token-expiry-unknown` and does not refresh or retry.
 
 The printed object is built from an allowlist: `schemaVersion`, `phase`, `disposition` (`success` or `refused`), and, when one applies, `code`, `membership`, `count`, `aliases`, and `buckets`. A stage receipt has `disposition: "success"` only when the journal binding and the staging binding are both readable and equal and the current pool file still admits to that same binding. The success object is:
 
