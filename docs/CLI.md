@@ -581,7 +581,7 @@ resume:    noop
 }
 ```
 
-`qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt.
+`qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt. Status omits `completeSetCommitment` (including its digest). That commitment stays in the private journal and staging file. Diagnostic `detail` can still show staged account labels; the receipt does not.
 
 ### `qlb migrate receipt`
 

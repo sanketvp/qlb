@@ -683,6 +683,15 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Status is diagnostic. The private complete-set commitment stays in the journal and staging file. */
+function detailForStatus(detail: Record<string, unknown>): Record<string, unknown> {
+  const binding = detail.binding;
+  if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return detail;
+  const redacted = { ...binding };
+  delete redacted.completeSetCommitment;
+  return { ...detail, binding: redacted };
+}
+
 /** Bridge the shared Pi-gate document validator to migration's legacy v1 payload. */
 function validatedMigrationOwnerFile(value: unknown): OwnerFile | null {
   try {
@@ -1783,7 +1792,7 @@ export class Migration {
       nativeStore,
       piAtNextLaunch,
       resumeAction,
-      detail,
+      detail: detailForStatus(detail),
       handback,
       nativeStrategy: this.strategy(),
       provider: this.provider,

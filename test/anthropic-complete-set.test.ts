@@ -144,6 +144,12 @@ function assertUntouched(ctx: {
   }
 }
 
+function storedBinding(store: Store): NonNullable<OwnerFile['binding']> {
+  const parsed = JSON.parse(store.getMigration(PI_POOL_STORE)?.detail_json ?? 'null') as { binding?: OwnerFile['binding'] };
+  if (!parsed?.binding?.completeSetCommitment) throw new Error('stored binding missing');
+  return parsed.binding;
+}
+
 function assertRejected(raw: string, leaked?: { id: string; label: string }): void {
   withPool(raw, (ctx) => {
     assert.throws(() => ctx.mig.stage(), (error: unknown) => error instanceof SourceMembershipInvalidError
@@ -265,9 +271,11 @@ describe('anthropic complete-set binding', () => {
     withPool(multiple, (ctx) => {
       const status = ctx.mig.stage();
       const detail = status.detail;
-      const binding = detail.binding as OwnerFile['binding'];
+      const binding = storedBinding(ctx.store);
       const staged = JSON.parse(readFileSync(stagingOwnerPath(ctx.ownerPath), 'utf8')) as OwnerFile;
       assert.deepEqual(staged.binding, binding);
+      assert.equal(JSON.stringify(status).includes(binding.completeSetCommitment.digest), false);
+      assert.equal(JSON.stringify(status).includes('completeSetCommitment'), false);
       assert.equal(binding?.version, 1);
       assert.equal(binding?.cycle, detail.authBackupCycle);
       assert.equal(binding?.stagedAt, detail.stagedAt);
@@ -286,19 +294,21 @@ describe('anthropic complete-set binding', () => {
       assert.equal(existsSync(`${ctx.authPath}.lock`), false);
     });
     withPool(reordered, (ctx) => {
-      const binding = ctx.mig.stage().detail.binding as OwnerFile['binding'];
+      ctx.mig.stage();
+      const binding = storedBinding(ctx.store);
       assert.deepEqual(binding?.aliases, ['member-0001', 'member-0002']);
       assert.deepEqual(binding?.identityKinds, ['accountUuid', 'email']);
       assert.equal(binding?.completeSetCommitment.digest, VECTORS[2]!.digest);
       assert.notEqual(binding?.completeSetCommitment.digest, firstDigest);
     });
     withPool(pool([emailMember('a', 0)]), (ctx) => {
-      const binding = ctx.mig.stage().detail.binding as { completeSetCommitment: { digest: string } };
-      assert.equal(binding.completeSetCommitment.digest, VECTORS[0]!.digest);
+      ctx.mig.stage();
+      assert.equal(storedBinding(ctx.store).completeSetCommitment.digest, VECTORS[0]!.digest);
+      assert.equal(JSON.stringify(ctx.mig.status()).includes(VECTORS[0]!.digest), false);
     });
     withPool(pool([emailMember('a', MAX_EXPIRY)]), (ctx) => {
-      const binding = ctx.mig.stage().detail.binding as { completeSetCommitment: { digest: string } };
-      assert.equal(binding.completeSetCommitment.digest, VECTORS[3]!.digest);
+      ctx.mig.stage();
+      assert.equal(storedBinding(ctx.store).completeSetCommitment.digest, VECTORS[3]!.digest);
     });
   });
 

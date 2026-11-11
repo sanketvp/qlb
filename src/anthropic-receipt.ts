@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
   admitAnthropicCompleteSet,
   memberAlias,
@@ -227,6 +228,6 @@ export function readAnthropicReceiptSources(
   return {
     poolText: readUtf8(poolFile),
     journalDetail: parseJson(journalDetailJson),
-    stagingDocument: parseJson(readUtf8(stagingOwnerPath(ownerFile))),
+    stagingDocument: parseJson(readUtf8(stagingOwnerPath(join(dirname(ownerFile), 'qlb-owner.json')))),
   };
 }

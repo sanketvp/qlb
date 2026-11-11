@@ -273,11 +273,14 @@ describe('anthropic migration receipt', () => {
       }
       const status = ctx.mig.status();
       const statusJson = JSON.stringify(status);
-      const digest = (status.detail.binding as { completeSetCommitment: { digest: string } }).completeSetCommitment.digest;
+      const digest = (JSON.parse(ctx.store.getMigration(PI_POOL_STORE)?.detail_json ?? '{}') as {
+        binding: { completeSetCommitment: { digest: string } };
+      }).binding.completeSetCommitment.digest;
       assert.equal(typeof status.resumeAction, 'string');
       assert.equal(statusJson.includes('"disposition"'), false);
       assert.equal(statusJson.includes(EMAIL), true);
-      assert.equal(statusJson.includes(digest), true);
+      assert.equal(statusJson.includes(digest), false);
+      assert.equal(statusJson.includes('completeSetCommitment'), false);
       assert.equal(receiptTexts(ctx, 'stage').json.includes(EMAIL), false);
       assert.equal(receiptTexts(ctx, 'stage').json.includes(digest), false);
     });
@@ -367,7 +370,10 @@ describe('qlb migrate receipt command', () => {
     const statusBody = JSON.parse(status.stdout) as Record<string, unknown>;
     assert.equal(typeof statusBody.resumeAction, 'string');
     assert.equal('disposition' in statusBody, false);
+    const digest = (JSON.parse(journal) as { binding: { completeSetCommitment: { digest: string } } }).binding.completeSetCommitment.digest;
     assert.equal(JSON.stringify(statusBody).includes(EMAIL), true);
+    assert.equal(status.stdout.includes(digest), false);
+    assert.equal(status.stdout.includes('completeSetCommitment'), false);
     assert.equal(json.stdout.includes(EMAIL), false);
     const reopened = openStore(dbPath);
     try {
@@ -378,6 +384,39 @@ describe('qlb migrate receipt command', () => {
     assert.deepEqual(readFileSync(stagingOwnerPath(ownerPath)), staging);
     const added = filesUnder(root).filter((path) => !before.includes(path) && !path.endsWith('-wal') && !path.endsWith('-shm'));
     assert.deepEqual(added, []);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads the staging file stage writes when --owner-file is not qlb-owner.json', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-r1a-receipt-owner-'));
+    const poolPath = join(root, 'anthropic-pool.json');
+    const ownerPath = join(root, 'custom', 'not-the-map.json');
+    const dbPath = join(root, 'qlb.db');
+    mkdirSync(join(root, 'custom'), { recursive: true });
+    writeFileSync(poolPath, pool([emailMember()]), { mode: 0o600 });
+    const store = openStore(dbPath);
+    new Migration(store, new MockKeychain(), poolPath, ownerPath, undefined, { authJsonPath: join(root, 'auth.json') }).stage();
+    store.close();
+    const mapStaging = join(root, 'custom', 'qlb-owner.json.staging');
+    assert.equal(existsSync(mapStaging), true);
+    assert.equal(existsSync(`${ownerPath}.staging`), false);
+    const result = runCli(
+      ['migrate', 'receipt', '--phase', 'stage', '--json', '--pool-file', poolPath, '--owner-file', ownerPath, '--db', dbPath],
+      {
+        ...process.env,
+        QLB_TEST_MODE: '1',
+        QLB_HOME: root,
+        HOME: root,
+        QLB_DB_PATH: dbPath,
+        QLB_CONFIG_PATH: join(root, 'config.json'),
+        QLB_PI_AUTH_JSON_PATH: join(root, 'auth.json'),
+        QLB_ANTHROPIC_POOL_PATH: join(root, 'missing-pool.json'),
+        QLB_PLUGINS_DIR: join(root, 'plugins'),
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal((JSON.parse(result.stdout) as { disposition: string }).disposition, 'success');
+    assert.equal(existsSync(`${ownerPath}.staging`), false);
     rmSync(root, { recursive: true, force: true });
   });
 });
