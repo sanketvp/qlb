@@ -581,7 +581,7 @@ resume:    noop
 }
 ```
 
-`qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt. Status omits `completeSetCommitment` (including its digest). That commitment stays in the private journal and staging file. Diagnostic `detail` can still show staged account labels; the receipt does not.
+`qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt. Status omits `completeSetCommitment` (including its digest). That commitment stays in the private journal and staging file. Diagnostic `detail` can still show staged account labels, and after a successful Anthropic rehearsal it can show `identityProof` aliases and the fixed `5h` / `7d` readings. The receipt does not print labels, and status output is not publication authority.
 
 ### `qlb migrate receipt`
 
@@ -593,7 +593,7 @@ $ qlb migrate receipt --provider anthropic --phase stage --pool-file /tmp/demo/a
 
 `--phase` is `stage`, `rehearse`, `commit`, or `failure`. The command reads the pool file, the migration journal, and the staging owner file. It does not stage, rehearse, commit, resume, roll back, write a Keychain item, or call a provider. It does not take `--confirm-real-cutover` because it does not mutate.
 
-The printed object is built from an allowlist: `schemaVersion`, `phase`, `disposition` (`success` or `refused`), and, when one applies, `code`, `membership`, `count`, and `aliases`. A stage receipt has `disposition: "success"` only when the journal binding and the staging binding are both readable and equal and the current pool file still admits to that same binding. The success object is:
+The printed object is built from an allowlist: `schemaVersion`, `phase`, `disposition` (`success` or `refused`), and, when one applies, `code`, `membership`, `count`, `aliases`, and `buckets`. A stage receipt has `disposition: "success"` only when the journal binding and the staging binding are both readable and equal and the current pool file still admits to that same binding. The success object is:
 
 ```json
 {
@@ -606,9 +606,23 @@ The printed object is built from an allowlist: `schemaVersion`, `phase`, `dispos
 }
 ```
 
-Aliases are cycle-local labels (`member-0001`), not source identities. The receipt never includes a cycle id, commitment, witness, credential, token hash, email, account id, label, path, Keychain coordinate, provider payload, or raw error.
+Aliases are cycle-local labels (`member-0001`), not source identities. The receipt never includes a cycle id, commitment, witness, credential, token hash, email, account id, label, path, Keychain coordinate, provider payload, provider display name, or raw error.
 
-`code` is a fixed string. This slice emits `source-membership-invalid` when the pool membership is rejected, including when a restage fails and the previous recovery files are left in place. That refusal is not a success receipt. `rehearse`, `commit`, and `failure` do not succeed in this slice; when membership is not the reason, their code is `proof-unavailable`. A journal-only binding, a staging-only binding, or unequal bindings also cannot succeed. Exit `0` only for a success receipt. A refusal still prints the allowlisted JSON with `--json` and exits `1`.
+A rehearse receipt succeeds only when that same stage binding still matches and the journal holds a complete current-cycle identity proof. Success adds `buckets`, aligned with `aliases`. Each entry contains only the finite readings `5h` and `7d`:
+
+```json
+{
+  "schemaVersion": 1,
+  "phase": "rehearse",
+  "disposition": "success",
+  "membership": "complete",
+  "count": 1,
+  "aliases": ["member-0001"],
+  "buckets": [{ "5h": 1, "7d": 2 }]
+}
+```
+
+`code` is a fixed string. `source-membership-invalid` means the pool membership is rejected, including when a restage fails and the previous recovery files are left in place. `identity-mismatch` means rehearse refused because a profile did not match the admitted member. `proof-unavailable` is the rehearse refusal when that proof is absent for any other reason. `commit` and `failure` stay `proof-unavailable` and do not succeed. A rehearse success does not authorize publication. A journal-only binding, a staging-only binding, or unequal bindings also cannot succeed. Exit `0` only for a success receipt. A refusal still prints the allowlisted JSON with `--json` and exits `1`.
 
 Subcommands: `stage`, `rehearse`, `commit`, `rollback`, `resume`, `status`, `receipt`. Common flags: `[--provider anthropic|xai|kimi-coding|openai-codex|openrouter]`, `[--pool-file <path>]`, `[--owner-file <path>]`, `[--auth-json <path>]`, `[--target-dir <path>]`, `[--db <path>]`, `[--json]`.
 

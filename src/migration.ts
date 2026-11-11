@@ -39,7 +39,8 @@
 //     Owner file: .staging only. Native: intact. Journal: MIRRORED.
 //     Pi at next launch: NATIVE WORKS. status(): same as S2.
 //     resume(): same as S2 (rollback). Rehearse never refreshes; a failed
-//     rehearsal leaves native untouched. User re-runs stage/rehearse.
+//     rehearsal leaves native untouched. Anthropic pool proof is written only
+//     after every member succeeds, in one transaction. User re-runs stage/rehearse.
 //
 // C   Crash after the owner-file rename, before H1 (journal still VALIDATED
 //     or MIRRORED). Owner file: PRESENT. Native: intact (not yet renamed).
@@ -130,6 +131,14 @@ import {
   type AdmittedAnthropicMember,
   type AnthropicStageBinding,
 } from './anthropic-complete-set';
+import { buildProfileRequest, buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
+import {
+  assembleIdentityProof,
+  readProfileIdentity,
+  readUsageBuckets,
+  type AnthropicHttpResult,
+  type AnthropicPoolTransport,
+} from './anthropic-rehearsal-proof';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
 import { codexHeaderAccountId } from './codex-slots';
@@ -334,6 +343,11 @@ export interface MigrationConfig {
   sleepSync?: (ms: number) => void;
   /** S2 test seam for lease liveness and its bounded wait clock; defaults to Date.now. */
   now?: () => number;
+  /**
+   * Anthropic pool rehearsal transport. Tests supply a fake. Production uses
+   * `anthropicPoolFetchTransport` and must not pass a live transport from tests.
+   */
+  anthropicPoolTransport?: AnthropicPoolTransport;
   /** S3 test seam for rollback/resume's Pi auth-lock acquisition timing. */
   authLockTiming?: AuthLockTiming;
   /**
@@ -884,6 +898,28 @@ export async function defaultRehearseFn(
   }
 }
 
+async function anthropicGet(request: HttpRequestDescription): Promise<AnthropicHttpResult> {
+  const response = await fetch(request.url, {
+    method: request.method,
+    headers: request.headers,
+    signal: AbortSignal.timeout(request.timeoutMs),
+  });
+  const text = await response.text();
+  try {
+    return { status: response.status, body: JSON.parse(text) as unknown };
+  } catch {
+    return { status: response.status, body: null };
+  }
+}
+
+/** Profile GET then usage GET. No refresh, retry, or poll. Tests must not call this. */
+export function anthropicPoolFetchTransport(): AnthropicPoolTransport {
+  return {
+    getProfile: (accessToken) => anthropicGet(buildProfileRequest(accessToken)),
+    getUsage: (accessToken) => anthropicGet(buildUsageRequest(accessToken)),
+  };
+}
+
 export class Migration {
   private readonly store: Store;
   private readonly keychain: KeychainBackend;
@@ -907,6 +943,7 @@ export class Migration {
   /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
   private piAuthLockRefresh: (() => void) | undefined;
   private readonly now: () => number;
+  private readonly anthropicPoolTransport: AnthropicPoolTransport | undefined;
   private readonly authLockTiming: AuthLockTiming | undefined;
   private readonly fsyncDirectory: (path: string) => void;
   private readonly piMigrateJournalDir: string;
@@ -941,6 +978,7 @@ export class Migration {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     });
     this.now = config.now ?? Date.now;
+    this.anthropicPoolTransport = config.anthropicPoolTransport;
     this.authLockTiming = config.authLockTiming;
     this.fsyncDirectory = config.fsyncDirectory ?? fsyncDirSync;
     this.piMigrateJournalDir = config.piMigrateJournalDir ?? join(qlbHomeDir(), '.qlb', 'journal');
@@ -1896,6 +1934,8 @@ export class Migration {
       authBackupCycle,
       binding,
       sourceWitness,
+      identityProof: undefined,
+      rehearseRefusal: undefined,
       poolV2PublicationStarted: undefined,
     });
 
@@ -1910,11 +1950,129 @@ export class Migration {
   }
 
   /**
-   * S3 — one live authenticated call per staged account via `rehearseFn`.
-   * MUST NOT refresh. Injected (like adapterRefreshFn on RefreshLease) so
-   * tests can mock; the CLI passes defaultRehearseFn for real cutovers.
+   * S3. Non-pool providers make one injected call per staged account.
+   * The Anthropic pool instead profiles then reads usage once per admitted
+   * member, with no refresh, retry, or poll, and persists only if every
+   * member succeeds.
    */
-  async rehearse(rehearseFn: RehearseFn): Promise<MigrationStatus> {
+  async rehearse(rehearseFn: RehearseFn, poolTransport?: AnthropicPoolTransport): Promise<MigrationStatus> {
+    if (this.kind === 'pool') return this.rehearseAnthropicPool(poolTransport);
+    return this.rehearseAccounts(rehearseFn);
+  }
+
+  private poolRehearseTransport(explicit: AnthropicPoolTransport | undefined): AnthropicPoolTransport {
+    const transport = explicit ?? this.anthropicPoolTransport;
+    if (transport) return transport;
+    if (process.env.QLB_TEST_MODE === '1') {
+      throw new Error('anthropic pool rehearse requires an injected transport under QLB_TEST_MODE');
+    }
+    return anthropicPoolFetchTransport();
+  }
+
+  private failAnthropicRehearsal(code: 'identity-mismatch' | 'proof-unavailable'): never {
+    const row = this.store.getMigration(this.storeName);
+    const detail = parseDetail(row?.detail_json);
+    const proved = Object.hasOwn(detail, 'identityProof') || asState(row?.state) === 'VALIDATED';
+    if (code === 'identity-mismatch' || proved) {
+      this.journal('MIRRORED', {
+        identityProof: undefined,
+        rehearse: undefined,
+        rehearseRefusal: code === 'identity-mismatch' ? { code: 'identity-mismatch' } : undefined,
+      });
+    }
+    throw Object.assign(
+      new Error(code === 'identity-mismatch' ? 'identity-mismatch' : 'rehearse failed'),
+      { exitCode: 3 },
+    );
+  }
+
+  private async rehearseAnthropicPool(explicit: AnthropicPoolTransport | undefined): Promise<MigrationStatus> {
+    const current = this.status();
+    if (current.state !== 'MIRRORED' && current.state !== 'VALIDATED') {
+      throw new Error(`cannot rehearse from state ${current.state}`);
+    }
+    this.assertNoUnreadableOwnershipClaim();
+    this.assertNoActiveHandbackMarker();
+    const transport = this.poolRehearseTransport(explicit);
+    const stagedOwner = this.readStagingOwnerFile();
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const binding = stagedOwner?.binding;
+    if (!binding || !isDeepStrictEqual(binding, detail.binding)) {
+      return this.failAnthropicRehearsal('proof-unavailable');
+    }
+    const admitted = admitAnthropicCompleteSet(readFileSync(this.poolFilePath, 'utf8'));
+    const sameAdmission = admitted.memberCount === binding.memberCount
+      && admitted.commitment.digest === binding.completeSetCommitment.digest
+      && admitted.aliases.every((alias, index) => alias === binding.aliases[index])
+      && admitted.identityKinds.every((kind, index) => kind === binding.identityKinds[index]);
+    if (!sameAdmission) return this.failAnthropicRehearsal('proof-unavailable');
+    const derived = distinctAnthropicStageAccounts(admitted.members);
+    const stagedById = new Map(this.readStagedAccounts().map((account) => [account.id, account]));
+    const grants = derived.map((account) => {
+      const loaded = stagedById.get(account.id);
+      if (!loaded || loaded.provider !== 'anthropic') this.failAnthropicRehearsal('proof-unavailable');
+      return loaded;
+    });
+    const provedAt = this.now();
+    for (let index = 0; index < grants.length; index += 1) {
+      const expires = grants[index]?.grant.expires ?? 0;
+      if (expires > 0 && expires <= provedAt) {
+        throw new Error(
+          `${binding.aliases[index]}: staged access token expired — use the native harness once so IT refreshes, then re-run. QLB will not refresh a grant it does not own`,
+        );
+      }
+    }
+    const readings: Array<{ providerUuid: string; buckets: { '5h': number; '7d': number } }> = [];
+    const seen = new Set<string>();
+    for (let index = 0; index < admitted.members.length; index += 1) {
+      const member = admitted.members[index];
+      const token = grants[index]?.grant.access ?? '';
+      if (!member || token.length === 0) return this.failAnthropicRehearsal('proof-unavailable');
+      let profile: AnthropicHttpResult;
+      try {
+        profile = await transport.getProfile(token);
+      } catch {
+        return this.failAnthropicRehearsal('proof-unavailable');
+      }
+      const identity = readProfileIdentity(member.identityKind, member.identity, profile);
+      if (!identity.ok) return this.failAnthropicRehearsal(identity.code);
+      if (seen.has(identity.providerUuid)) return this.failAnthropicRehearsal('identity-mismatch');
+      seen.add(identity.providerUuid);
+      let usage: AnthropicHttpResult;
+      try {
+        usage = await transport.getUsage(token);
+      } catch {
+        return this.failAnthropicRehearsal('proof-unavailable');
+      }
+      const buckets = readUsageBuckets(usage);
+      if (!buckets.ok) return this.failAnthropicRehearsal(buckets.code);
+      readings.push({ providerUuid: identity.providerUuid, buckets: buckets.buckets });
+    }
+    const assembled = assembleIdentityProof({
+      cycle: binding.cycle,
+      provedAt,
+      aliases: binding.aliases,
+      identityKinds: binding.identityKinds,
+      readings,
+    });
+    if (!assembled.ok) return this.failAnthropicRehearsal(assembled.code);
+    const proof = assembled.proof;
+    try {
+      this.store.runImmediate(() => {
+        for (const account of derived) this.store.setAccountStatus(account.id, 'validated');
+        this.journal('VALIDATED', {
+          identityProof: proof,
+          rehearse: { ok: true, validatedAt: provedAt },
+          rehearseRefusal: undefined,
+        });
+      });
+    } catch {
+      throw Object.assign(new Error('rehearse failed'), { exitCode: 3 });
+    }
+    return this.status();
+  }
+
+  private async rehearseAccounts(rehearseFn: RehearseFn): Promise<MigrationStatus> {
     const current = this.status();
     if (current.state !== 'MIRRORED' && current.state !== 'VALIDATED') {
       throw new Error(`cannot rehearse from state ${current.state}`);
@@ -2864,6 +3022,8 @@ export class Migration {
     this.journal('NATIVE', {
       intent: undefined,
       binding: undefined,
+      identityProof: undefined,
+      rehearseRefusal: undefined,
       sourceWitness: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',

@@ -25,7 +25,7 @@ const EMAIL_NAME = 'Kept Display Name';
 const UUID_NAME = 'Uuid Display Name';
 const EXPIRES = 123456789;
 const LEAK = 'nested-journal-leak-value';
-const ALLOWED = /^(schemaVersion|phase|disposition|code|membership|count|aliases|success|refused|complete|stage|rehearse|commit|failure|source-membership-invalid|proof-unavailable|member-\d+)$/;
+const ALLOWED = /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets|success|refused|complete|stage|rehearse|commit|failure|source-membership-invalid|proof-unavailable|identity-mismatch|5h|7d|member-\d+)$/;
 const PHASES: AnthropicReceiptPhase[] = ['stage', 'rehearse', 'commit', 'failure'];
 
 function oauth(expires: number = EXPIRES) {
@@ -83,9 +83,17 @@ function assertAllowlisted(value: unknown): void {
   assert.equal(typeof value, 'object');
   assert.ok(value);
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    assert.match(key, /^(schemaVersion|phase|disposition|code|membership|count|aliases)$/);
+    assert.match(key, /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets)$/);
     if (key === 'aliases') assertAllowlisted(item);
-    else assert.equal(item !== null && typeof item === 'object', false);
+    else if (key === 'buckets') {
+      assert.ok(Array.isArray(item));
+      for (const bucket of item) {
+        assert.deepEqual(Object.keys(bucket as object).sort(), ['5h', '7d']);
+        const readings = bucket as { '5h': unknown; '7d': unknown };
+        assert.equal(typeof readings['5h'], 'number');
+        assert.equal(typeof readings['7d'], 'number');
+      }
+    } else assert.equal(item !== null && typeof item === 'object', false);
   }
 }
 
@@ -308,6 +316,73 @@ describe('anthropic migration receipt', () => {
       assert.equal(statusJson.includes('completeSetCommitment'), false);
       assert.equal(receiptTexts(ctx, 'stage').json.includes(EMAIL), false);
       assert.equal(receiptTexts(ctx, 'stage').json.includes(digest), false);
+    });
+  });
+
+  it('prints rehearse buckets only from a complete proof and keeps commit and failure unavailable', () => {
+    withPool(pool([emailMember(), uuidMember()]), (ctx) => {
+      ctx.mig.stage();
+      const detail = JSON.parse(ctx.store.getMigration(PI_POOL_STORE)?.detail_json ?? '{}') as {
+        binding: { cycle: string; memberCount: number; aliases: string[]; identityKinds: string[] };
+      };
+      const binding = detail.binding;
+      const hostile = 'Hostile Display Name';
+      const proof = {
+        version: 1,
+        cycle: binding.cycle,
+        provedAt: 50,
+        memberCount: binding.memberCount,
+        aliases: binding.aliases,
+        members: binding.aliases.map((alias, index) => ({
+          alias,
+          identityKind: binding.identityKinds[index],
+          hasProviderUuid: true,
+          buckets: index === 0 ? { '5h': 11, '7d': 22 } : { '5h': 33, '7d': 44 },
+        })),
+      };
+      ctx.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', JSON.stringify({ ...detail, identityProof: proof }));
+      const success = receiptTexts(ctx, 'rehearse');
+      assert.deepEqual(success.body, {
+        schemaVersion: 1,
+        phase: 'rehearse',
+        disposition: 'success',
+        membership: 'complete',
+        count: 2,
+        aliases: ['member-0001', 'member-0002'],
+        buckets: [{ '5h': 11, '7d': 22 }, { '5h': 33, '7d': 44 }],
+      });
+      assertAllowlisted(success.body);
+      assert.equal(success.human.includes('buckets: 5h=11,7d=22;5h=33,7d=44'), true);
+      for (const secret of [binding.cycle, EMAIL, UUID, ACCESS, REFRESH, EMAIL_ID, UUID_ID, EMAIL_NAME, UUID_NAME, hostile, 'hasProviderUuid', 'identityKind', 'provedAt', 'accountUuid']) {
+        assert.equal(success.json.includes(secret), false, secret);
+        assert.equal(success.human.includes(secret), false, secret);
+      }
+      for (const phase of ['commit', 'failure'] as const) {
+        assert.deepEqual(receiptTexts(ctx, phase).body, {
+          schemaVersion: 1, phase, disposition: 'refused', code: 'proof-unavailable',
+        });
+      }
+      const smuggled = {
+        ...proof,
+        members: proof.members.map((member, index) => index === 0
+          ? { ...member, buckets: { ...member.buckets, [`7d:${hostile}`]: 9 } }
+          : member),
+      };
+      ctx.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', JSON.stringify({ ...detail, identityProof: smuggled }));
+      const hidden = receiptTexts(ctx, 'rehearse');
+      assert.deepEqual(hidden.body, { schemaVersion: 1, phase: 'rehearse', disposition: 'refused', code: 'proof-unavailable' });
+      assert.equal(hidden.json.includes(hostile), false);
+      ctx.store.upsertMigration(PI_POOL_STORE, 'MIRRORED', JSON.stringify({
+        ...detail,
+        rehearseRefusal: { code: 'identity-mismatch' },
+      }));
+      const mismatch = receiptTexts(ctx, 'rehearse');
+      assert.deepEqual(mismatch.body, { schemaVersion: 1, phase: 'rehearse', disposition: 'refused', code: 'identity-mismatch' });
+      assertNoEcho(mismatch.json, [echoSources(ctx), EMAIL, UUID, hostile]);
+      assert.deepEqual(receiptTexts(ctx, 'commit').body.code, 'proof-unavailable');
+      writeFileSync(ctx.poolPath, pool([{ email: EMAIL, credentials: { type: 'oauth', access: ACCESS, refresh: REFRESH, expires: 'nope' } }]));
+      assert.equal(receiptTexts(ctx, 'rehearse').body.code, 'source-membership-invalid');
+      assert.equal(receiptTexts(ctx, 'rehearse').json.includes('identity-mismatch'), false);
     });
   });
 });

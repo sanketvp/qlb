@@ -272,7 +272,17 @@ async function createWriterFixture(kind) {
     }));
     // Pool publication runs under the Pi auth lock beside auth.json (P7b8), so the
     // fixture gives the pool its own temp auth.json, as test/migration.test.ts does.
-    migration = new Migration(store, keychain, nativePath, ownerPath, undefined, { authJsonPath: path.join(dir, 'auth.json') });
+    migration = new Migration(store, keychain, nativePath, ownerPath, undefined, {
+      authJsonPath: path.join(dir, 'auth.json'),
+      anthropicPoolTransport: {
+        async getProfile() {
+          return { status: 200, body: { account: { uuid: '00000000-0000-4000-8000-0000000000f1' } } };
+        },
+        async getUsage() {
+          return { status: 200, body: { five_hour: { utilization: 1 }, seven_day: { utilization: 2 } } };
+        },
+      },
+    });
     account = 'victim';
   } else if (kind === 'single-grant') {
     const nativePath = path.join(dir, 'auth.json');
