@@ -25,7 +25,7 @@ const EMAIL_NAME = 'Kept Display Name';
 const UUID_NAME = 'Uuid Display Name';
 const EXPIRES = 123456789;
 const LEAK = 'nested-journal-leak-value';
-const ALLOWED = /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets|success|refused|complete|stage|rehearse|commit|failure|source-membership-invalid|proof-unavailable|identity-mismatch|5h|7d|member-\d+)$/;
+const ALLOWED = /^(schemaVersion|phase|disposition|code|membership|count|aliases|buckets|success|refused|complete|stage|rehearse|commit|failure|source-membership-invalid|source-witness-unavailable|proof-unavailable|proof-stale|identity-mismatch|5h|7d|member-\d+)$/;
 const PHASES: AnthropicReceiptPhase[] = ['stage', 'rehearse', 'commit', 'failure'];
 
 function oauth(expires: number = EXPIRES) {
@@ -311,7 +311,8 @@ describe('anthropic migration receipt', () => {
       }).binding.completeSetCommitment.digest;
       assert.equal(typeof status.resumeAction, 'string');
       assert.equal(statusJson.includes('"disposition"'), false);
-      assert.equal(statusJson.includes(EMAIL), true);
+      assert.equal(statusJson.includes(EMAIL), false);
+      assert.equal(statusJson.includes('"label"'), false);
       assert.equal(statusJson.includes(digest), false);
       assert.equal(statusJson.includes('completeSetCommitment'), false);
       assert.equal(receiptTexts(ctx, 'stage').json.includes(EMAIL), false);
@@ -359,7 +360,7 @@ describe('anthropic migration receipt', () => {
       }
       for (const phase of ['commit', 'failure'] as const) {
         assert.deepEqual(receiptTexts(ctx, phase).body, {
-          schemaVersion: 1, phase, disposition: 'refused', code: 'proof-unavailable',
+          schemaVersion: 1, phase, disposition: 'refused', code: 'proof-stale',
         });
       }
       const smuggled = {
@@ -379,7 +380,7 @@ describe('anthropic migration receipt', () => {
       const mismatch = receiptTexts(ctx, 'rehearse');
       assert.deepEqual(mismatch.body, { schemaVersion: 1, phase: 'rehearse', disposition: 'refused', code: 'identity-mismatch' });
       assertNoEcho(mismatch.json, [echoSources(ctx), EMAIL, UUID, hostile]);
-      assert.deepEqual(receiptTexts(ctx, 'commit').body.code, 'proof-unavailable');
+      assert.equal(receiptTexts(ctx, 'commit').body.code, 'identity-mismatch');
       writeFileSync(ctx.poolPath, pool([{ email: EMAIL, credentials: { type: 'oauth', access: ACCESS, refresh: REFRESH, expires: 'nope' } }]));
       assert.equal(receiptTexts(ctx, 'rehearse').body.code, 'source-membership-invalid');
       assert.equal(receiptTexts(ctx, 'rehearse').json.includes('identity-mismatch'), false);
@@ -471,7 +472,8 @@ describe('qlb migrate receipt command', () => {
     assert.equal(typeof statusBody.resumeAction, 'string');
     assert.equal('disposition' in statusBody, false);
     const digest = (JSON.parse(journal) as { binding: { completeSetCommitment: { digest: string } } }).binding.completeSetCommitment.digest;
-    assert.equal(JSON.stringify(statusBody).includes(EMAIL), true);
+    assert.equal(JSON.stringify(statusBody).includes(EMAIL), false);
+    assert.equal(JSON.stringify(statusBody).includes('"label"'), false);
     assert.equal(status.stdout.includes(digest), false);
     assert.equal(status.stdout.includes('completeSetCommitment'), false);
     assert.equal(json.stdout.includes(EMAIL), false);

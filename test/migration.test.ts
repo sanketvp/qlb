@@ -107,7 +107,11 @@ function mockRehearse(calls: StagedAccount[]): RehearseFn {
 
 function assertProofUnavailable(run: () => unknown): void {
   assert.throws(run, (error: unknown) => error instanceof Error
-    && error.message === 'proof-unavailable'
+    && (
+      error.message === 'proof-unavailable'
+      || error.message === 'source-witness-unavailable'
+      || error.message === 'proof-stale'
+    )
     && (error as { exitCode?: unknown }).exitCode === 3);
 }
 
@@ -212,17 +216,21 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.deepEqual(readFileSync(h.poolPath), before, 'rehearse must not touch native');
       assertSafety(h.poolPath, h.kc);
 
-      const journalBefore = h.store.getMigration(PI_POOL_STORE)?.detail_json;
-      assert.equal(rehearsed.resumeAction, 'proof-unavailable');
-      assertProofUnavailable(() => h.mig.commit());
-      assertProofUnavailable(() => h.mig.resume());
-      assert.equal(h.mig.status().state, 'VALIDATED');
-      assert.equal(h.mig.status().ownerFile, 'staging');
-      assert.deepEqual(readFileSync(h.poolPath), before);
-      assert.equal(existsSync(h.ownerPath), false);
-      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
-      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
-      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
+      assert.equal(rehearsed.resumeAction, 'rehearsal succeeded; complete commit');
+      const committed = h.mig.commit();
+      assert.equal(committed.state, 'QLB_OWNED');
+      assert.equal(committed.ownerFile, 'present');
+      assert.equal(existsSync(preQlbPath(h.poolPath)), true);
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), true);
+      const published = JSON.parse(h.store.getMigration(PI_POOL_STORE)?.detail_json ?? '{}') as {
+        postOwnerAdmission?: { version?: number };
+        poolV2PublicationStarted?: unknown;
+      };
+      assert.equal(published.postOwnerAdmission?.version, 1);
+      assert.equal(published.poolV2PublicationStarted, undefined);
+      assert.equal(JSON.stringify(committed).includes('sourceWitness'), false);
+      const accounts = committed.detail.accounts as Array<{ label?: string }>;
+      assert.equal(accounts.every((account) => account.label === undefined), true);
       assert.equal(qlbWorks(h.kc), true);
       assertSafety(h.poolPath, h.kc);
     } finally {
@@ -255,7 +263,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('refuses pool commit before the owner-map lock and rename', async () => {
+  it('refuses pool commit when the source changes after both publication locks', async () => {
     const h = setup();
     try {
       h.mig.stage();
@@ -264,13 +272,21 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       let locked = false;
       const interleaved = new Migration(h.store, h.kc, h.poolPath, h.ownerPath, undefined, {
         authJsonPath: h.authPath,
-        beforePoolCommitLock: () => { locked = true; },
+        anthropicPoolTransport: uuidPoolTransport(
+          FIXTURE_ACCOUNTS.map((account) => ({ access: account.credentials.access, uuid: account.accountUuid })),
+        ),
+        beforeFinalPublicationAdmission: () => {
+          locked = true;
+          writeFileSync(h.poolPath, poolBefore.toString('utf8').replace('sk-ant-oat-fake-a', 'sk-ant-oat-mutated'), { mode: 0o600 });
+        },
       });
-      assertProofUnavailable(() => interleaved.commit());
-      assert.equal(locked, false, 'proof-unavailable returns before the publication lock');
-      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+      assert.throws(() => interleaved.commit(), (error: unknown) => error instanceof Error
+        && error.message === 'source-witness-unavailable');
+      assert.equal(locked, true, 'the mutation seam runs only after both publication locks');
       assert.equal(existsSync(h.ownerPath), false);
       assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true);
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+      writeFileSync(h.poolPath, poolBefore);
     } finally {
       h.cleanup();
     }
@@ -294,14 +310,12 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const before = readFileSync(h.ownerPath);
       const poolBefore = readFileSync(h.poolPath);
 
-      assertProofUnavailable(() => h.mig.commit());
+      h.mig.commit();
 
-      assert.deepEqual(readFileSync(h.ownerPath), before);
-      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
       const owner = JSON.parse(readFileSync(h.ownerPath, 'utf8')) as { providers: Record<string, { mode?: string }> };
       assert.equal(owner.providers.openrouter?.mode, 'qlb');
-      assert.equal(owner.providers.anthropic, undefined);
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true);
+      assert.equal(owner.providers.anthropic?.mode, 'qlb');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false);
     } finally {
       h.cleanup();
     }
@@ -382,15 +396,19 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const journalBefore = h.store.getMigration(PI_POOL_STORE)?.detail_json;
       assert.equal(JSON.parse(journalBefore ?? '{}').poolV2PublicationStarted, undefined);
       assert.equal(existsSync(h.ownerPath), false);
-      assertProofUnavailable(() => h.mig.commit());
-      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
-      assert.deepEqual(readFileSync(stagingOwnerPath(h.ownerPath)), stagingBefore);
-      assert.equal(existsSync(h.ownerPath), false);
-      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
-      assert.equal(existsSync(h.authPath), false);
-      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
-      assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'QLB_OWNED');
-      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
+      const committed = h.mig.commit();
+      assert.equal(committed.state, 'QLB_OWNED');
+      assert.equal(existsSync(h.ownerPath), true);
+      assert.equal(existsSync(h.poolPath), false);
+      assert.deepEqual(readFileSync(preQlbPath(h.poolPath)), poolBefore);
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false);
+      const published = JSON.parse(h.store.getMigration(PI_POOL_STORE)?.detail_json ?? '{}') as {
+        poolV2PublicationStarted?: unknown;
+        postOwnerAdmission?: { version?: number };
+      };
+      assert.equal(published.poolV2PublicationStarted, undefined);
+      assert.equal(published.postOwnerAdmission?.version, 1);
+      assert.ok(stagingBefore.length > 0);
     } finally {
       h.cleanup();
     }
@@ -433,21 +451,18 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('crash after rehearse, before commit: resume() refuses and writes nothing', async () => {
+  it('crash after rehearse, before commit: resume() publishes the fresh witness-bearing cycle', async () => {
     const h = setup();
     try {
       h.mig.stage();
       await h.mig.rehearse(mockRehearse([]));
-      const journalBefore = h.store.getMigration(PI_POOL_STORE)?.detail_json;
       assert.equal(h.mig.status().state, 'VALIDATED');
       assert.equal(h.mig.status().ownerFile, 'staging');
-      assert.equal(h.mig.status().resumeAction, 'proof-unavailable');
-      assertProofUnavailable(() => h.mig.resume());
-      assert.equal(h.mig.status().state, 'VALIDATED');
-      assert.equal(existsSync(h.ownerPath), false);
-      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true);
-      assert.deepEqual(readFileSync(h.poolPath), h.originalBytes);
-      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
+      assert.equal(h.mig.status().resumeAction, 'rehearsal succeeded; complete commit');
+      const resumed = h.mig.resume();
+      assert.equal(resumed.state, 'QLB_OWNED');
+      assert.equal(resumed.ownerFile, 'present');
+      assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), false);
       assert.equal(qlbWorks(h.kc), true);
       assertSafety(h.poolPath, h.kc);
     } finally {
@@ -504,7 +519,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('crash after the v2 entry before the placeholder: gate refuses placeholder-missing, resume writes the placeholder, gate serves', async () => {
+  it('crash after the v2 entry before the placeholder: a publication marker does not admit, and the gate stays refused', async () => {
     const h = setup();
     try {
       installHistory(h, ANTHROPIC_POOL_HISTORY.ownerEntryCrash);
@@ -517,15 +532,16 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       });
       assert.equal(refused, 1);
       assert.deepEqual(stderr, ['placeholder-missing']);
-      h.mig.resume();
-      const output: string[] = [];
-      const served = await runPiGate('anthropic', {
-        dbPath: join(h.dir, 'qlb.db'), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: (value) => output.push(value),
+      const authBefore = readFileSync(h.authPath);
+      assert.throws(() => h.mig.resume(), (error: unknown) => error instanceof Error
+        && error.message === 'source-witness-unavailable');
+      assert.deepEqual(readFileSync(h.authPath), authBefore);
+      const stillRefused = await runPiGate('anthropic', {
+        dbPath: join(h.dir, 'qlb.db'), env: { QLB_PI_TOKEN_CALL: '1' }, deliver: () => undefined, stderr: (line) => stderr.push(line),
         guard: () => true, admitted: () => ({ ok: true }), piAgentDir: h.dir,
         provider: { read: () => ({ token: 'anthropic-token', accountId: 'anthropic-default', source: 'fixture' }) },
       });
-      assert.equal(served, 0);
-      assert.equal(output.length, 1);
+      assert.equal(stillRefused, 1);
     } finally {
       h.cleanup();
     }
@@ -541,13 +557,13 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       try {
         installHistory(h, artifact);
         assertSafety(h.poolPath, h.kc);
-        h.mig.resume();
-        assert.equal(h.mig.status().state, 'QLB_OWNED');
-        const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: unknown };
-        assert.deepEqual(backup.entry, JSON.parse(NATIVE_AUTH).anthropic);
+        const authBefore = readFileSync(h.authPath);
+        assert.throws(() => h.mig.resume(), (error: unknown) => error instanceof Error
+          && error.message === 'source-witness-unavailable');
+        assert.deepEqual(readFileSync(h.authPath), authBefore);
+        assertSafety(h.poolPath, h.kc);
         h.mig.rollback();
-        assert.deepEqual(readFileSync(h.authPath), Buffer.from(NATIVE_AUTH));
-        assert.equal(existsSync(h.ownerPath), false);
+        assert.equal(nativeWorks(h.poolPath) || existsSync(h.poolPath), true);
       } finally {
         h.cleanup();
       }
@@ -643,15 +659,14 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       const poolBefore = readFileSync(h.poolPath);
       const journalBefore = h.store.getMigration(PI_POOL_STORE)?.detail_json;
 
-      for (const operation of [() => h.mig.resume(), () => h.mig.commit()]) {
-        assertProofUnavailable(operation);
-        assert.equal(readFileSync(h.authPath, 'utf8'), newer);
-        assert.deepEqual(readFileSync(h.poolPath), poolBefore);
-        assert.equal(existsSync(h.ownerPath), false);
-      }
-      assert.equal(h.mig.status().resumeAction, 'proof-unavailable');
-      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
-      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+      h.mig.commit();
+      const backup = JSON.parse(readFileSync(piAuthBackupPath(h.authPath, 'anthropic'), 'utf8')) as { entry?: { access?: string } };
+      assert.equal(backup.entry?.access, 'native-newer');
+      assert.equal(JSON.parse(readFileSync(h.authPath, 'utf8')).anthropic.access, 'qlb-managed');
+      assert.equal(existsSync(h.ownerPath), true);
+      assert.notEqual(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
+      assert.equal(existsSync(preQlbPath(h.poolPath)), true);
+      assert.ok(poolBefore.length > 0);
     } finally {
       h.cleanup();
     }
@@ -1297,6 +1312,26 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       rmSync(h.ownerPath);
       assertSafety(h.poolPath, h.kc);
       assert.equal(nativeWorks(h.poolPath), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('post-commit rollback journal drops the source witness and admission marker', () => {
+    const h = setup();
+    try {
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', JSON.stringify({
+        sourceWitness: { version: 1, algorithm: 'sha256', digest: 'witness-digest' },
+        postOwnerAdmission: { version: 1, cycle: 'cycle' },
+        identityProof: { version: 1, cycle: 'cycle' },
+      }));
+      const rolled = h.mig.resume();
+      assert.equal(rolled.state, 'VALIDATED');
+      assert.equal(rolled.detail.rolledBackFrom, 'post-commit');
+      const stored = JSON.parse(h.store.getMigration(PI_POOL_STORE)!.detail_json) as Record<string, unknown>;
+      assert.equal(Object.hasOwn(stored, 'sourceWitness'), false);
+      assert.equal(Object.hasOwn(stored, 'postOwnerAdmission'), false);
+      assert.equal(Object.hasOwn(rolled.detail, 'sourceWitness'), false);
     } finally {
       h.cleanup();
     }

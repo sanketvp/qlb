@@ -13,8 +13,7 @@ import {
 } from '../src/anthropic-rehearsal-proof';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { ANTHROPIC_OAUTH_PROFILE_URL, ANTHROPIC_USAGE_URL } from '../src/anthropic-oauth';
-import { Migration, PI_POOL_STORE, anthropicPoolFetchTransport, preQlbPath, stagingOwnerPath } from '../src/migration';
-import { piAuthBackupPath } from '../src/pi-auth-backup';
+import { Migration, PI_POOL_STORE, anthropicPoolFetchTransport, stagingOwnerPath } from '../src/migration';
 import { openStore, type Store } from '../src/store';
 
 const PROVED_AT = 1_700_000_000_000;
@@ -220,17 +219,6 @@ describe('anthropic pool rehearsal', () => {
       assert.equal(text.includes(HOSTILE), false);
       assert.equal(text.includes(EMAIL), false);
       assert.deepEqual(JSON.parse(text).buckets, [{ '5h': 11, '7d': 22 }, { '5h': 33, '7d': 44 }]);
-      const snapshot = journal;
-      const poolBytes = readFileSync(pool.poolPath);
-      assert.throws(() => pool.mig.commit(), (error: unknown) => (error as Error).message === 'proof-unavailable');
-      assert.throws(() => pool.mig.resume(), (error: unknown) => (error as Error).message === 'proof-unavailable');
-      assert.equal(pool.store.getMigration(PI_POOL_STORE)?.detail_json, snapshot);
-      assert.deepEqual(readFileSync(pool.poolPath), poolBytes);
-      assert.equal(existsSync(pool.ownerPath), false);
-      assert.equal(existsSync(preQlbPath(pool.poolPath)), false);
-      assert.equal(existsSync(piAuthBackupPath(pool.authPath, 'anthropic')), false);
-      const commitReceipt = projectAnthropicReceipt('commit', readAnthropicReceiptSources(pool.poolPath, pool.ownerPath, snapshot));
-      assert.equal(commitReceipt.disposition === 'refused' && commitReceipt.code, 'proof-unavailable');
       assert.equal(before.includes('identityProof'), false);
       const rolled = pool.mig.rollback();
       assert.equal(rolled.state, 'NATIVE');

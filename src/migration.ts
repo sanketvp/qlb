@@ -131,9 +131,15 @@ import {
   type AdmittedAnthropicMember,
   type AnthropicStageBinding,
 } from './anthropic-complete-set';
+import {
+  assessAnthropicForwardAdmission,
+  isForwardRefusal,
+  type ForwardAdmissionDecision,
+} from './anthropic-forward-admission';
 import { buildProfileRequest, buildUsageRequest, type HttpRequestDescription } from './anthropic-oauth';
 import {
   assembleIdentityProof,
+  identityMismatchRefusal,
   readProfileIdentity,
   readUsageBuckets,
   type AnthropicHttpResult,
@@ -359,6 +365,11 @@ export interface MigrationConfig {
   readNativeKey?: () => string;
   /** Test-only barrier after a pool takes the final owner-map lock. */
   beforePoolCommitLock?: () => void;
+  /**
+   * Test-only seam after both publication locks are held and before the final
+   * source read. Distinct from `beforePoolCommitLock`.
+   */
+  beforeFinalPublicationAdmission?: () => void;
   /** Test-only seam after custom conversion writes v2 and before it unlinks v1. */
   beforePoolLegacyUnlink?: () => void;
   /** Test-only barrier after staging validation and immediately before the commit rename. */
@@ -705,10 +716,18 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Status is diagnostic. Commitment stays journal/staging-only; source witness stays journal-only. */
+/** Status is diagnostic. Account labels, the commitment, and the source witness stay off this projection. */
 function detailForStatus(detail: Record<string, unknown>): Record<string, unknown> {
   const redactedDetail = { ...detail };
   delete redactedDetail.sourceWitness;
+  if (Array.isArray(redactedDetail.accounts)) {
+    redactedDetail.accounts = redactedDetail.accounts.map((account) => {
+      if (!isObjectRecord(account)) return account;
+      const projected = { ...account };
+      delete projected.label;
+      return projected;
+    });
+  }
   const binding = redactedDetail.binding;
   if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return redactedDetail;
   const redacted = { ...binding };
@@ -933,6 +952,8 @@ export class Migration {
   private readonly authJsonPath: string;
   private readonly readNativeKey: (() => string) | undefined;
   private readonly beforePoolCommitLock: (() => void) | undefined;
+  private readonly beforeFinalPublicationAdmission: (() => void) | undefined;
+  private ownerMapLockDepth = 0;
   private readonly beforePoolLegacyUnlink: (() => void) | undefined;
   private readonly beforeOwnerFileRename: (() => void) | undefined;
   private readonly beforeOwnershipLock: (() => void) | undefined;
@@ -968,6 +989,7 @@ export class Migration {
     this.authJsonPath = config.authJsonPath ?? DEFAULT_AUTH_JSON;
     this.readNativeKey = config.readNativeKey;
     this.beforePoolCommitLock = config.beforePoolCommitLock;
+    this.beforeFinalPublicationAdmission = config.beforeFinalPublicationAdmission;
     this.beforePoolLegacyUnlink = config.beforePoolLegacyUnlink;
     this.beforeOwnerFileRename = config.beforeOwnerFileRename;
     this.beforeOwnershipLock = config.beforeOwnershipLock;
@@ -1287,18 +1309,6 @@ export class Migration {
         || this.claimPathPresent(this.stagingPath()));
   }
 
-  private poolV2PublicationEvidence(current: MigrationStatus): boolean {
-    return current.detail.poolV2PublicationStarted === true
-      && STATE_RANK[current.state] >= STATE_RANK.VALIDATED;
-  }
-
-  private poolV2OrphanError(): Error {
-    return Object.assign(
-      new Error('owner-file-orphan: v2 Anthropic ownership has no staging file or pool publication journal; refuse to replace Pi auth.json.'),
-      { exitCode: 3 },
-    );
-  }
-
   private poolLegacyOwnerProviders(): string[] | null {
     if (!existsSync(this.ownerFilePath)) return null;
     const parsed: unknown = JSON.parse(readFileSync(this.ownerFilePath, 'utf8'));
@@ -1390,10 +1400,98 @@ export class Migration {
     return Object.assign(new Error('proof-unavailable'), { exitCode: 3 });
   }
 
-  /** Commit publishes only with a recovery signal. Resume allows a matching VALIDATED v1 owner. */
+  private poolAdmissionError(code: string): Error {
+    return Object.assign(new Error(code), { exitCode: 3 });
+  }
+
+  /** `poolV2PublicationStarted` is not an input. A v2 entry is only `canonicalOwnerEntry`. */
+  private forwardAdmissionEvidence(canonicalOwnerEntry: boolean) {
+    const detail = parseDetail(this.store.getMigration(this.storeName)?.detail_json);
+    const rawBinding = isObjectRecord(detail.binding) ? detail.binding : null;
+    const commitment = rawBinding && isObjectRecord(rawBinding.completeSetCommitment)
+      ? rawBinding.completeSetCommitment
+      : null;
+    const binding = rawBinding
+      && typeof rawBinding.cycle === 'string'
+      && typeof rawBinding.memberCount === 'number'
+      && Array.isArray(rawBinding.aliases)
+      && Array.isArray(rawBinding.identityKinds)
+      && commitment
+      && typeof commitment.digest === 'string'
+      ? {
+          cycle: rawBinding.cycle,
+          memberCount: rawBinding.memberCount,
+          aliases: rawBinding.aliases as string[],
+          identityKinds: rawBinding.identityKinds as Array<'email' | 'accountUuid'>,
+          commitmentDigest: commitment.digest,
+        }
+      : null;
+    const sourcePresent = existsSync(this.poolFilePath);
+    let recomputedWitnessDigest: string | null = null;
+    let recomputedCommitmentDigest: string | null = null;
+    if (sourcePresent) {
+      try {
+        const admitted = admitAnthropicCompleteSet(readFileSync(this.poolFilePath, 'utf8'));
+        distinctAnthropicStageAccounts(admitted.members);
+        recomputedCommitmentDigest = admitted.commitment.digest;
+        recomputedWitnessDigest = sourceWitnessForMembers(admitted.members).digest;
+      } catch {
+        recomputedWitnessDigest = null;
+        recomputedCommitmentDigest = null;
+      }
+    }
+    const marker = detail.postOwnerAdmission;
+    const postOwnerCycle = isObjectRecord(marker)
+      && marker.version === 1
+      && typeof marker.cycle === 'string'
+      && marker.cycle.length > 0
+      ? marker.cycle
+      : null;
+    return {
+      canonicalOwnerEntry,
+      postOwnerCycle,
+      binding,
+      storedWitness: detail.sourceWitness,
+      recomputedWitnessDigest,
+      recomputedCommitmentDigest,
+      sourcePresent,
+      identityProof: detail.identityProof,
+      identityMismatch: identityMismatchRefusal(detail),
+      now: this.now(),
+    };
+  }
+
+  private poolForwardDecision(canonicalOwnerEntry: boolean): ForwardAdmissionDecision {
+    return assessAnthropicForwardAdmission(
+      this.forwardAdmissionEvidence(canonicalOwnerEntry),
+      canonicalOwnerEntry ? 'post-owner-recovery' : 'pre-owner',
+    );
+  }
+
+  private poolPublicationGuidance(): string {
+    const decision = this.poolForwardDecision(this.ownerEntryPresentAt(this.ownerMapPath));
+    return decision === 'ADMIT_PRE_OWNER' || decision === 'ADMIT_POST_OWNER_RECOVERY'
+      ? 'rehearsal succeeded; complete commit'
+      : decision === 'PUBLISHED'
+        ? 'rehearsal succeeded; complete commit'
+        : decision;
+  }
+
+  /**
+   * Resume still blocks bare MIRRORED and unmatched legacy claims. A v2 entry
+   * or `poolV2PublicationStarted` does not unblock publication; those attempts
+   * reach `commitPoolV2`, which admits under both locks.
+   */
   private poolForwardBlocked(current: MigrationStatus, forResume: boolean): boolean {
-    if (current.detail.poolV2PublicationStarted === true || this.ownerEntryPresentAt(this.ownerMapPath)) return false;
-    if (!forResume) return true;
+    if (!forResume) return false;
+    if (this.poolNeedsV2Publication(current)) return false;
+    if (
+      current.state === 'VALIDATED'
+      && this.claimPathPresent(this.stagingPath())
+      && this.readStagingOwnerFile() !== null
+    ) {
+      return false;
+    }
     if (this.poolLegacyOwnerPresent()) {
       return !(current.state === 'VALIDATED' && this.readOwnerFileAt(this.ownerFilePath) !== null);
     }
@@ -1410,7 +1508,7 @@ export class Migration {
     if (stagingPresent) {
       if (this.readStagingOwnerFile() === null) throw this.invalidStagingError(staging);
       if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
-        throw new Error(`cannot commit from state ${current.state} (rehearse must succeed first)`);
+        throw this.poolProofUnavailable();
       }
     } else if (legacy) {
       if (!this.allowPoolLegacyConversion) {
@@ -1420,7 +1518,6 @@ export class Migration {
         throw new Error('cannot convert legacy Anthropic owner before VALIDATED');
       }
     } else if (v2) {
-      if (!stagingPresent && !this.poolV2PublicationEvidence(current)) throw this.poolV2OrphanError();
       if (this.poolPlaceholderPresent() && !stagingPresent) return this.finishHygiene();
     } else {
       throw new Error(`cannot commit: missing ${staging}`);
@@ -1429,39 +1526,45 @@ export class Migration {
     this.assertPoolLegacyOwnerClaimsOnlyAnthropic();
     this.assertPoolPlaceholderBackupLineage();
     this.withPoolRollbackAuthLock(() => {
-      this.beforePoolCommitLock?.();
-      // Refuse before even journaling a resume when the current-cycle backup
-      // proves Pi has since written a newer native entry.
-      if (!this.poolPlaceholderPresent() && this.poolNativeEntryChangedSinceStage()) {
-        throw this.poolNativeEntryChangedSinceStageError();
-      }
-      this.journal(current.state, { poolV2PublicationStarted: true });
-      // Re-read under the auth lock. A dual claim is the crash window between
-      // publishing the canonical map and retiring a custom v1 document; close
-      // it before touching the user's auth.json or backup.
-      const lockedLegacy = this.poolLegacyOwnerPresent();
-      const lockedV2 = this.ownerEntryPresentAt(this.ownerMapPath);
-      const writeOwner = (replaceLegacyDocument: boolean): void => this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
-        this.ownerMapPath,
-        'anthropic',
-        true,
-        {
-          replaceLegacyDocument,
-          legacyDocumentPath: replaceLegacyDocument ? this.ownerFilePath : undefined,
-          beforeLegacyUnlink: this.beforePoolLegacyUnlink,
-        },
-      ));
-      if (lockedLegacy && lockedV2) {
-        writeOwner(true);
-        this.afterWrite?.('owner-entry');
-      }
-      this.writePoolAnthropicBackupOnce();
-      if (!(lockedLegacy && lockedV2)) {
-        writeOwner(lockedLegacy);
-        this.afterWrite?.('owner-entry');
-      }
-      this.writePoolAnthropicPlaceholder();
-      this.afterWrite?.('placeholder');
+      this.withOwnerMapLockUnlessHeld(() => {
+        this.beforePoolCommitLock?.();
+        this.beforeFinalPublicationAdmission?.();
+        if (!this.poolPlaceholderPresent() && this.poolNativeEntryChangedSinceStage()) {
+          throw this.poolNativeEntryChangedSinceStageError();
+        }
+        const lockedLegacy = this.poolLegacyOwnerPresent();
+        const lockedV2 = this.ownerEntryPresentAt(this.ownerMapPath);
+        const decision = this.poolForwardDecision(lockedV2);
+        if (isForwardRefusal(decision)) throw this.poolAdmissionError(decision);
+        const writeOwner = (replaceLegacyDocument: boolean): void => this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
+          this.ownerMapPath,
+          'anthropic',
+          true,
+          {
+            replaceLegacyDocument,
+            legacyDocumentPath: replaceLegacyDocument ? this.ownerFilePath : undefined,
+            beforeLegacyUnlink: this.beforePoolLegacyUnlink,
+          },
+        ));
+        if (lockedLegacy && lockedV2) {
+          writeOwner(true);
+          this.afterWrite?.('owner-entry');
+        }
+        this.writePoolAnthropicBackupOnce();
+        if (!(lockedLegacy && lockedV2)) {
+          writeOwner(lockedLegacy);
+          this.afterWrite?.('owner-entry');
+        }
+        const admittedBinding = parseDetail(this.store.getMigration(this.storeName)?.detail_json).binding;
+        const admittedCycle = isObjectRecord(admittedBinding) && typeof admittedBinding.cycle === 'string'
+          ? admittedBinding.cycle
+          : null;
+        if (admittedCycle !== null && this.ownerEntryPresentAt(this.ownerMapPath)) {
+          this.journal(current.state, { postOwnerAdmission: { version: 1, cycle: admittedCycle } });
+        }
+        this.writePoolAnthropicPlaceholder();
+        this.afterWrite?.('placeholder');
+      });
     });
     if (stagingPresent) unlinkIfExists(staging);
     return this.finishHygiene();
@@ -1617,8 +1720,10 @@ export class Migration {
    * exit 3, like a held auth lock.
    */
   private withOwnerMapLockUnlessHeld<T>(fn: () => T): T {
+    if (this.ownerMapLockDepth > 0) return fn();
     const heldAuthPath = this.kind === 'pool' ? this.authJsonPath : this.poolFilePath;
     if (resolve(dirname(this.ownerMapPath), 'auth.json') === resolve(heldAuthPath)) return fn();
+    this.ownerMapLockDepth += 1;
     try {
       return this.withOwnerMapLock(fn);
     } catch (error: unknown) {
@@ -1626,6 +1731,8 @@ export class Migration {
         throw Object.assign(error, { exitCode: 3 });
       }
       throw error;
+    } finally {
+      this.ownerMapLockDepth -= 1;
     }
   }
 
@@ -1778,8 +1885,7 @@ export class Migration {
       && !this.revalidateAndSecureCommittedOwnerFile()
     ) {
       resumeAction = 'invalid published owner; run `qlb migrate rollback`';
-    } else if (poolV2Owner && !ownerStaging
-      && !(detail.poolV2PublicationStarted === true && STATE_RANK[state] >= STATE_RANK.VALIDATED)) {
+    } else if (poolV2Owner && !ownerStaging && !poolPlaceholder && !poolAuthMalformed) {
       resumeAction = 'owner-file-orphan: v2 Anthropic ownership has no staging file or pool publication journal; remove its Anthropic claim before retrying';
     } else if (poolV2Owner && poolAuthMalformed) {
       resumeAction = 'Pi auth.json is malformed; repair it before resuming';
@@ -1791,16 +1897,18 @@ export class Migration {
       resumeAction = ownerPresent
         ? 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`'
         : 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic` or re-stage';
-    } else if (poolLegacyOwner && !poolV2Owner && detail.poolV2PublicationStarted !== true && !(state === 'VALIDATED' && this.readOwnerFileAt(this.ownerFilePath) !== null)) {
+    } else if (poolLegacyOwner && !poolV2Owner && !(state === 'VALIDATED' && this.readOwnerFileAt(this.ownerFilePath) !== null)) {
       resumeAction = 'proof-unavailable';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
-      resumeAction = staticKey
-        ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
-        : (singleGrantV2Owner && !singleGrantPlaceholder) || (poolV2Owner && !poolPlaceholder)
-          ? 'complete commit: back up Pi auth.json, then write its placeholder → QLB_OWNED'
-          : retains
-            ? 'already committed; finish hygiene → QLB_OWNED'
-            : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
+      resumeAction = this.kind === 'pool' && poolV2Owner && !poolPlaceholder
+        ? this.poolPublicationGuidance()
+        : staticKey
+          ? 'already committed; finish hygiene (journal only; native Keychain retained) → QLB_OWNED'
+          : (singleGrantV2Owner && !singleGrantPlaceholder)
+            ? 'complete commit: back up Pi auth.json, then write its placeholder → QLB_OWNED'
+            : retains
+              ? 'already committed; finish hygiene → QLB_OWNED'
+              : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
     } else if (ownerPresent && nativePresent && !prePresent && !retains
       && !(this.kind === 'pool' && poolV2Owner && !poolPlaceholder)) {
       resumeAction = 'finish hygiene: rename native → .pre-qlb';
@@ -1821,12 +1929,12 @@ export class Migration {
     } else if (preCommitRollbackIntent) {
       resumeAction = 'before commit: roll back staging (native untouched)';
     } else if (state === 'VALIDATED' && ownerStaging && this.readStagingOwnerFile() !== null) {
-      resumeAction = this.kind === 'pool' && detail.poolV2PublicationStarted !== true && !poolV2Owner
-        ? 'proof-unavailable'
+      resumeAction = this.kind === 'pool'
+        ? this.poolPublicationGuidance()
         : 'rehearsal succeeded; complete commit';
     } else if (state === 'MIRRORED' || ownerStaging) {
-      resumeAction = this.kind === 'pool' && detail.poolV2PublicationStarted !== true && !poolV2Owner
-        ? 'proof-unavailable'
+      resumeAction = this.kind === 'pool'
+        ? this.poolPublicationGuidance()
         : 'before commit: roll back staging (native untouched)';
     } else {
       resumeAction = this.kind === 'single-grant' ? 'nothing to roll back' : 'noop';
@@ -3025,6 +3133,7 @@ export class Migration {
       identityProof: undefined,
       rehearseRefusal: undefined,
       sourceWitness: undefined,
+      postOwnerAdmission: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',
     });
@@ -3544,6 +3653,9 @@ export class Migration {
       commitStarted: undefined,
       poolV2PublicationStarted: undefined,
       rollbackDecision: undefined,
+      sourceWitness: undefined,
+      postOwnerAdmission: undefined,
+      identityProof: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'post-commit',
     });

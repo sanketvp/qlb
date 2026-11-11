@@ -3,10 +3,12 @@ import { dirname, join } from 'node:path';
 import {
   admitAnthropicCompleteSet,
   memberAlias,
+  sourceWitnessForMembers,
   SourceMembershipInvalidError,
   type AdmittedAnthropicPool,
   type AnthropicIdentityKind,
 } from './anthropic-complete-set';
+import { assessAnthropicForwardAdmission } from './anthropic-forward-admission';
 import { identityMismatchRefusal, identityProofBuckets } from './anthropic-rehearsal-proof';
 import { distinctAnthropicStageAccounts, stagingOwnerPath } from './migration';
 
@@ -17,7 +19,12 @@ export const RECEIPT_PHASES = ['stage', 'rehearse', 'commit', 'failure'] as cons
 export type AnthropicReceiptPhase = (typeof RECEIPT_PHASES)[number];
 
 /** Codes this slice can put on a receipt. Later slices add the other fixed public codes. */
-export type AnthropicReceiptCode = 'source-membership-invalid' | 'proof-unavailable' | 'identity-mismatch';
+export type AnthropicReceiptCode =
+  | 'source-membership-invalid'
+  | 'proof-unavailable'
+  | 'identity-mismatch'
+  | 'source-witness-unavailable'
+  | 'proof-stale';
 
 /**
  * `proof-unavailable` is the no-forward plan's fixed code for a phase that
@@ -51,6 +58,14 @@ export type AnthropicReceipt =
     }
   | {
       schemaVersion: 1;
+      phase: 'commit';
+      disposition: 'success';
+      membership: 'complete';
+      count: number;
+      aliases: string[];
+    }
+  | {
+      schemaVersion: 1;
       phase: AnthropicReceiptPhase;
       disposition: 'refused';
       code?: AnthropicReceiptCode;
@@ -60,6 +75,7 @@ export interface AnthropicReceiptSources {
   poolText: string | null;
   journalDetail: unknown;
   stagingDocument: unknown;
+  ownerDocument?: unknown;
 }
 
 interface PrivateBinding {
@@ -201,10 +217,75 @@ export function projectAnthropicReceipt(
       return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: 'identity-mismatch' };
     }
   }
+  if (phase === 'commit' || phase === 'failure') {
+    const decision = assessAnthropicForwardAdmission(commitEvidence(sources, journal), 'receipt');
+    if (phase === 'commit' && decision === 'PUBLISHED' && journal) {
+      return {
+        schemaVersion: RECEIPT_SCHEMA_VERSION,
+        phase: 'commit',
+        disposition: 'success',
+        membership: 'complete',
+        count: journal.memberCount,
+        aliases: journal.aliases.slice(),
+      };
+    }
+    if (
+      decision === 'source-witness-unavailable'
+      || decision === 'proof-stale'
+      || decision === 'identity-mismatch'
+      || decision === 'proof-unavailable'
+    ) {
+      return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: decision };
+    }
+  }
   if (phase !== 'stage') {
     return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: ANTHROPIC_PROOF_UNAVAILABLE };
   }
   return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused' };
+}
+
+function canonicalOwnerEntry(document: unknown): boolean {
+  if (!isRecord(document) || !isRecord(document.providers) || !isRecord(document.providers.anthropic)) return false;
+  return document.providers.anthropic.mode === 'qlb';
+}
+
+function postOwnerCycle(detail: unknown): string | null {
+  if (!isRecord(detail) || !isRecord(detail.postOwnerAdmission)) return null;
+  const marker = detail.postOwnerAdmission;
+  return marker.version === 1 && typeof marker.cycle === 'string' && marker.cycle.length > 0 ? marker.cycle : null;
+}
+
+function commitEvidence(sources: AnthropicReceiptSources, journal: PrivateBinding | null) {
+  const sourcePresent = sources.poolText !== null;
+  let recomputedWitnessDigest: string | null = null;
+  let recomputedCommitmentDigest: string | null = null;
+  if (sources.poolText !== null) {
+    const admission = admitPool(sources.poolText);
+    if (admission.admitted) {
+      recomputedWitnessDigest = sourceWitnessForMembers(admission.admitted.members).digest;
+      recomputedCommitmentDigest = admission.admitted.commitment.digest;
+    }
+  }
+  return {
+    canonicalOwnerEntry: canonicalOwnerEntry(sources.ownerDocument),
+    postOwnerCycle: postOwnerCycle(sources.journalDetail),
+    binding: journal
+      ? {
+          cycle: journal.cycle,
+          memberCount: journal.memberCount,
+          aliases: journal.aliases,
+          identityKinds: journal.identityKinds,
+          commitmentDigest: journal.commitmentDigest,
+        }
+      : null,
+    storedWitness: isRecord(sources.journalDetail) ? sources.journalDetail.sourceWitness : null,
+    recomputedWitnessDigest,
+    recomputedCommitmentDigest,
+    sourcePresent,
+    identityProof: isRecord(sources.journalDetail) ? sources.journalDetail.identityProof : null,
+    identityMismatch: identityMismatchRefusal(sources.journalDetail),
+    now: Date.now(),
+  };
 }
 
 /** Allowlisted object. Callers serialize this value and never a journal or staging document. */
@@ -219,6 +300,8 @@ export function anthropicReceiptBody(receipt: AnthropicReceipt): Record<string, 
       receipt.code === 'source-membership-invalid'
       || receipt.code === ANTHROPIC_PROOF_UNAVAILABLE
       || receipt.code === 'identity-mismatch'
+      || receipt.code === 'source-witness-unavailable'
+      || receipt.code === 'proof-stale'
     ) body.code = receipt.code;
     return body;
   }
@@ -276,9 +359,13 @@ export function readAnthropicReceiptSources(
   ownerFile: string,
   journalDetailJson: string | null | undefined,
 ): AnthropicReceiptSources {
+  const ownerDocument = parseJson(readUtf8(ownerFile));
   return {
     poolText: readUtf8(poolFile),
     journalDetail: parseJson(journalDetailJson),
     stagingDocument: parseJson(readUtf8(stagingOwnerPath(join(dirname(ownerFile), 'qlb-owner.json')))),
+    ownerDocument: canonicalOwnerEntry(ownerDocument)
+      ? ownerDocument
+      : parseJson(readUtf8(join(dirname(ownerFile), 'qlb-owner.json'))),
   };
 }
