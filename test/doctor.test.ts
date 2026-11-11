@@ -589,6 +589,26 @@ describe('qlb doctor', () => {
     assert.doesNotMatch(openrouter?.example ?? '', /security add-generic-password/);
   });
 
+  it('omits pool account labels and the source witness from stuck migration detail', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-witness-'));
+    const label = 'pool-label-must-not-leak@example.com';
+    const digest = 'witness-digest-must-not-leak';
+    const commitment = 'commitment-digest-must-not-leak';
+    const report = await doctorReport(home, (store) => {
+      store.upsertMigration('pi-pool', 'MIRRORED', JSON.stringify({
+        accounts: [{ id: 'acct', provider: 'anthropic', label, fingerprint: 'abc' }],
+        sourceWitness: { version: 1, algorithm: 'sha256', digest },
+        binding: { completeSetCommitment: { version: 1, memberCount: 1, digest: commitment } },
+      }));
+    });
+    const body = JSON.stringify(report.checks.find((check) => check.name === 'migrations'));
+    assert.equal(body.includes(label), false);
+    assert.equal(body.includes(digest), false);
+    assert.equal(body.includes(commitment), false);
+    assert.equal(body.includes('pi-pool'), true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it('returns FAIL for a corrupt SQLite store', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-corrupt-test-'));
     const config = defaultConfig(home);

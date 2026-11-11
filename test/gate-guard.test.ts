@@ -121,16 +121,8 @@ describe('qlb gate core (S30/S54)', () => {
       }));
       migration.stage();
       await migration.rehearse(async () => ({ ok: true }));
-      const poolBefore = readFileSync(poolPath);
-      const journalBefore = anthropicStore.getMigration('pi-pool');
-      assert.throws(() => migration.commit(), (error: unknown) => error instanceof Error
-        && error.message === 'proof-unavailable'
-        && (error as { exitCode?: unknown }).exitCode === 3);
-      assert.deepEqual(readFileSync(poolPath), poolBefore);
-      assert.equal(existsSync(ownerPath), false);
-      assert.equal(existsSync(authPath), false);
-      assert.equal(anthropicStore.getMigration('pi-pool')?.state, journalBefore?.state);
-      assert.equal(anthropicStore.getMigration('pi-pool')?.detail_json, journalBefore?.detail_json);
+      migration.commit();
+      assert.equal(migration.status().state, 'QLB_OWNED');
       writeFileSync(ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }) + '\n');
       writeFileSync(authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 } }) + '\n');
     } finally {

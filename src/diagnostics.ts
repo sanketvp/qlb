@@ -55,7 +55,7 @@ import {
   type SingleGrantKeychainCoords,
   type SingleGrantKeychainProvider,
 } from './single-grant-ownership';
-import { ADAPTER_ACCOUNT_IDS } from './migration';
+import { ADAPTER_ACCOUNT_IDS, PI_POOL_STORE, projectMigrationStatusDetail } from './migration';
 import { piEvidenceGapCheck } from './checks/pi-evidence-gap';
 import { qlbHomeDir } from './home';
 import { piReleaseAppDir } from './pi-deploy';
@@ -618,6 +618,28 @@ function resolveDoctorOwnedKeychain(
   return resolveSingleGrantKeychain(provider, accounts[0]);
 }
 
+function redactStuckMigrationDetail(row: { store: string; state: string; detail_json?: string }): {
+  store: string;
+  state: string;
+  detail_json?: string;
+} {
+  if (typeof row.detail_json !== 'string') return row;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.detail_json);
+  } catch {
+    return row;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return row;
+  return {
+    ...row,
+    detail_json: JSON.stringify(projectMigrationStatusDetail(
+      parsed as Record<string, unknown>,
+      row.store === PI_POOL_STORE,
+    )),
+  };
+}
+
 export async function doctorQlb(
   config: QlbConfig,
   options: {
@@ -748,7 +770,7 @@ export async function doctorQlb(
       name: 'migrations',
       level: 'WARN',
       message: `MIGRATION NEEDS ATTENTION: ${parts.join('; ')}`,
-      detail: stuck,
+      detail: stuck.map(redactStuckMigrationDetail),
     });
   } else {
     checks.push({ name: 'migrations', level: 'PASS', message: 'no incomplete migrations detected' });
