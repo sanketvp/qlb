@@ -260,7 +260,7 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
-  it('pool commit publishes Anthropic into a v2 map that appeared after stage', async () => {
+  it('refuses pool commit when another provider map appeared after stage', async () => {
     const h = setup();
     try {
       h.mig.stage();
@@ -286,6 +286,55 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
       assert.equal(owner.providers.openrouter?.mode, 'qlb');
       assert.equal(owner.providers.anthropic, undefined);
       assert.equal(existsSync(stagingOwnerPath(h.ownerPath)), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('bare resume of a QLB_OWNED legacy owner refuses without writing', () => {
+    const h = setup();
+    try {
+      const owner = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n';
+      const auth = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 } }, null, 2) + '\n';
+      const poolBefore = readFileSync(h.poolPath);
+      writeFileSync(h.ownerPath, owner, { mode: 0o600 });
+      writeFileSync(h.authPath, auth, { mode: 0o600 });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      assert.equal(h.mig.status().resumeAction, 'proof-unavailable');
+      assertProofUnavailable(() => h.mig.resume());
+      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
+      assert.equal(readFileSync(h.ownerPath, 'utf8'), owner);
+      assert.equal(readFileSync(h.authPath, 'utf8'), auth);
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'QLB_OWNED');
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, '{}');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('refuses commit from QLB_OWNED with readable staging and no recovery signal', async () => {
+    const h = setup();
+    try {
+      h.mig.stage();
+      await h.mig.rehearse(mockRehearse([]));
+      const staged = h.store.getMigration(PI_POOL_STORE);
+      assert.ok(staged);
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', staged.detail_json);
+      const poolBefore = readFileSync(h.poolPath);
+      const stagingBefore = readFileSync(stagingOwnerPath(h.ownerPath));
+      const journalBefore = h.store.getMigration(PI_POOL_STORE)?.detail_json;
+      assert.equal(JSON.parse(journalBefore ?? '{}').poolV2PublicationStarted, undefined);
+      assert.equal(existsSync(h.ownerPath), false);
+      assertProofUnavailable(() => h.mig.commit());
+      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+      assert.deepEqual(readFileSync(stagingOwnerPath(h.ownerPath)), stagingBefore);
+      assert.equal(existsSync(h.ownerPath), false);
+      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
+      assert.equal(existsSync(h.authPath), false);
+      assert.equal(existsSync(piAuthBackupPath(h.authPath, 'anthropic')), false);
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'QLB_OWNED');
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, journalBefore);
     } finally {
       h.cleanup();
     }

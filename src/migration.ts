@@ -1291,14 +1291,11 @@ export class Migration {
     return Object.assign(new Error('proof-unavailable'), { exitCode: 3 });
   }
 
-  /** Fresh pre-owner publish, or a legacy conversion that would write the v2 map. */
+  /** Publication is allowed only when a v2 owner or publication marker already exists. */
   private poolForwardBlocked(current: MigrationStatus, forResume: boolean): boolean {
     if (current.detail.poolV2PublicationStarted === true || this.ownerEntryPresentAt(this.ownerMapPath)) return false;
-    if (this.poolLegacyOwnerPresent()) {
-      return forResume
-        ? this.allowPoolLegacyConversion && current.state === 'QLB_OWNED'
-        : current.state === 'VALIDATED' || current.state === 'QLB_OWNED';
-    }
+    if (!forResume) return true;
+    if (this.poolLegacyOwnerPresent()) return current.state === 'QLB_OWNED';
     return current.state === 'MIRRORED' || current.state === 'VALIDATED';
   }
 
