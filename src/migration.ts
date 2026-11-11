@@ -716,11 +716,11 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Status is diagnostic. Account labels, the commitment, and the source witness stay off this projection. */
-function detailForStatus(detail: Record<string, unknown>): Record<string, unknown> {
+/** Status is diagnostic. Pool account labels, the commitment, and the source witness stay off this projection. */
+function detailForStatus(detail: Record<string, unknown>, redactAccountLabels: boolean): Record<string, unknown> {
   const redactedDetail = { ...detail };
   delete redactedDetail.sourceWitness;
-  if (Array.isArray(redactedDetail.accounts)) {
+  if (redactAccountLabels && Array.isArray(redactedDetail.accounts)) {
     redactedDetail.accounts = redactedDetail.accounts.map((account) => {
       if (!isObjectRecord(account)) return account;
       const projected = { ...account };
@@ -1948,7 +1948,7 @@ export class Migration {
       nativeStore,
       piAtNextLaunch,
       resumeAction,
-      detail: detailForStatus(detail),
+      detail: detailForStatus(detail, this.kind === 'pool'),
       handback,
       nativeStrategy: this.strategy(),
       provider: this.provider,
