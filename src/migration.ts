@@ -717,7 +717,7 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Status is diagnostic. Pool account labels, the commitment, and the source witness stay off this projection. */
-function detailForStatus(detail: Record<string, unknown>, redactAccountLabels: boolean): Record<string, unknown> {
+export function projectMigrationStatusDetail(detail: Record<string, unknown>, redactAccountLabels: boolean): Record<string, unknown> {
   const redactedDetail = { ...detail };
   delete redactedDetail.sourceWitness;
   if (redactAccountLabels && Array.isArray(redactedDetail.accounts)) {
@@ -1517,14 +1517,10 @@ export class Migration {
       if (current.state !== 'VALIDATED' && current.state !== 'QLB_OWNED') {
         throw new Error('cannot convert legacy Anthropic owner before VALIDATED');
       }
-    } else if (v2) {
-      if (this.poolPlaceholderPresent() && !stagingPresent) return this.finishHygiene();
-    } else {
+    } else if (!v2) {
       throw new Error(`cannot commit: missing ${staging}`);
     }
 
-    this.assertPoolLegacyOwnerClaimsOnlyAnthropic();
-    this.assertPoolPlaceholderBackupLineage();
     this.withPoolRollbackAuthLock(() => {
       this.withOwnerMapLockUnlessHeld(() => {
         this.beforePoolCommitLock?.();
@@ -1536,6 +1532,8 @@ export class Migration {
         const lockedV2 = this.ownerEntryPresentAt(this.ownerMapPath);
         const decision = this.poolForwardDecision(lockedV2);
         if (isForwardRefusal(decision)) throw this.poolAdmissionError(decision);
+        this.assertPoolLegacyOwnerClaimsOnlyAnthropic();
+        this.assertPoolPlaceholderBackupLineage();
         const writeOwner = (replaceLegacyDocument: boolean): void => this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
           this.ownerMapPath,
           'anthropic',
@@ -1948,7 +1946,7 @@ export class Migration {
       nativeStore,
       piAtNextLaunch,
       resumeAction,
-      detail: detailForStatus(detail, this.kind === 'pool'),
+      detail: projectMigrationStatusDetail(detail, this.kind === 'pool'),
       handback,
       nativeStrategy: this.strategy(),
       provider: this.provider,

@@ -45,6 +45,25 @@ function evidence(overrides: Partial<ForwardAdmissionEvidence> = {}): ForwardAdm
 }
 
 describe('assessAnthropicForwardAdmission', () => {
+  it('refuses pre-owner admission when the source pool is absent', () => {
+    const absent = evidence({
+      sourcePresent: false,
+      recomputedWitnessDigest: null,
+      recomputedCommitmentDigest: null,
+    });
+    assert.equal(assessAnthropicForwardAdmission(absent, 'pre-owner'), 'source-witness-unavailable');
+    assert.equal(
+      assessAnthropicForwardAdmission(evidence({
+        canonicalOwnerEntry: true,
+        postOwnerCycle: CYCLE,
+        sourcePresent: false,
+        recomputedWitnessDigest: null,
+        recomputedCommitmentDigest: null,
+      }), 'receipt'),
+      'PUBLISHED',
+    );
+  });
+
   it('admits a fresh pre-owner cycle at 300000 ms and refuses at 300001 ms', () => {
     assert.equal(
       assessAnthropicForwardAdmission(evidence(), 'pre-owner'),

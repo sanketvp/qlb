@@ -88,20 +88,24 @@ export function assessAnthropicForwardAdmission(
 ): ForwardAdmissionDecision {
   const binding = evidence.binding;
   const stored = witnessDigest(evidence.storedWitness);
-  const witnessMatches = binding !== null
-    && stored !== null
-    && (
-      (!evidence.sourcePresent && evidence.recomputedWitnessDigest === null)
-      || (
-        evidence.recomputedWitnessDigest === stored
-        && evidence.recomputedCommitmentDigest === binding.commitmentDigest
-      )
-    );
-  if (!witnessMatches || binding === null) return 'source-witness-unavailable';
+  if (binding === null || stored === null) return 'source-witness-unavailable';
+  const marked = evidence.canonicalOwnerEntry && evidence.postOwnerCycle === binding.cycle;
+  if (!evidence.sourcePresent) {
+    if (!marked) return 'source-witness-unavailable';
+    if (identityProofBuckets(evidence.identityProof, bindingView(binding)) === null) {
+      return evidence.identityMismatch ? 'identity-mismatch' : 'proof-unavailable';
+    }
+    return 'PUBLISHED';
+  }
+  if (
+    evidence.recomputedWitnessDigest !== stored
+    || evidence.recomputedCommitmentDigest !== binding.commitmentDigest
+  ) {
+    return 'source-witness-unavailable';
+  }
   if (identityProofBuckets(evidence.identityProof, bindingView(binding)) === null) {
     return evidence.identityMismatch ? 'identity-mismatch' : 'proof-unavailable';
   }
-  const marked = evidence.canonicalOwnerEntry && evidence.postOwnerCycle === binding.cycle;
   if (marked) return 'PUBLISHED';
   const stamped = provedAt(evidence.identityProof);
   if (

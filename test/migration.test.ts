@@ -632,6 +632,30 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
+  it('refuses hygiene when a v2 owner and placeholder have no witness or proof', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: piPlaceholder() }) + '\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      const ownerBefore = readFileSync(h.ownerPath);
+      const authBefore = readFileSync(h.authPath);
+      const poolBefore = readFileSync(h.poolPath);
+      for (const detail of ['{}', JSON.stringify({ poolV2PublicationStarted: true })]) {
+        h.store.upsertMigration(PI_POOL_STORE, 'VALIDATED', detail);
+        assert.throws(() => h.mig.commit(), (error: unknown) => error instanceof Error
+          && error.message === 'source-witness-unavailable'
+          && (error as { exitCode?: unknown }).exitCode === 3);
+        assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+        assert.equal(existsSync(preQlbPath(h.poolPath)), false);
+        assert.deepEqual(readFileSync(h.ownerPath), ownerBefore);
+        assert.deepEqual(readFileSync(h.authPath), authBefore);
+        assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'VALIDATED');
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('refuses an orphan v2 Anthropic owner without this migration’s staging or journal evidence', () => {
     const h = setup();
     try {
