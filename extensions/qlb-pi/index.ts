@@ -58,7 +58,7 @@ import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/p
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { validatePiOwnerDocument } from "../../src/pi-owner-document.js";
-import { streamWithAuthRetry } from "./auth-retry.js";
+import { ownedSmokeResync, streamWithAuthRetry } from "./auth-retry.js";
 import { qlbUnavailable } from "./active-access.js";
 import { createAnthropicSource } from "./providers/anthropic.js";
 import {
@@ -565,8 +565,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
     const source = createAnthropicSource({
       runGate: async (provider, retryAfter401Fp) => {
+        const smoke = process.env.QLB_PI_OWNED_SMOKE === "1";
         const result = await runQlb(
-          ["gate", provider, "--json", ...(retryAfter401Fp === undefined ? [] : ["--retry-after-401", retryAfter401Fp])],
+          ["gate", provider, "--json",
+            ...(smoke ? ["--no-refresh"] : []),
+            ...(smoke || retryAfter401Fp === undefined ? [] : ["--retry-after-401", retryAfter401Fp])],
           ANTHROPIC_GATE_TIMEOUT_MS,
           { ...process.env, QLB_PI_TOKEN_CALL: "1" },
         );
@@ -611,6 +614,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
               // QLB owns token renewal; on one failed request, re-run its
               // gate with the rejected access generation's non-secret hash.
               resync: async () => {
+                const smoke = ownedSmokeResync();
+                if (smoke) return smoke;
                 const next = await (source.read as (retryAfter401Fp?: string) => Promise<typeof access>)(accessFingerprint(access.token));
                 // A retry never switches accounts: surface the original 401
                 // and record nothing (spec rev 5, K6b r1 item 2).
