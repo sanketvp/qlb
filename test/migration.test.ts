@@ -28,6 +28,7 @@ const FIXTURE_ACCOUNTS = [
   {
     id: 'acct-a',
     name: 'Account A',
+    accountUuid: '00000000-0000-4000-8000-00000000000a',
     credentials: {
       type: 'oauth' as const,
       access: 'sk-ant-oat-fake-a',
@@ -38,6 +39,7 @@ const FIXTURE_ACCOUNTS = [
   {
     id: 'acct-b',
     name: 'Account B',
+    accountUuid: '00000000-0000-4000-8000-00000000000b',
     credentials: {
       type: 'oauth' as const,
       access: 'sk-ant-oat-fake-b',

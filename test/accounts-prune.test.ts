@@ -691,6 +691,7 @@ describe('accounts-prune vs Migration.stage() pre-journal window', () => {
           {
             id: 'acct-stage-race',
             name: 'Stage Race',
+            accountUuid: '00000000-0000-4000-8000-0000000000c1',
             credentials: {
               type: 'oauth',
               access: 'sk-ant-oat-fake',
@@ -703,7 +704,9 @@ describe('accounts-prune vs Migration.stage() pre-journal window', () => {
     );
     const store = openStore(dbPath);
     const kc = new MockKeychain();
-    const mig = new Migration(store, kc, poolPath, ownerPath);
+    const mig = new Migration(store, kc, poolPath, ownerPath, undefined, {
+      authJsonPath: join(dir, 'auth.json'),
+    });
     const origUpsert = store.upsertAccount.bind(store);
     let pruneRefusedWhileVisible = false;
     let upserts = 0;

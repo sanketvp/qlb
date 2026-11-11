@@ -108,7 +108,7 @@ describe('qlb gate core (S30/S54)', () => {
       const ownerPath = join(anthropicAgent, 'qlb-owner.json');
       const authPath = join(anthropicAgent, 'auth.json');
       writeFileSync(poolPath, JSON.stringify({
-        accounts: [{ id: 'anthropic-a', name: 'Anthropic A', credentials: {
+        accounts: [{ id: 'anthropic-a', name: 'Anthropic A', accountUuid: '00000000-0000-4000-8000-0000000000d1', credentials: {
           type: 'oauth', access: 'anthropic-access', refresh: 'anthropic-refresh', expires: Date.now() + 60_000,
         } }],
       }));
