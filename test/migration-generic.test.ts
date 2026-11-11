@@ -1881,6 +1881,7 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
         accounts: [{
           id: 'fixture-account',
           name: 'Fixture Account',
+          accountUuid: '00000000-0000-4000-8000-0000000000e1',
           credentials: {
             type: 'oauth',
             access: 'pool-access-fake',

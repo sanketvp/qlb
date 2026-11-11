@@ -123,6 +123,12 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import {
+  admitAnthropicCompleteSet,
+  SourceMembershipInvalidError,
+  type AdmittedAnthropicMember,
+  type AnthropicStageBinding,
+} from './anthropic-complete-set';
 import { config } from './config';
 import { codexSlotIdFromAccessToken } from './codex-auth';
 import { codexHeaderAccountId } from './codex-slots';
@@ -295,6 +301,7 @@ export interface OwnerFile {
   nativeStrategy?: NativeStrategy;
   authJsonKey?: string;
   nativeKeychainService?: string;
+  binding?: AnthropicStageBinding;
 }
 
 export interface MigrationStatus {
@@ -580,6 +587,41 @@ function claimPathPresent(path: string): boolean {
 function unlinkIfExists(path: string): void {
   if (!claimPathPresent(path)) return;
   rmSync(path);
+}
+
+function stagedPoolAccount(member: AdmittedAnthropicMember): {
+  id: string;
+  provider: 'anthropic';
+  label: string;
+  grant: Grant;
+  fingerprint: string;
+} {
+  const source = member.source as { id?: string; email?: string; name?: string };
+  const id = source.id || source.email || source.name || `account-${member.ordinal + 1}`;
+  const label = source.email || source.name || id;
+  const grant: Grant = {
+    access: member.access,
+    refresh: member.refresh,
+    expires: member.expires,
+    generation: 0,
+    writtenBy: 'migrate-stage',
+    extra: { type: 'oauth' },
+  };
+  return {
+    id,
+    provider: 'anthropic',
+    label,
+    grant,
+    fingerprint: fingerprintRefresh(grant.refresh),
+  };
+}
+
+function assertDistinctStagedAccountIds(accounts: Array<{ id: string }>): void {
+  const seen = new Set<string>();
+  for (const account of accounts) {
+    if (seen.has(account.id)) throw new SourceMembershipInvalidError();
+    seen.add(account.id);
+  }
 }
 
 export function parsePoolFile(raw: string): {
@@ -1789,23 +1831,39 @@ export class Migration {
       throw new Error(`pool file not found: ${this.poolFilePath}`);
     }
 
-    const raw = readFileSync(this.poolFilePath, 'utf8');
-    const { accounts } = parsePoolFile(raw);
-    const mtime = statSync(this.poolFilePath).mtimeMs;
+    return this.withPoolRollbackAuthLock(() => this.stageAdmittedPool());
+  }
 
+  private stageAdmittedPool(): MigrationStatus {
+    const admitted = admitAnthropicCompleteSet(readFileSync(this.poolFilePath, 'utf8'));
+    const mtime = statSync(this.poolFilePath).mtimeMs;
+    const stagedAt = Date.now();
+    const authBackupCycle = randomUUID();
+    const accounts = admitted.members.map((member) => stagedPoolAccount(member));
+    assertDistinctStagedAccountIds(accounts);
+    const binding: AnthropicStageBinding = {
+      version: 1,
+      cycle: authBackupCycle,
+      stagedAt,
+      memberCount: admitted.memberCount,
+      aliases: admitted.aliases,
+      identityKinds: admitted.identityKinds,
+      completeSetCommitment: admitted.commitment,
+    };
     const owner: OwnerFile = {
       owner: 'qlb',
-      stagedAt: Date.now(),
+      stagedAt,
       committedAt: null,
       exportSeq: 0,
-      qlbAccountIds: accounts.map((a) => a.id),
+      qlbAccountIds: accounts.map((account) => account.id),
       stores: [this.storeName],
-      accounts: accounts.map((a) => ({
-        id: a.id,
-        provider: a.provider,
-        label: a.label,
-        fingerprint: a.fingerprint,
+      accounts: accounts.map((account) => ({
+        id: account.id,
+        provider: account.provider,
+        label: account.label,
+        fingerprint: account.fingerprint,
       })),
+      binding,
     };
     // Intent journal FIRST so a concurrent prune cannot observe the account
     // row without a MIRRORED journal naming it.
@@ -1815,15 +1873,16 @@ export class Migration {
       nativeMtime: mtime,
       poolFilePath: this.poolFilePath,
       ownerFilePath: this.ownerFilePath,
-      stagedAt: owner.stagedAt,
-      authBackupCycle: randomUUID(),
+      stagedAt,
+      authBackupCycle,
+      binding,
       poolV2PublicationStarted: undefined,
     });
 
-    for (const acct of accounts) {
-      const { service, account } = keychainCoords(acct.provider, acct.id, acct.label);
-      this.keychain.setSync(service, account, JSON.stringify(acct.grant));
-      this.store.upsertAccount(acct.id, acct.provider, acct.label, 'imported-unvalidated');
+    for (const account of accounts) {
+      const { service, account: keychainAccount } = keychainCoords(account.provider, account.id, account.label);
+      this.keychain.setSync(service, keychainAccount, JSON.stringify(account.grant));
+      this.store.upsertAccount(account.id, account.provider, account.label, 'imported-unvalidated');
     }
 
     atomicWriteFile(this.stagingPath(), JSON.stringify(owner, null, 2) + '\n');
@@ -2784,6 +2843,7 @@ export class Migration {
     if (authKey !== undefined) this.removeCurrentCycleAuthBackup(authKey);
     this.journal('NATIVE', {
       intent: undefined,
+      binding: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',
     });
