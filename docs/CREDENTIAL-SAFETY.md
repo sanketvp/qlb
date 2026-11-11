@@ -50,7 +50,9 @@ The migration state machine (`src/migration.ts`) enumerates eleven crash points 
 - A crash mid-rehearsal or mid-staging leaves only a `.staging` file, which consumers ignore; `resume` cleans it up and the native store was never touched.
 - A crash right after the commit leaves the owner file present and the native store merely unused — QLB works; `resume` finishes the bookkeeping idempotently.
 
-`qlb migrate status` reports this state honestly — `state`, `ownerFile` (`absent`/`staging`/`present`), `nativeStore` (`intact`/`pre-qlb`/`both`/`missing`), and `piAtNextLaunch` (`native works` / `QLB works`) — so you can always see where you are before doing anything.
+`qlb migrate status` reports this state honestly — `state`, `ownerFile` (`absent`/`staging`/`present`), `nativeStore` (`intact`/`pre-qlb`/`both`/`missing`), and `piAtNextLaunch` (`native works` / `QLB works`) — so you can always see where you are before doing anything. Status, including `qlb migrate status --json`, is diagnostic. It is not a receipt and can include journal detail.
+
+`qlb migrate receipt --provider anthropic --phase stage|rehearse|commit|failure --json` is the only migration receipt. It is an allowlisted projection of phase, schema version, success or refusal, a fixed code, member count, and cycle-local aliases such as `member-0001`. A stage receipt succeeds only when the private journal binding and the staging binding are readable and equal and the current pool still admits to them. It then says `membership: "complete"` plus that count and those aliases. It does not print source identifiers, credentials, the commitment, or a raw error. Invalid membership is the fixed code `source-membership-invalid`. A failed restage keeps the previous mirrored or validated recovery files and cannot produce a success receipt. Rehearse, commit, and failure receipts do not succeed in this slice; when membership is valid they use the fixed code `proof-unavailable` and do not publish. Receipt writes no journal row, staging file, owner file, or Keychain item and makes no provider call.
 
 ## Shared files are shadow-retained, not moved
 
@@ -103,6 +105,7 @@ Even after QLB owns your credentials, the original native stores for harnesses l
 | Concern | Mechanism |
 |---|---|
 | Accidental credential changes | Adapters are read-only by construction; ownership only via `qlb migrate` |
+| Migration receipt | `qlb migrate receipt` is the only receipt and is allowlisted; `qlb migrate status --json` is diagnostic and is not a receipt |
 | Real cutovers | Refused without `--confirm-real-cutover` (exit 2) |
 | Trying before committing | `stage` (reversible) → `rehearse` (live proof, no refresh) → `commit` |
 | Crash during cutover | Single atomic rename as commit point; 11 enumerated crash points each resolve to "native works" or "QLB works"; `resume` converges |

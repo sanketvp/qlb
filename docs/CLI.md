@@ -581,7 +581,36 @@ resume:    noop
 }
 ```
 
-Subcommands: `stage`, `rehearse`, `commit`, `rollback`, `resume`, `status`. Common flags: `[--provider anthropic|xai|kimi-coding|openai-codex|openrouter]`, `[--pool-file <path>]`, `[--owner-file <path>]`, `[--auth-json <path>]`, `[--target-dir <path>]`, `[--db <path>]`, `[--json]`.
+`qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt.
+
+### `qlb migrate receipt`
+
+Anthropic-only read-only receipt, and the only operational migration receipt:
+
+```console
+$ qlb migrate receipt --provider anthropic --phase stage --pool-file /tmp/demo/anthropic-pool.json --owner-file /tmp/demo/qlb-owner.json --db /tmp/demo/qlb.db --json
+```
+
+`--phase` is `stage`, `rehearse`, `commit`, or `failure`. The command reads the pool file, the migration journal, and the staging owner file. It does not stage, rehearse, commit, resume, roll back, write a Keychain item, or call a provider. It does not take `--confirm-real-cutover` because it does not mutate.
+
+The printed object is built from an allowlist: `schemaVersion`, `phase`, `disposition` (`success` or `refused`), and, when one applies, `code`, `membership`, `count`, and `aliases`. A stage receipt has `disposition: "success"` only when the journal binding and the staging binding are both readable and equal and the current pool file still admits to that same binding. The success object is:
+
+```json
+{
+  "schemaVersion": 1,
+  "phase": "stage",
+  "disposition": "success",
+  "membership": "complete",
+  "count": 2,
+  "aliases": ["member-0001", "member-0002"]
+}
+```
+
+Aliases are cycle-local labels (`member-0001`), not source identities. The receipt never includes a cycle id, commitment, witness, credential, token hash, email, account id, label, path, Keychain coordinate, provider payload, or raw error.
+
+`code` is a fixed string. This slice emits `source-membership-invalid` when the pool membership is rejected, including when a restage fails and the previous recovery files are left in place. That refusal is not a success receipt. `rehearse`, `commit`, and `failure` do not succeed in this slice; when membership is not the reason, their code is `proof-unavailable`. A journal-only binding, a staging-only binding, or unequal bindings also cannot succeed. Exit `0` only for a success receipt. A refusal still prints the allowlisted JSON with `--json` and exits `1`.
+
+Subcommands: `stage`, `rehearse`, `commit`, `rollback`, `resume`, `status`, `receipt`. Common flags: `[--provider anthropic|xai|kimi-coding|openai-codex|openrouter]`, `[--pool-file <path>]`, `[--owner-file <path>]`, `[--auth-json <path>]`, `[--target-dir <path>]`, `[--db <path>]`, `[--json]`.
 
 **The safety interlock** — mutating subcommands that resolve to the real `~/.pi/agent/` credential files are refused unless `--confirm-real-cutover` is also passed:
 
