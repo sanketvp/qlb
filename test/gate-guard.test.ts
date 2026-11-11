@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -104,14 +104,28 @@ describe('qlb gate core (S30/S54)', () => {
         undefined,
         { authJsonPath: join(anthropicAgent, 'auth.json') },
       );
-      writeFileSync(join(anthropicAgent, 'anthropic-pool.json'), JSON.stringify({
+      const poolPath = join(anthropicAgent, 'anthropic-pool.json');
+      const ownerPath = join(anthropicAgent, 'qlb-owner.json');
+      const authPath = join(anthropicAgent, 'auth.json');
+      writeFileSync(poolPath, JSON.stringify({
         accounts: [{ id: 'anthropic-a', name: 'Anthropic A', credentials: {
           type: 'oauth', access: 'anthropic-access', refresh: 'anthropic-refresh', expires: Date.now() + 60_000,
         } }],
       }));
       migration.stage();
       await migration.rehearse(async () => ({ ok: true }));
-      migration.commit();
+      const poolBefore = readFileSync(poolPath);
+      const journalBefore = anthropicStore.getMigration('pi-pool');
+      assert.throws(() => migration.commit(), (error: unknown) => error instanceof Error
+        && error.message === 'proof-unavailable'
+        && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.deepEqual(readFileSync(poolPath), poolBefore);
+      assert.equal(existsSync(ownerPath), false);
+      assert.equal(existsSync(authPath), false);
+      assert.equal(anthropicStore.getMigration('pi-pool')?.state, journalBefore?.state);
+      assert.equal(anthropicStore.getMigration('pi-pool')?.detail_json, journalBefore?.detail_json);
+      writeFileSync(ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }) + '\n');
+      writeFileSync(authPath, JSON.stringify({ anthropic: { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 1 } }) + '\n');
     } finally {
       anthropicStore.close();
     }

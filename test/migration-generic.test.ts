@@ -1892,10 +1892,22 @@ describe('generic single-grant migration — xai / kimi-coding / openai-codex', 
       try {
         mig.stage();
         await mig.rehearse(mockRehearse([]));
-        mig.commit();
-        const committed = store.getMigration('pi-pool');
-        assert.ok(committed);
-        store.upsertMigration('pi-pool', 'NATIVE', committed.detail_json);
+        const poolBefore = readFileSync(poolPath);
+        const staged = store.getMigration('pi-pool');
+        assert.ok(staged);
+        assert.throws(() => mig.commit(), (error: unknown) => error instanceof Error
+          && error.message === 'proof-unavailable'
+          && (error as { exitCode?: unknown }).exitCode === 3);
+        assert.deepEqual(readFileSync(poolPath), poolBefore);
+        assert.equal(existsSync(ownerPath), false);
+        assert.equal(existsSync(join(dir, 'auth.json')), false);
+        assert.equal(store.getMigration('pi-pool')?.state, staged.state);
+        assert.equal(store.getMigration('pi-pool')?.detail_json, staged.detail_json);
+        writeFileSync(join(dir, 'auth.json'), JSON.stringify({
+          anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 },
+        }) + '\n');
+        writeFileSync(ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }) + '\n');
+        store.upsertMigration('pi-pool', 'NATIVE', staged.detail_json);
 
         const writes: Array<{ state: string; detail: Record<string, unknown> }> = [];
         const originalUpsertMigration = store.upsertMigration.bind(store);

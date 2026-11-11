@@ -286,7 +286,16 @@ async function createWriterFixture(kind) {
   }
   migration.stage();
   await migration.rehearse(rehearse);
-  migration.commit();
+  if (kind === 'pool') {
+    // Fresh pool commit is proof-unavailable. Roll back an already-present v2 map
+    // so the post-rollback VALIDATED scenarios still have a durable journal.
+    fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify({
+      anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 },
+    }) + '\n');
+    fs.writeFileSync(ownerPath, JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }) + '\n');
+  } else {
+    migration.commit();
+  }
   migration.rollback();
   seedMetadata(store, account, false);
   return { store, dbPath, dir, ownerPath, account, migration, rehearse };

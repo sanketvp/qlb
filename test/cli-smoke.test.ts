@@ -222,14 +222,16 @@ describe('CLI smoke — documented commands', () => {
     assert.match(result.stdout, /owner:\s+present/);
   });
 
-  it('bare migrate resume leaves legacy Anthropic conversion untouched; explicit --provider anthropic is required', () => {
+  it('bare migrate resume refuses a QLB_OWNED legacy owner without writing', () => {
     const env = isolatedEnv();
     const target = join(env.QLB_HOME!, 'migrate');
     const ownerPath = join(target, 'qlb-owner.json');
     const authPath = join(target, 'auth.json');
+    const poolPath = join(target, 'anthropic-pool.json');
     const owner = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n';
     const auth = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 } }, null, 2) + '\n';
-    writeFileSync(join(target, 'anthropic-pool.json'), JSON.stringify({ accounts: [] }) + '\n');
+    const pool = JSON.stringify({ accounts: [] }) + '\n';
+    writeFileSync(poolPath, pool);
     writeFileSync(ownerPath, owner);
     writeFileSync(authPath, auth);
     const store = openStore(env.QLB_DB_PATH!);
@@ -240,9 +242,20 @@ describe('CLI smoke — documented commands', () => {
     }
 
     const result = runCli(['migrate', 'resume', '--target-dir', target, '--db', env.QLB_DB_PATH!, '--confirm-real-cutover'], env);
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, 3, result.stderr);
+    assert.match(result.stderr, /proof-unavailable/);
     assert.equal(readFileSync(ownerPath, 'utf8'), owner);
     assert.equal(readFileSync(authPath, 'utf8'), auth);
+    assert.equal(readFileSync(poolPath, 'utf8'), pool);
+    assert.equal(existsSync(`${poolPath}.pre-qlb`), false);
+    const after = openStore(env.QLB_DB_PATH!);
+    try {
+      const row = after.getMigration('pi-pool');
+      assert.equal(row?.state, 'QLB_OWNED');
+      assert.equal(row?.detail_json, '{}');
+    } finally {
+      after.close();
+    }
   });
 
   it('plain-text migrate status prints the hand-back record fields with null shown as not fenced', () => {
