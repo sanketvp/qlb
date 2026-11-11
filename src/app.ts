@@ -15,6 +15,13 @@ import { runCodexProbeClaims } from './commands/codex-probe-claims';
 import { redactError, redactSecrets } from './redact';
 import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
+import {
+  formatAnthropicReceipt,
+  isReceiptPhase,
+  projectAnthropicReceipt,
+  readAnthropicReceiptSources,
+  type AnthropicReceiptPhase,
+} from './anthropic-receipt';
 import { loginExpiresAtIso } from './anthropic-oauth';
 import { qlbOwnsAnthropicUsage } from './anthropic-usage-view';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from './keychain';
@@ -127,6 +134,7 @@ const USAGE = `Usage:
   qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate status   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] [--pool-file <path>] [--owner-file <path>] [--auth-json <path>] [--db <path>] [--target-dir <path>] [--json]
+  qlb migrate receipt  --provider anthropic --phase stage|rehearse|commit|failure [--pool-file <path>] [--owner-file <path>] [--db <path>] [--target-dir <path>] [--json]
   qlb retire native status  --harness claude-code|codex-cli [--json] [--db <path>]
   qlb retire native execute --harness claude-code|codex-cli --confirm-real-retirement [--db <path>]
   qlb accounts prune --account <id> --confirm [--json] [--db <path>]
@@ -235,7 +243,7 @@ type OverrideListOpts = {
   db?: string;
 };
 type OverrideOpts = OverridePinOpts | OverrideAccountOpts | OverrideClearOpts | OverrideListOpts;
-type MigrateSub = 'stage' | 'rehearse' | 'commit' | 'rollback' | 'resume' | 'status';
+type MigrateSub = 'stage' | 'rehearse' | 'commit' | 'rollback' | 'resume' | 'status' | 'receipt';
 type MigrateOpts = {
   cmd: 'migrate';
   sub: MigrateSub;
@@ -249,6 +257,7 @@ type MigrateOpts = {
   protectedPiAuthJsonPath: string;
   db?: string;
   confirmRealCutover: boolean;
+  phase?: AnthropicReceiptPhase;
 };
 type PolicySetOpts = {
   cmd: 'policy';
@@ -338,6 +347,7 @@ const MIGRATE_SUBS: readonly MigrateSub[] = [
   'rollback',
   'resume',
   'status',
+  'receipt',
 ];
 
 function isMigrateSub(s: string | undefined): s is MigrateSub {
@@ -378,7 +388,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     process.exit(0);
   }
   if (!isMigrateSub(subRaw)) {
-    console.error('qlb migrate: unknown subcommand. Expected stage|rehearse|commit|rollback|resume|status');
+    console.error('qlb migrate: unknown subcommand. Expected stage|rehearse|commit|rollback|resume|status|receipt');
     console.error(USAGE);
     process.exit(1);
   }
@@ -392,6 +402,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   let db: string | undefined;
   let confirmRealCutover = false;
   let providerRaw: string | undefined;
+  let phaseRaw: string | undefined;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -417,6 +428,10 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     }
     if (arg === '--provider') {
       providerRaw = rest[++i];
+      continue;
+    }
+    if (arg === '--phase') {
+      phaseRaw = rest[++i];
       continue;
     }
     if (arg === '--target-dir') {
@@ -445,6 +460,19 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     process.exit(1);
   }
   const provider: MigrateProvider = providerRawOrDefault;
+  if (subRaw === 'receipt') {
+    if (provider !== 'anthropic') {
+      console.error('qlb migrate receipt: --provider must be anthropic');
+      process.exit(1);
+    }
+    if (!isReceiptPhase(phaseRaw)) {
+      console.error('qlb migrate receipt: --phase must be stage|rehearse|commit|failure');
+      process.exit(1);
+    }
+  } else if (phaseRaw !== undefined) {
+    console.error('qlb migrate: --phase is only valid with receipt');
+    process.exit(1);
+  }
 
   // config.ts retains the actual winning spelling (flag, env, config file, or
   // default) so normalization cannot erase a hostile segment before migration
@@ -481,6 +509,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     protectedPiAuthJsonPath,
     db,
     confirmRealCutover,
+    phase: isReceiptPhase(phaseRaw) ? phaseRaw : undefined,
   };
 }
 
@@ -1121,7 +1150,7 @@ type MigratePathAdmission = {
  * keeps structural refusals from creating a database or migration backup.
  */
 function prepareMigratePathAdmission(opts: MigrateOpts): MigratePathAdmission | undefined {
-  if (opts.sub === 'status') return undefined;
+  if (opts.sub === 'status' || opts.sub === 'receipt') return undefined;
   assertSupportedPlatform();
   const cwd = physicalCwd();
   const protectedRoot = resolveProtectedRoot(opts.protectedPiAuthJsonPath, {
@@ -1652,6 +1681,20 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
     // reports DUAL_OWNERSHIP_REFUSED even on default (live) paths; still before
     // any migration object is built or any native/owner file is touched.
     assertNoUnconfirmedRealCutover(opts, paths);
+    if (opts.sub === 'receipt') {
+      const phase = opts.phase;
+      if (opts.provider !== 'anthropic' || phase === undefined) {
+        console.error('qlb migrate receipt: --provider must be anthropic and --phase must be stage|rehearse|commit|failure');
+        return 1;
+      }
+      const receipt = projectAnthropicReceipt(phase, readAnthropicReceiptSources(
+        opts.poolFile,
+        opts.ownerFile,
+        store.getMigration(PI_POOL_STORE)?.detail_json,
+      ));
+      console.log(formatAnthropicReceipt(receipt, opts.json));
+      return receipt.disposition === 'success' ? 0 : 1;
+    }
     const mig = isStaticKeyProvider(opts.provider)
       ? createStaticKeyMigration(
           store,

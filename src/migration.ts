@@ -624,6 +624,13 @@ function assertDistinctStagedAccountIds(accounts: Array<{ id: string }>): void {
   }
 }
 
+/** Same derived-id refusal stage uses. A duplicate id is `source-membership-invalid`. */
+export function distinctAnthropicStageAccounts(members: readonly AdmittedAnthropicMember[]) {
+  const accounts = members.map((member) => stagedPoolAccount(member));
+  assertDistinctStagedAccountIds(accounts);
+  return accounts;
+}
+
 export function parsePoolFile(raw: string): {
   parsed: PoolFileInput;
   accounts: Array<{
@@ -681,6 +688,15 @@ export function parsePoolFile(raw: string): {
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Status is diagnostic. The private complete-set commitment stays in the journal and staging file. */
+function detailForStatus(detail: Record<string, unknown>): Record<string, unknown> {
+  const binding = detail.binding;
+  if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return detail;
+  const redacted = { ...binding };
+  delete redacted.completeSetCommitment;
+  return { ...detail, binding: redacted };
 }
 
 /** Bridge the shared Pi-gate document validator to migration's legacy v1 payload. */
@@ -1783,7 +1799,7 @@ export class Migration {
       nativeStore,
       piAtNextLaunch,
       resumeAction,
-      detail,
+      detail: detailForStatus(detail),
       handback,
       nativeStrategy: this.strategy(),
       provider: this.provider,
@@ -1839,8 +1855,7 @@ export class Migration {
     const mtime = statSync(this.poolFilePath).mtimeMs;
     const stagedAt = Date.now();
     const authBackupCycle = randomUUID();
-    const accounts = admitted.members.map((member) => stagedPoolAccount(member));
-    assertDistinctStagedAccountIds(accounts);
+    const accounts = distinctAnthropicStageAccounts(admitted.members);
     const binding: AnthropicStageBinding = {
       version: 1,
       cycle: authBackupCycle,
