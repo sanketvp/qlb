@@ -1291,11 +1291,13 @@ export class Migration {
     return Object.assign(new Error('proof-unavailable'), { exitCode: 3 });
   }
 
-  /** Publication is allowed only when a v2 owner or publication marker already exists. */
+  /** Commit publishes only with a recovery signal. Resume allows a matching VALIDATED v1 owner. */
   private poolForwardBlocked(current: MigrationStatus, forResume: boolean): boolean {
     if (current.detail.poolV2PublicationStarted === true || this.ownerEntryPresentAt(this.ownerMapPath)) return false;
     if (!forResume) return true;
-    if (this.poolLegacyOwnerPresent()) return current.state === 'QLB_OWNED';
+    if (this.poolLegacyOwnerPresent()) {
+      return !(current.state === 'VALIDATED' && this.readOwnerFileAt(this.ownerFilePath) !== null);
+    }
     return current.state === 'MIRRORED' || current.state === 'VALIDATED';
   }
 
@@ -1690,7 +1692,7 @@ export class Migration {
       resumeAction = ownerPresent
         ? 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic`'
         : 'stale native writer: auth.json[anthropic] is not the placeholder; run `qlb migrate rollback --provider anthropic` or re-stage';
-    } else if (poolLegacyOwner && state === 'QLB_OWNED' && !poolV2Owner && detail.poolV2PublicationStarted !== true) {
+    } else if (poolLegacyOwner && !poolV2Owner && detail.poolV2PublicationStarted !== true && !(state === 'VALIDATED' && this.readOwnerFileAt(this.ownerFilePath) !== null)) {
       resumeAction = 'proof-unavailable';
     } else if (ownerPresent && STATE_RANK[state] < STATE_RANK.QLB_OWNED) {
       resumeAction = staticKey

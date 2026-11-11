@@ -291,6 +291,46 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
+  it('refuses resume of a short legacy v1 claim that is not a validated journal match', () => {
+    const owner = JSON.stringify({ owner: 'qlb', accounts: [{ provider: 'anthropic' }] }) + '\n';
+    const auth = JSON.stringify({ anthropic: { type: 'oauth', access: 'native-access', refresh: 'native-refresh', expires: 1 } }) + '\n';
+    for (const state of ['absent', 'NATIVE', 'MIRRORED', 'RETIRED'] as const) {
+      const h = setup();
+      try {
+        if (state === 'MIRRORED') h.mig.stage();
+        else if (state !== 'absent') h.store.upsertMigration(PI_POOL_STORE, state, '{}');
+        writeFileSync(h.ownerPath, owner, { mode: 0o600 });
+        writeFileSync(h.authPath, auth, { mode: 0o600 });
+        const poolBefore = readFileSync(h.poolPath);
+        const journalBefore = JSON.stringify(h.store.getMigration(PI_POOL_STORE) ?? null);
+        assert.equal(h.mig.status().resumeAction, 'proof-unavailable', state);
+        assertProofUnavailable(() => h.mig.resume());
+        assert.deepEqual(readFileSync(h.poolPath), poolBefore, state);
+        assert.equal(existsSync(preQlbPath(h.poolPath)), false, state);
+        assert.equal(readFileSync(h.ownerPath, 'utf8'), owner, state);
+        assert.equal(readFileSync(h.authPath, 'utf8'), auth, state);
+        assert.equal(JSON.stringify(h.store.getMigration(PI_POOL_STORE) ?? null), journalBefore, state);
+      } finally {
+        h.cleanup();
+      }
+    }
+  });
+
+  it('VALIDATED resume still finishes hygiene when the v1 owner matches the journal', () => {
+    const h = setup();
+    try {
+      installHistory(h);
+      const native = readFileSync(h.poolPath);
+      const resumed = h.mig.resume();
+      assert.equal(resumed.state, 'QLB_OWNED');
+      assert.equal(existsSync(h.poolPath), false);
+      assert.deepEqual(readFileSync(preQlbPath(h.poolPath)), native);
+      assert.equal(existsSync(h.ownerPath), true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('bare resume of a QLB_OWNED legacy owner refuses without writing', () => {
     const h = setup();
     try {
