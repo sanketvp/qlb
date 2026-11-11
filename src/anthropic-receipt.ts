@@ -7,7 +7,7 @@ import {
   type AdmittedAnthropicPool,
   type AnthropicIdentityKind,
 } from './anthropic-complete-set';
-import { stagingOwnerPath } from './migration';
+import { distinctAnthropicStageAccounts, stagingOwnerPath } from './migration';
 
 export const RECEIPT_SCHEMA_VERSION = 1;
 
@@ -126,7 +126,9 @@ function sourceMatches(admitted: AdmittedAnthropicPool, binding: PrivateBinding)
 function admitPool(poolText: string | null): { admitted: AdmittedAnthropicPool | null; invalid: boolean } {
   if (poolText === null) return { admitted: null, invalid: false };
   try {
-    return { admitted: admitAnthropicCompleteSet(poolText), invalid: false };
+    const admitted = admitAnthropicCompleteSet(poolText);
+    distinctAnthropicStageAccounts(admitted.members);
+    return { admitted, invalid: false };
   } catch (error) {
     return {
       admitted: null,

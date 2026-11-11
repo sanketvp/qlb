@@ -263,6 +263,31 @@ describe('anthropic migration receipt', () => {
     });
   });
 
+  it('surfaces duplicate derived account ids as source-membership-invalid', () => {
+    const duplicate = pool([
+      { email: 'same@example.com', name: 'One', credentials: oauth() },
+      { id: 'same@example.com', name: 'Two', accountUuid: '11111111-1111-4111-8111-111111111111', credentials: oauth() },
+    ]);
+    withPool(duplicate, (ctx) => {
+      assert.throws(
+        () => ctx.mig.stage(),
+        (error: unknown) => error instanceof SourceMembershipInvalidError && error.code === 'source-membership-invalid',
+      );
+      assert.equal(ctx.store.getMigration(PI_POOL_STORE), null);
+      assert.equal(existsSync(stagingOwnerPath(ctx.ownerPath)), false);
+      for (const phase of PHASES) {
+        const text = formatAnthropicReceipt(projectAnthropicReceipt(phase, sourcesOf(ctx)), true);
+        assert.deepEqual(JSON.parse(text), {
+          schemaVersion: 1,
+          phase,
+          disposition: 'refused',
+          code: 'source-membership-invalid',
+        });
+        assertNoEcho(text, [JSON.parse(duplicate), 'same@example.com', '11111111-1111-4111-8111-111111111111']);
+      }
+    });
+  });
+
   it('uses the plan proof-unavailable code for rehearse, commit, and failure without a success receipt', () => {
     withPool(pool([emailMember()]), (ctx) => {
       ctx.mig.stage();
