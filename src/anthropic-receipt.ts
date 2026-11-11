@@ -8,6 +8,7 @@ import {
   type AdmittedAnthropicPool,
   type AnthropicIdentityKind,
 } from './anthropic-complete-set';
+import { assessAnthropicAdoption } from './anthropic-adoption';
 import { assessAnthropicForwardAdmission } from './anthropic-forward-admission';
 import { identityMismatchRefusal, identityProofBuckets } from './anthropic-rehearsal-proof';
 import { distinctAnthropicStageAccounts, stagingOwnerPath } from './migration';
@@ -33,7 +34,8 @@ export type AnthropicReceiptCode =
   | 'adoption-slot-missing'
   | 'adoption-ambiguous'
   | 'adoption-slot-unusable'
-  | 'initial-active-invalid';
+  | 'initial-active-invalid'
+  | 'adoption-mismatch';
 
 const REHEARSE_REFUSAL_CODES = [
   'identity-mismatch',
@@ -96,6 +98,9 @@ export interface AnthropicReceiptSources {
   journalDetail: unknown;
   stagingDocument: unknown;
   ownerDocument?: unknown;
+  adoptionSlots?: Array<{ accountId: string; email: string | null; dead: boolean; archivedAt: number | null }>;
+  activeAccountId?: string | null;
+  now?: number;
 }
 
 interface PrivateBinding {
@@ -284,6 +289,7 @@ export function projectAnthropicReceipt(
       || decision === 'proof-stale'
       || decision === 'identity-mismatch'
       || decision === 'proof-unavailable'
+      || decision === 'adoption-mismatch'
     ) {
       return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: decision };
     }
@@ -334,8 +340,33 @@ function commitEvidence(sources: AnthropicReceiptSources, journal: PrivateBindin
     sourcePresent,
     identityProof: isRecord(sources.journalDetail) ? sources.journalDetail.identityProof : null,
     identityMismatch: identityMismatchRefusal(sources.journalDetail),
-    now: Date.now(),
+    adoptionMismatch: adoptionMismatch(sources, journal),
+    adoptionMarkerCycle: adoptionMarkerCycle(sources.journalDetail),
+    now: sources.now ?? Date.now(),
   };
+}
+
+function adoptionMarkerCycle(detail: unknown): string | null {
+  if (!isRecord(detail) || !isRecord(detail.adoption)) return null;
+  const marker = detail.adoption;
+  return marker.version === 1 && typeof marker.cycle === 'string' && marker.cycle.length > 0 ? marker.cycle : null;
+}
+
+function adoptionMismatch(sources: AnthropicReceiptSources, journal: PrivateBinding | null): boolean {
+  if (!journal || sources.adoptionSlots === undefined || sources.poolText === null) return false;
+  try {
+    const admitted = admitAnthropicCompleteSet(sources.poolText);
+    return assessAnthropicAdoption(
+      isRecord(sources.journalDetail) ? sources.journalDetail.adoptionBinding : null,
+      admitted,
+      sources.adoptionSlots,
+      sources.activeAccountId ?? null,
+      journal.cycle,
+      sources.now ?? Date.now(),
+    ) !== 'ok';
+  } catch {
+    return false;
+  }
 }
 
 /** Allowlisted object. Callers serialize this value and never a journal or staging document. */
@@ -350,7 +381,8 @@ export function anthropicReceiptBody(receipt: AnthropicReceipt): Record<string, 
       || receipt.code === 'source-membership-invalid'
       || receipt.code === ANTHROPIC_PROOF_UNAVAILABLE
       || receipt.code === 'source-witness-unavailable'
-      || receipt.code === 'proof-stale') {
+      || receipt.code === 'proof-stale'
+      || receipt.code === 'adoption-mismatch') {
       if (receipt.code) body.code = receipt.code;
     }
     return body;
