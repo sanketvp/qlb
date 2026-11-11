@@ -656,6 +656,49 @@ describe('migration state machine — §4.8.3 / §4.8.3a', () => {
     }
   });
 
+  it('resume refuses to retire a live pool from a QLB_OWNED v2 owner with an empty journal', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: piPlaceholder() }) + '\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', '{}');
+      const poolBefore = readFileSync(h.poolPath);
+      const ownerBefore = readFileSync(h.ownerPath);
+      assert.equal(h.mig.status().resumeAction, 'source-witness-unavailable');
+      assert.throws(() => h.mig.resume(), (error: unknown) => error instanceof Error
+        && error.message === 'source-witness-unavailable'
+        && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
+      assert.deepEqual(readFileSync(h.ownerPath), ownerBefore);
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'QLB_OWNED');
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, '{}');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('resume refuses to retire a live pool when only the publication marker is set', () => {
+    const h = setup();
+    try {
+      writeFileSync(h.authPath, JSON.stringify({ anthropic: piPlaceholder() }) + '\n', { mode: 0o600 });
+      writePiOwnerEntry(h.ownerPath, 'anthropic', true);
+      const detail = JSON.stringify({ poolV2PublicationStarted: true });
+      h.store.upsertMigration(PI_POOL_STORE, 'QLB_OWNED', detail);
+      const poolBefore = readFileSync(h.poolPath);
+      assert.equal(h.mig.status().resumeAction, 'source-witness-unavailable');
+      assert.throws(() => h.mig.resume(), (error: unknown) => error instanceof Error
+        && error.message === 'source-witness-unavailable'
+        && (error as { exitCode?: unknown }).exitCode === 3);
+      assert.deepEqual(readFileSync(h.poolPath), poolBefore);
+      assert.equal(existsSync(preQlbPath(h.poolPath)), false);
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.state, 'QLB_OWNED');
+      assert.equal(h.store.getMigration(PI_POOL_STORE)?.detail_json, detail);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('refuses an orphan v2 Anthropic owner without this migration’s staging or journal evidence', () => {
     const h = setup();
     try {

@@ -1306,7 +1306,14 @@ export class Migration {
     return v2
       && (STATE_RANK[current.state] < STATE_RANK.QLB_OWNED
         || !this.poolPlaceholderPresent()
-        || this.claimPathPresent(this.stagingPath()));
+        || this.claimPathPresent(this.stagingPath())
+        || this.poolLiveNativeWouldBeRetired());
+  }
+
+  /** True when finishHygiene would rename the live pool. Already-retired natives are not a new write. */
+  private poolLiveNativeWouldBeRetired(): boolean {
+    if (this.retainsNative()) return false;
+    return existsSync(this.poolFilePath) && !existsSync(preQlbPath(this.poolFilePath));
   }
 
   private poolLegacyOwnerProviders(): string[] | null {
@@ -1909,7 +1916,9 @@ export class Migration {
               : 'already committed; finish hygiene (H1–H2) → QLB_OWNED';
     } else if (ownerPresent && nativePresent && !prePresent && !retains
       && !(this.kind === 'pool' && poolV2Owner && !poolPlaceholder)) {
-      resumeAction = 'finish hygiene: rename native → .pre-qlb';
+      resumeAction = this.kind === 'pool' && poolV2Owner
+        ? this.poolPublicationGuidance()
+        : 'finish hygiene: rename native → .pre-qlb';
     } else if (ownerPresent) {
       resumeAction = staticKey
         ? 'noop (already QLB_OWNED; native Keychain retained)'
