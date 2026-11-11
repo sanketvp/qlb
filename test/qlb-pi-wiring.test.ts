@@ -498,7 +498,7 @@ describe('Anthropic gate timeout', () => {
   it('passes the bounded-refresh budget only to the Anthropic gate call', () => {
     const source = readFileSync(join(ROOT, 'extensions', 'qlb-pi', 'index.ts'), 'utf8');
     assert.match(source, /const ANTHROPIC_GATE_TIMEOUT_MS = 45_000;/);
-    assert.match(source, /runQlb\(\s*\["gate", provider, "--json", \.\.\.\(retryAfter401Fp === undefined \? \[\] : \["--retry-after-401", retryAfter401Fp\]\)\],\s*ANTHROPIC_GATE_TIMEOUT_MS,/);
+    assert.match(source, /runQlb\(\s*\["gate", provider, "--json",\s*\.\.\.\(smoke \? \["--no-refresh"\] : \[\]\),\s*\.\.\.\(smoke \|\| retryAfter401Fp === undefined \? \[\] : \["--retry-after-401", retryAfter401Fp\]\)\],\s*ANTHROPIC_GATE_TIMEOUT_MS,/);
   });
 });
 
