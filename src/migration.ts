@@ -125,6 +125,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
   admitAnthropicCompleteSet,
+  sourceWitnessForMembers,
   SourceMembershipInvalidError,
   type AdmittedAnthropicMember,
   type AnthropicStageBinding,
@@ -690,13 +691,15 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Status is diagnostic. The private complete-set commitment stays in the journal and staging file. */
+/** Status is diagnostic. Commitment stays journal/staging-only; source witness stays journal-only. */
 function detailForStatus(detail: Record<string, unknown>): Record<string, unknown> {
-  const binding = detail.binding;
-  if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return detail;
+  const redactedDetail = { ...detail };
+  delete redactedDetail.sourceWitness;
+  const binding = redactedDetail.binding;
+  if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return redactedDetail;
   const redacted = { ...binding };
   delete redacted.completeSetCommitment;
-  return { ...detail, binding: redacted };
+  return { ...redactedDetail, binding: redacted };
 }
 
 /** Bridge the shared Pi-gate document validator to migration's legacy v1 payload. */
@@ -1852,6 +1855,7 @@ export class Migration {
 
   private stageAdmittedPool(): MigrationStatus {
     const admitted = admitAnthropicCompleteSet(readFileSync(this.poolFilePath, 'utf8'));
+    const sourceWitness = sourceWitnessForMembers(admitted.members);
     const mtime = statSync(this.poolFilePath).mtimeMs;
     const stagedAt = Date.now();
     const authBackupCycle = randomUUID();
@@ -1891,6 +1895,7 @@ export class Migration {
       stagedAt,
       authBackupCycle,
       binding,
+      sourceWitness,
       poolV2PublicationStarted: undefined,
     });
 
@@ -2859,6 +2864,7 @@ export class Migration {
     this.journal('NATIVE', {
       intent: undefined,
       binding: undefined,
+      sourceWitness: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',
     });

@@ -24,6 +24,17 @@ export interface CompleteSetCommitment {
   digest: string;
 }
 
+export interface SourceWitnessMemberInput extends CompleteSetMemberInput {
+  access: string;
+  refresh: string;
+}
+
+export interface SourceWitness {
+  version: 1;
+  algorithm: 'sha256';
+  digest: string;
+}
+
 export interface AnthropicStageBinding {
   version: 1;
   cycle: string;
@@ -110,6 +121,7 @@ function utf8_32(value: string): Buffer {
 }
 
 const DOMAIN_COMPLETE = utf8_32('qlb:anthropic:pool-complete-set:v1\u0000');
+const DOMAIN_WITNESS = utf8_32('qlb:anthropic:pool-source-witness:v1\u0000');
 
 export function memberAlias(ordinal: number): string {
   return `member-${String(ordinal + 1).padStart(4, '0')}`;
@@ -133,6 +145,36 @@ export function encodeCompleteSetPreimage(members: readonly CompleteSetMemberInp
     );
   });
   return Buffer.concat(parts);
+}
+
+export function encodeSourceWitnessPreimage(members: readonly SourceWitnessMemberInput[]): Buffer {
+  if (!Number.isSafeInteger(members.length) || members.length < 1 || members.length > 0xffffffff) reject();
+  const parts: Buffer[] = [DOMAIN_WITNESS, u32be(members.length)];
+  members.forEach((member, index) => {
+    if (member.ordinal !== index) reject();
+    const tag = IDENTITY_TAG[member.identityKind];
+    if (tag === undefined) reject();
+    parts.push(
+      u32be(member.ordinal),
+      u8(0x01),
+      u8(0x01),
+      utf8_32(scalarString(member.access)),
+      u8(0x01),
+      utf8_32(scalarString(member.refresh)),
+      u64be(member.expires),
+      u8(tag),
+      utf8_32(scalarString(member.identity)),
+    );
+  });
+  return Buffer.concat(parts);
+}
+
+export function sourceWitnessForMembers(members: readonly SourceWitnessMemberInput[]): SourceWitness {
+  return {
+    version: 1,
+    algorithm: 'sha256',
+    digest: sha256Base64Url(encodeSourceWitnessPreimage(members)),
+  };
 }
 
 function sha256Base64Url(preimage: Buffer): string {
