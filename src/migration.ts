@@ -66,9 +66,14 @@
 //     here is indistinguishable from H2. QLB WORKS (qlb-pi never reads
 //     auth.json). resume(): noop.
 //
-// H4  Cosmetic rename of extensions/anthropic-pool → .disabled. Never
-//     required — the owner-file guard already makes anthropic-pool inert.
-//     Crash: QLB WORKS. resume(): noop.
+// H4  Rename extensions/anthropic-pool into extensions-disabled-by-qlb so the
+//     owned gate's anthropic-pool-present prerequisite can pass.
+//     F5  Crash after the owner entry, before the rename. The gate refuses
+//         anthropic-pool-present until resume performs the rename.
+//     B6  Crash after the rollback rename restores the extension, before the
+//         owner claim is removed. The gate refuses anthropic-pool-present
+//         until rollback is run again.
+//     Both windows are bounded: re-running resume or rollback converges.
 //
 // ROLLBACK (only entered by explicit rollback() or resume() with
 // detail.intent='rollback'. resume() never *starts* a post-commit rollback.)
@@ -113,6 +118,7 @@ import {
   fstatSync,
   existsSync,
   fsyncSync,
+  mkdirSync,
   lstatSync,
   openSync,
   realpathSync,
@@ -1598,6 +1604,7 @@ export class Migration {
         if (isForwardRefusal(decision)) throw this.poolAdmissionError(decision);
         this.assertPoolLegacyOwnerClaimsOnlyAnthropic();
         this.assertPoolPlaceholderBackupLineage();
+        this.assertAnthropicPoolExtensionMovable();
         const writeOwner = (replaceLegacyDocument: boolean): void => this.withOwnerMapLockUnlessHeld(() => writePiOwnerEntry(
           this.ownerMapPath,
           'anthropic',
@@ -1629,6 +1636,7 @@ export class Migration {
         }
         this.writePoolAnthropicPlaceholder();
         this.afterWrite?.('placeholder');
+        this.recordAnthropicPoolExtension(this.disableAnthropicPoolExtension());
       });
     });
     if (stagingPresent) unlinkIfExists(staging);
@@ -2006,6 +2014,8 @@ export class Migration {
     } else {
       resumeAction = this.kind === 'single-grant' ? 'nothing to roll back' : 'noop';
     }
+    const extensionRefusal = this.anthropicPoolExtensionRefusal();
+    if (extensionRefusal) resumeAction = extensionRefusal;
 
     return {
       store: this.storeName,
@@ -3039,7 +3049,87 @@ export class Migration {
         ) + '\n',
       );
     }
+    this.recordAnthropicPoolExtension(this.disableAnthropicPoolExtension());
     return this.status();
+  }
+
+  private anthropicPoolExtensionPaths(): { src: string; dst: string } {
+    const agentDir = dirname(this.poolFilePath);
+    return {
+      src: join(agentDir, 'extensions', 'anthropic-pool'),
+      dst: join(agentDir, 'extensions-disabled-by-qlb', 'anthropic-pool'),
+    };
+  }
+
+  private pathPresent(path: string): boolean {
+    try {
+      lstatSync(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  private assertAnthropicPoolExtensionMovable(): void {
+    if (this.kind !== 'pool') return;
+    const paths = this.anthropicPoolExtensionPaths();
+    if (this.pathPresent(paths.src) && this.pathPresent(paths.dst)) {
+      throw this.poolAdmissionError('anthropic-pool-dir-ambiguous');
+    }
+  }
+
+  /** F1–F4. Idempotent. Both directories present is a refusal and moves nothing. */
+  private disableAnthropicPoolExtension(): 'disabled' | 'absent' {
+    if (this.kind !== 'pool') return 'absent';
+    const paths = this.anthropicPoolExtensionPaths();
+    const src = this.pathPresent(paths.src);
+    const dst = this.pathPresent(paths.dst);
+    if (src && dst) throw this.poolAdmissionError('anthropic-pool-dir-ambiguous');
+    if (src && !dst) {
+      mkdirSync(dirname(paths.dst), { recursive: true, mode: 0o700 });
+      renameSync(paths.src, paths.dst);
+      this.fsyncDirectory(dirname(paths.src));
+      this.fsyncDirectory(dirname(paths.dst));
+    }
+    return src || dst ? 'disabled' : 'absent';
+  }
+
+  private recordAnthropicPoolExtension(disposition: 'disabled' | 'absent' | 'restored'): void {
+    if (this.kind !== 'pool') return;
+    this.journal(this.journalState(), { anthropicPoolExtension: disposition });
+  }
+
+  private anthropicPoolExtensionRefusal(): string | null {
+    if (this.kind !== 'pool') return null;
+    const paths = this.anthropicPoolExtensionPaths();
+    const src = this.pathPresent(paths.src);
+    const dst = this.pathPresent(paths.dst);
+    if (src && dst) return 'anthropic-pool-dir-ambiguous';
+    const recorded = parseDetail(this.store.getMigration(this.storeName)?.detail_json).anthropicPoolExtension;
+    if (!src && !dst && recorded === 'disabled') return 'anthropic-pool-dir-missing';
+    return null;
+  }
+
+  /** B1–B4'. Refusals leave the owner claim in place. */
+  private restoreAnthropicPoolExtension(): void {
+    if (this.kind !== 'pool') return;
+    const paths = this.anthropicPoolExtensionPaths();
+    const src = this.pathPresent(paths.src);
+    const dst = this.pathPresent(paths.dst);
+    const recorded = parseDetail(this.store.getMigration(this.storeName)?.detail_json).anthropicPoolExtension;
+    if (src && dst) throw this.poolAdmissionError('anthropic-pool-dir-ambiguous');
+    if (!src && !dst) {
+      if (recorded === 'disabled') throw this.poolAdmissionError('anthropic-pool-dir-missing');
+      return;
+    }
+    if (!src && dst) {
+      mkdirSync(dirname(paths.src), { recursive: true, mode: 0o700 });
+      renameSync(paths.dst, paths.src);
+      this.fsyncDirectory(dirname(paths.dst));
+      this.fsyncDirectory(dirname(paths.src));
+    }
+    this.recordAnthropicPoolExtension('restored');
   }
 
   private deleteStagedKeychain(accounts: OwnerFile['accounts'] | undefined): void {
@@ -3335,6 +3425,7 @@ export class Migration {
     if (!existsSync(native) && existsSync(retired)) {
       renameSync(retired, native);
     }
+    if (existsSync(native)) this.restoreAnthropicPoolExtension();
 
     // RC — restore any P7b8 Anthropic placeholder and only then unlink its
     // owner claim. Legacy v1 pool documents never recorded a v2 owner entry
