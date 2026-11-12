@@ -342,7 +342,7 @@ sleep 7`);
 sleep 8`);
     const second = s4Fake(s.dir, 'second', `echo ran > "${secondRuns}"`);
     try {
-      assert.throws(() => runKeychainClientSync(keychainRequestFromArgv('security', hold, ['find-generic-password', '-a', 'a', '-w', '-s', 'svc-s4-shared'], { timeoutMs: 300, lockfPath: s.lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
+      assert.throws(() => runKeychainClientSync(keychainRequestFromArgv('security', hold, ['find-generic-password', '-a', 'a', '-w', '-s', 'svc-s4-shared'], { timeoutMs: 3_000, lockfPath: s.lockfPath })), (err: unknown) => (err as { code?: unknown }).code === 'ETIMEDOUT');
       boundedPoll(startedFile, 5_000);
       const began = Date.now();
       await assert.rejects(defaultHelperRunner(second, ['probe-read', 'svc-s4-shared', 'a'], undefined, undefined, null, { lockfPath: s.lockfPath }), KeychainRequestStillWaiting);
