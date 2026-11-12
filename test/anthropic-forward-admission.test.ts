@@ -126,6 +126,14 @@ describe('assessAnthropicForwardAdmission', () => {
     );
   });
 
+  it('admits a proof whose 5h bucket is 0', () => {
+    const idle = evidence();
+    const members = (idle.identityProof as { members: Array<{ buckets: { '5h': number } }> }).members;
+    members[0].buckets['5h'] = 0;
+    assert.equal(assessAnthropicForwardAdmission(idle, 'pre-owner'), 'ADMIT_PRE_OWNER');
+    assert.equal(assessAnthropicForwardAdmission({ ...idle, canonicalOwnerEntry: true }, 'post-owner-recovery'), 'ADMIT_POST_OWNER_RECOVERY');
+  });
+
   it('refuses a Slice 2 proof that has no witness, and a witness that has no proof', () => {
     assert.equal(
       assessAnthropicForwardAdmission(evidence({ storedWitness: null }), 'pre-owner'),

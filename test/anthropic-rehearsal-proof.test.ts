@@ -6,10 +6,12 @@ import { describe, it } from 'node:test';
 import { formatAnthropicReceipt, projectAnthropicReceipt, readAnthropicReceiptSources } from '../src/anthropic-receipt';
 import {
   assembleIdentityProof,
+  identityProofBuckets,
   readProfileIdentity,
   readUsageBuckets,
   type AnthropicHttpResult,
   type AnthropicPoolTransport,
+  type ProofBindingView,
 } from '../src/anthropic-rehearsal-proof';
 import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { ANTHROPIC_OAUTH_PROFILE_URL, ANTHROPIC_USAGE_URL } from '../src/anthropic-oauth';
@@ -62,12 +64,16 @@ describe('readUsageBuckets', () => {
   const cases: Array<{ name: string; body: unknown; status?: number; value?: string }> = [
     { name: 'finite buckets', body: usage(11, 22, hostile), value: '11/22' },
     { name: 'zero is finite', body: usage(0, 4), value: '0/4' },
-    { name: 'missing 5h', body: { seven_day: { utilization: 1 } } },
+    { name: 'five_hour null is an idle window', body: { five_hour: null, seven_day: { utilization: 8 }, ...hostile }, value: '0/8' },
+    { name: 'five_hour key absent is an idle window', body: { seven_day: { utilization: 1 } }, value: '0/1' },
     { name: 'missing 7d', body: { five_hour: { utilization: 1 } } },
+    { name: 'seven_day null', body: { five_hour: null, seven_day: null } },
+    { name: 'seven_day null with a finite five_hour', body: { five_hour: { utilization: 3 }, seven_day: null } },
     { name: 'nan', body: usage(Number.NaN, 1) },
     { name: 'infinity', body: usage(Number.POSITIVE_INFINITY, 1) },
     { name: 'boolean', body: usage(true, 1) },
-    { name: 'string', body: usage('12', 1) },
+    { name: 'string utilization', body: usage('12', 1) },
+    { name: 'five_hour string', body: { five_hour: '12', seven_day: { utilization: 1 } } },
     { name: 'bad reset', body: { five_hour: { utilization: 1, resets_at: 'nope' }, seven_day: { utilization: 2 } } },
     { name: 'usage http', body: usage(), status: 500 },
     { name: 'usage json', body: [] },
@@ -243,6 +249,64 @@ describe('anthropic pool rehearsal', () => {
     }
   });
 
+  it('validates a mixed pool when only one member has an active 5-hour window', async () => {
+    const roster = [
+      { email: EMAIL, token: TOKEN_A, five: 11, seven: 22 },
+      { email: 'idle-b@example.com', token: TOKEN_B, five: null, seven: 30 },
+      { email: 'idle-c@example.com', token: 'access-token-c', five: 'absent' as const, seven: 40 },
+      { email: 'idle-d@example.com', token: 'access-token-d', five: null, seven: 50 },
+      { email: 'idle-e@example.com', token: 'access-token-e', five: 'absent' as const, seven: 60 },
+    ];
+    const log: string[] = [];
+    const steps: Step[] = [];
+    const expectedBuckets = roster.map((member) => {
+      const slot = member.email === EMAIL ? UUID_A : `slot-${member.email}`;
+      const usageBody: Record<string, unknown> = { seven_day: { utilization: member.seven } };
+      if (member.five === null) usageBody.five_hour = null;
+      else if (member.five !== 'absent') usageBody.five_hour = { utilization: member.five };
+      if (member.five === null) {
+        usageBody.limits = [{ scope: { model: { display_name: HOSTILE } }, percent: 9 }];
+      }
+      steps.push(
+        { op: 'profile', body: { account: { uuid: slot, email: member.email } } },
+        { op: 'usage', body: usageBody },
+      );
+      return { '5h': typeof member.five === 'number' ? member.five : 0, '7d': member.seven };
+    });
+    const pool = openPool(
+      poolText(roster.map((member) => emailMember(member.token, member.email))),
+      scripted(steps, log),
+    );
+    try {
+      const rehearsed = await pool.mig.rehearse(async () => { throw new Error('rehearse hook must not run'); });
+      assert.equal(rehearsed.state, 'VALIDATED');
+      assert.deepEqual(log, roster.flatMap((member) => [`profile:${member.token}`, `usage:${member.token}`]));
+      for (const member of roster) assert.equal(statusOf(pool, member.token), 'validated');
+      const journal = detail(pool);
+      const binding = journal.binding as ProofBindingView;
+      assert.deepEqual(identityProofBuckets(journal.identityProof, binding), expectedBuckets);
+      const proof = journal.identityProof as { members?: Array<{ buckets: unknown }> };
+      assert.deepEqual(proof.members?.map((member) => member.buckets), expectedBuckets);
+      assert.equal(JSON.stringify(proof).includes(HOSTILE), false);
+      const receipt = projectAnthropicReceipt('rehearse', readAnthropicReceiptSources(
+        pool.poolPath,
+        pool.ownerPath,
+        pool.store.getMigration(PI_POOL_STORE)?.detail_json,
+      ));
+      assert.equal(receipt.phase, 'rehearse');
+      assert.equal(receipt.disposition, 'success');
+      if (receipt.phase === 'rehearse' && receipt.disposition === 'success') {
+        assert.deepEqual(receipt.buckets, expectedBuckets);
+      }
+      assert.equal(pool.mig.status().resumeAction, 'rehearsal succeeded; complete commit');
+      const committed = pool.mig.commit();
+      assert.equal(committed.state, 'QLB_OWNED');
+      assert.deepEqual(log, roster.flatMap((member) => [`profile:${member.token}`, `usage:${member.token}`]));
+    } finally {
+      pool.close();
+    }
+  });
+
   it('stops on the failing member and writes no proof or validated status', async () => {
     const cases: Array<{ name: string; steps: Step[]; message: string; log: string[] }> = [
       {
@@ -275,12 +339,12 @@ describe('anthropic pool rehearsal', () => {
         ],
       },
       {
-        name: 'missing 5h',
+        name: 'malformed five_hour',
         message: 'rehearse failed',
         log: [`profile:${TOKEN_A}`, `usage:${TOKEN_A}`],
         steps: [
           { op: 'profile', body: { account: { uuid: UUID_A, email: EMAIL } } },
-          { op: 'usage', body: { seven_day: { utilization: 1 }, limits: [{ scope: { model: { display_name: HOSTILE } }, percent: 9 }] } },
+          { op: 'usage', body: { five_hour: '12', seven_day: { utilization: 1 }, limits: [{ scope: { model: { display_name: HOSTILE } }, percent: 9 }] } },
         ],
       },
     ];

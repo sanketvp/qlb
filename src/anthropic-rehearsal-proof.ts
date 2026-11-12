@@ -76,6 +76,17 @@ function finiteUtilization(value: unknown): number | null {
   return value.utilization;
 }
 
+/**
+ * Anthropic sends `five_hour: null`, or omits it, when the account has no
+ * active 5-hour window. That is 0% used. A present non-null window that is
+ * not a finite utilization stays unavailable.
+ */
+function fiveHourUsedPct(body: Record<string, unknown>): number | null {
+  const value = body.five_hour;
+  if (value === null || value === undefined) return 0;
+  return finiteUtilization(value);
+}
+
 export function readProfileIdentity(
   identityKind: AnthropicIdentityKind,
   declaredIdentity: string,
@@ -98,7 +109,7 @@ export function readProfileIdentity(
 
 export function readUsageBuckets(response: AnthropicHttpResult): UsageRead {
   if (!httpOk(response) || !isRecord(response.body)) return { ok: false, code: 'proof-unavailable' };
-  const five = finiteUtilization(response.body.five_hour);
+  const five = fiveHourUsedPct(response.body);
   const seven = finiteUtilization(response.body.seven_day);
   if (five === null || seven === null) return { ok: false, code: 'proof-unavailable' };
   try {
