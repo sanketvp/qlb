@@ -70,6 +70,8 @@ This registers the extension file with Pi — **it is a separate step from insta
 
 Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
 
+Owned Anthropic follows Claude Code's active account. Pool adoption binds each Pi pool member to an existing Claude slot and does not write `active_login`. Commit moves `extensions/anthropic-pool` to `extensions-disabled-by-qlb` so the owned gate can serve. Bounded smoke (`qlb gate anthropic --no-refresh`, or `QLB_PI_OWNED_SMOKE=1`) does not refresh or retry.
+
 Typecheck the extension against the Pi you actually run with `npm run typecheck:pi` (or `qlb doctor --live`); `extensions/qlb-pi/tsconfig.json` deliberately carries no machine-specific Pi paths, so a bare `tsc -p extensions/qlb-pi/tsconfig.json` cannot resolve Pi's packages. If your `pi` is a wrapper QLB cannot trace (e.g. a compiled shim), set `QLB_PI_PACKAGE_ROOT` to the `@earendil-works/pi-coding-agent` package it runs.
 
 ## qlb-pi footer
