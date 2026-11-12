@@ -8,7 +8,7 @@ import {
   type AdmittedAnthropicPool,
   type AnthropicIdentityKind,
 } from './anthropic-complete-set';
-import { assessAnthropicAdoption } from './anthropic-adoption';
+import { assessAnthropicAdoption, readAdoptionBinding } from './anthropic-adoption';
 import { assessAnthropicForwardAdmission } from './anthropic-forward-admission';
 import { identityMismatchRefusal, identityProofBuckets } from './anthropic-rehearsal-proof';
 import { distinctAnthropicStageAccounts, stagingOwnerPath } from './migration';
@@ -20,7 +20,7 @@ export const RECEIPT_PHASES = ['stage', 'rehearse', 'commit', 'failure'] as cons
 export type AnthropicReceiptPhase = (typeof RECEIPT_PHASES)[number];
 
 export function receiptPhaseList(): string {
-  return [...RECEIPT_PHASES, 'preflight'].join('|');
+  return [...RECEIPT_PHASES, 'preflight', 'smoke'].join('|');
 }
 
 /** Codes this slice can put on a receipt. Later slices add the other fixed public codes. */
@@ -116,12 +116,63 @@ const BINDING_KEYS = ['version', 'cycle', 'stagedAt', 'memberCount', 'aliases', 
 const COMMITMENT_KEYS = ['version', 'memberCount', 'digest'];
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 
-export function isReceiptPhase(value: string | undefined): value is AnthropicReceiptPhase | 'preflight' {
-  return value === 'preflight' || (!!value && (RECEIPT_PHASES as readonly string[]).includes(value));
+export function isReceiptPhase(value: string | undefined): value is AnthropicReceiptPhase | 'preflight' | 'smoke' {
+  return value === 'preflight' || value === 'smoke' || (!!value && (RECEIPT_PHASES as readonly string[]).includes(value));
+}
+
+export interface AnthropicSmokeReceipt {
+  schemaVersion: 1;
+  phase: 'smoke';
+  disposition: 'success' | 'refused';
+  servedAlias?: string;
+  matchesInitialActive?: boolean;
+  servedAfterCommit?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Alias only. The served account id is used for matching and is not copied out. */
+export function projectAnthropicSmoke(input: {
+  journalDetail: unknown;
+  servedAccountId: string | null;
+  state: string | null;
+}): AnthropicSmokeReceipt {
+  const detail = isRecord(input.journalDetail) ? input.journalDetail : null;
+  const binding = readAdoptionBinding(detail?.adoptionBinding);
+  const served = binding?.members.find((member) => member.slotAccountId === input.servedAccountId);
+  if (!binding || !served || !input.servedAccountId) {
+    return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase: 'smoke', disposition: 'refused' };
+  }
+  return {
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    phase: 'smoke',
+    disposition: 'success',
+    servedAlias: served.alias,
+    matchesInitialActive: served.alias === binding.initialActiveAlias,
+    servedAfterCommit: input.state === 'QLB_OWNED',
+  };
+}
+
+export function formatAnthropicSmoke(receipt: AnthropicSmokeReceipt, json: boolean): string {
+  const body: Record<string, unknown> = {
+    schemaVersion: receipt.schemaVersion,
+    phase: receipt.phase,
+    disposition: receipt.disposition,
+  };
+  if (receipt.servedAlias !== undefined) body.servedAlias = receipt.servedAlias;
+  if (receipt.matchesInitialActive !== undefined) body.matchesInitialActive = receipt.matchesInitialActive;
+  if (receipt.servedAfterCommit !== undefined) body.servedAfterCommit = receipt.servedAfterCommit;
+  if (json) return JSON.stringify(body, null, 2);
+  return [
+    `schema: ${body.schemaVersion}`,
+    `phase: ${body.phase}`,
+    `disposition: ${body.disposition}`,
+    ...(typeof body.servedAlias === 'string' ? [`servedAlias: ${body.servedAlias}`] : []),
+    ...(typeof body.matchesInitialActive === 'boolean' ? [`matchesInitialActive: ${body.matchesInitialActive}`] : []),
+    ...(typeof body.servedAfterCommit === 'boolean' ? [`servedAfterCommit: ${body.servedAfterCommit}`] : []),
+  ].join('\n');
 }
 
 function sameKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

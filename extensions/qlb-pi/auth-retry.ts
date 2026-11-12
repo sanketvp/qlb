@@ -41,6 +41,13 @@ async function collectStream(stream: AsyncIterable<unknown>): Promise<{
   return { events, outcome, error };
 }
 
+/** Smoke mode never retries. The extension checks this before a second gate read. */
+export function ownedSmokeResync(): ResyncSignal | null {
+  return process.env.QLB_PI_OWNED_SMOKE === '1'
+    ? { resynced: false, reason: 'owned-smoke-no-retry' }
+    : null;
+}
+
 export function shouldResyncAfterAuthFailure(
   outcome: AuditOutcome,
   error: string | undefined,

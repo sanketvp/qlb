@@ -17,8 +17,10 @@ import { reloginsInWindow, type ReloginEvent } from './relogin';
 import { doctorQlb, initializeQlb, listCheckNames, type DoctorReport, type InitReport } from './diagnostics';
 import {
   formatAnthropicReceipt,
+  formatAnthropicSmoke,
   isReceiptPhase,
   projectAnthropicReceipt,
+  projectAnthropicSmoke,
   readAnthropicReceiptSources,
   receiptPhaseList,
   type AnthropicReceiptPhase,
@@ -260,7 +262,7 @@ type MigrateOpts = {
   protectedPiAuthJsonPath: string;
   db?: string;
   confirmRealCutover: boolean;
-  phase?: AnthropicReceiptPhase | 'preflight';
+  phase?: AnthropicReceiptPhase | 'preflight' | 'smoke';
   initialActive?: string;
 };
 type PolicySetOpts = {
@@ -1733,6 +1735,18 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
         opts.ownerFile,
         store.getMigration(PI_POOL_STORE)?.detail_json,
       );
+      if (phase === 'smoke') {
+        const row = store.getMigration(PI_POOL_STORE);
+        let journalDetail: unknown = null;
+        try { journalDetail = JSON.parse(row?.detail_json ?? 'null') as unknown; } catch { journalDetail = null; }
+        const smoke = projectAnthropicSmoke({
+          journalDetail,
+          servedAccountId: store.getConfig('pi.anthropic.lastServedAccountId'),
+          state: row?.state ?? null,
+        });
+        console.log(formatAnthropicSmoke(smoke, opts.json));
+        return smoke.disposition === 'success' ? 0 : 1;
+      }
       sources.adoptionSlots = store.listClaudeAdoptionSlots();
       sources.activeAccountId = store.getActiveLogin('anthropic')?.accountId ?? null;
       const receipt = projectAnthropicReceipt(phase, sources);

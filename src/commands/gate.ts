@@ -7,13 +7,19 @@ const PROVIDERS = new Set<PiGateProvider>(['anthropic', 'openai-codex', 'xai', '
 
 const ACCESS_FINGERPRINT = /^sha256-at:[a-f0-9]{64}$/;
 
-function parse(args: string[]): { provider: PiGateProvider; retryAfter401Fp?: string } | null {
+function parse(args: string[]): { provider: PiGateProvider; retryAfter401Fp?: string; noRefresh?: boolean } | null {
   const [provider, ...flags] = args;
   if (!provider || !PROVIDERS.has(provider as PiGateProvider)) return null;
   let retryAfter401Fp: string | undefined;
+  let noRefresh = false;
   for (let index = 0; index < flags.length; index += 1) {
     const flag = flags[index];
     if (flag === '--json') continue;
+    if (flag === '--no-refresh') {
+      if (provider !== 'anthropic') return null;
+      noRefresh = true;
+      continue;
+    }
     if (flag === '--retry-after-401' && retryAfter401Fp === undefined) {
       const value = flags[index + 1];
       if (!value || !ACCESS_FINGERPRINT.test(value)) return null;
@@ -23,7 +29,11 @@ function parse(args: string[]): { provider: PiGateProvider; retryAfter401Fp?: st
     }
     return null;
   }
-  return { provider: provider as PiGateProvider, ...(retryAfter401Fp === undefined ? {} : { retryAfter401Fp }) };
+  return {
+    provider: provider as PiGateProvider,
+    ...(retryAfter401Fp === undefined ? {} : { retryAfter401Fp }),
+    ...(noRefresh ? { noRefresh: true } : {}),
+  };
 }
 
 async function execute(args: string[], ctx: CommandContext): Promise<number> {
@@ -42,6 +52,7 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
     // dispatch has the authoritative configured Pi path.
     piAgentDir: dirname(ctx.config.piAuthJsonPath),
     ...(provider.retryAfter401Fp === undefined ? {} : { retryAfter401Fp: provider.retryAfter401Fp }),
+    ...(provider.noRefresh ? { noRefresh: true } : {}),
   });
 }
 

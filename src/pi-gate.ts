@@ -42,6 +42,8 @@ export interface GateContext {
   piAgentDir?: string;
   /** Access-token fingerprint rejected by Pi's immediately preceding request. */
   retryAfter401Fp?: string;
+  /** Bounded smoke: never refresh or retry. */
+  noRefresh?: boolean;
   autoLog: (line: string) => void;
 }
 
@@ -103,6 +105,8 @@ export interface PiGateDeps {
   piAgentDir?: string;
   /** Non-secret access fingerprint supplied by `gate --retry-after-401`. */
   retryAfter401Fp?: string;
+  /** Bounded Anthropic smoke. Refuses refresh, unknown expiry, and 401 retry. */
+  noRefresh?: boolean;
   /** Injectable S24 result for hermetic tests. */
   cswapProcesses?: () => CswapProcess[];
   /** Test seam for the process listing used when no S24 result is injected. */
@@ -254,7 +258,10 @@ function recordEvidenceAndDeliver(
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
     write.run(`pi.${provider}.lastServedFingerprint`, fingerprint(credential.token));
     write.run(`pi.${provider}.lastServedAt`, now);
-    if (provider === 'anthropic') write.run('pi.anthropic.lastServedBy', 'qlb-pi');
+    if (provider === 'anthropic') {
+      write.run('pi.anthropic.lastServedBy', 'qlb-pi');
+      write.run('pi.anthropic.lastServedAccountId', credential.accountId);
+    }
     deliver();
     trace?.('COMMIT');
     db.exec('COMMIT');
@@ -322,6 +329,7 @@ export async function runPiGate(providerName: string, deps: PiGateDeps): Promise
       env: deps.env,
       ...(deps.piAgentDir === undefined ? {} : { piAgentDir: deps.piAgentDir }),
       ...(deps.retryAfter401Fp === undefined ? {} : { retryAfter401Fp: deps.retryAfter401Fp }),
+      ...(deps.noRefresh ? { noRefresh: true } : {}),
       autoLog: (line) => appendGateAutoLog(deps.dbPath, line),
     });
     await gate.prerequisites?.();

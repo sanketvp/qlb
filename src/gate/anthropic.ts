@@ -322,6 +322,12 @@ export function createAnthropicGate(deps: AnthropicGateDeps = {}, initialContext
         };
 
         const retryAfter401Fp = context.retryAfter401Fp;
+        if (context.noRefresh) {
+          if (retryAfter401Fp !== undefined) throw new GateFailure('smoke-no-retry');
+          if (parts.expiresAt === undefined) throw new GateFailure('smoke-token-expiry-unknown');
+          if (isOAuthTokenExpired(parts.expiresAt, now())) throw new GateFailure('smoke-token-expired');
+          return served(accountId, live, 'live');
+        }
         if (retryAfter401Fp !== undefined) {
           // A changed access generation, a divergent served lineage, and a
           // quarantined slot must never consume a grant because of a stale 401.
