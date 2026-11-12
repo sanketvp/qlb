@@ -1728,11 +1728,14 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
         console.error(`qlb migrate receipt: --provider must be anthropic and --phase must be ${receiptPhaseList()}`);
         return 1;
       }
-      const receipt = projectAnthropicReceipt(phase, readAnthropicReceiptSources(
+      const sources = readAnthropicReceiptSources(
         opts.poolFile,
         opts.ownerFile,
         store.getMigration(PI_POOL_STORE)?.detail_json,
-      ));
+      );
+      sources.adoptionSlots = store.listClaudeAdoptionSlots();
+      sources.activeAccountId = store.getActiveLogin('anthropic')?.accountId ?? null;
+      const receipt = projectAnthropicReceipt(phase, sources);
       console.log(formatAnthropicReceipt(receipt, opts.json));
       return receipt.disposition === 'success' ? 0 : 1;
     }

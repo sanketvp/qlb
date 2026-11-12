@@ -39,6 +39,8 @@ function evidence(overrides: Partial<ForwardAdmissionEvidence> = {}): ForwardAdm
       }],
     },
     identityMismatch: false,
+    adoptionMismatch: false,
+    adoptionMarkerCycle: CYCLE,
     now: PROVED_AT + PROOF_FRESH_MS,
     ...overrides,
   };

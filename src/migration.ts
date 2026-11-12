@@ -124,7 +124,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { planAnthropicAdoption } from './anthropic-adoption';
+import { assessAnthropicAdoption, planAnthropicAdoption } from './anthropic-adoption';
 import {
   admitAnthropicCompleteSet,
   sourceWitnessForMembers,
@@ -758,6 +758,13 @@ export function projectMigrationStatusDetail(detail: Record<string, unknown>, re
       cycle: typeof adoption.cycle === 'string' ? adoption.cycle : null,
       aliases,
       ...(initialActiveAlias === undefined ? {} : { initialActiveAlias }),
+    };
+  }
+  const adoptionMarker = redactedDetail.adoption;
+  if (isObjectRecord(adoptionMarker)) {
+    redactedDetail.adoption = {
+      version: adoptionMarker.version === 1 ? 1 : null,
+      cycle: typeof adoptionMarker.cycle === 'string' ? adoptionMarker.cycle : null,
     };
   }
   return redactedDetail;
@@ -1466,10 +1473,12 @@ export class Migration {
     const sourcePresent = existsSync(this.poolFilePath);
     let recomputedWitnessDigest: string | null = null;
     let recomputedCommitmentDigest: string | null = null;
+    let admittedPool: ReturnType<typeof admitAnthropicCompleteSet> | null = null;
     if (sourcePresent) {
       try {
         const admitted = admitAnthropicCompleteSet(readFileSync(this.poolFilePath, 'utf8'));
         distinctAnthropicStageAccounts(admitted.members);
+        admittedPool = admitted;
         recomputedCommitmentDigest = admitted.commitment.digest;
         recomputedWitnessDigest = sourceWitnessForMembers(admitted.members).digest;
       } catch {
@@ -1484,6 +1493,22 @@ export class Migration {
       && marker.cycle.length > 0
       ? marker.cycle
       : null;
+    const adoptionMarker = detail.adoption;
+    const adoptionMarkerCycle = isObjectRecord(adoptionMarker)
+      && adoptionMarker.version === 1
+      && typeof adoptionMarker.cycle === 'string'
+      && adoptionMarker.cycle.length > 0
+      ? adoptionMarker.cycle
+      : null;
+    const adoptionMismatch = admittedPool !== null && binding !== null
+      && assessAnthropicAdoption(
+        detail.adoptionBinding,
+        admittedPool,
+        this.store.listClaudeAdoptionSlots(),
+        this.store.getActiveLogin('anthropic')?.accountId ?? null,
+        binding.cycle,
+        this.now(),
+      ) !== 'ok';
     return {
       canonicalOwnerEntry,
       postOwnerCycle,
@@ -1494,6 +1519,8 @@ export class Migration {
       sourcePresent,
       identityProof: detail.identityProof,
       identityMismatch: identityMismatchRefusal(detail),
+      adoptionMismatch,
+      adoptionMarkerCycle,
       now: this.now(),
     };
   }
@@ -1595,7 +1622,10 @@ export class Migration {
           ? admittedBinding.cycle
           : null;
         if (admittedCycle !== null && this.ownerEntryPresentAt(this.ownerMapPath)) {
-          this.journal(current.state, { postOwnerAdmission: { version: 1, cycle: admittedCycle } });
+          this.journal(current.state, {
+            postOwnerAdmission: { version: 1, cycle: admittedCycle },
+            adoption: { version: 1, cycle: admittedCycle },
+          });
         }
         this.writePoolAnthropicPlaceholder();
         this.afterWrite?.('placeholder');
@@ -3210,6 +3240,7 @@ export class Migration {
       adoptionBinding: undefined,
       sourceWitness: undefined,
       postOwnerAdmission: undefined,
+      adoption: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'pre-commit',
     });
@@ -3731,6 +3762,7 @@ export class Migration {
       rollbackDecision: undefined,
       sourceWitness: undefined,
       postOwnerAdmission: undefined,
+      adoption: undefined,
       identityProof: undefined,
       adoptionBinding: undefined,
       rolledBackAt: Date.now(),

@@ -13,7 +13,8 @@ export type ForwardAdmissionDecision =
   | 'source-witness-unavailable'
   | 'proof-unavailable'
   | 'proof-stale'
-  | 'identity-mismatch';
+  | 'identity-mismatch'
+  | 'adoption-mismatch';
 
 export interface ForwardBindingEvidence {
   cycle: string;
@@ -44,6 +45,10 @@ export interface ForwardAdmissionEvidence {
   sourcePresent: boolean;
   identityProof: unknown;
   identityMismatch: boolean;
+  /** Pre-commit binding no longer matches the live slots or active login. */
+  adoptionMismatch: boolean;
+  /** Post-commit `adoption` marker cycle. Null when the marker is absent. */
+  adoptionMarkerCycle: string | null;
   now: number;
 }
 
@@ -95,6 +100,7 @@ export function assessAnthropicForwardAdmission(
     if (identityProofBuckets(evidence.identityProof, bindingView(binding)) === null) {
       return evidence.identityMismatch ? 'identity-mismatch' : 'proof-unavailable';
     }
+    if (evidence.adoptionMarkerCycle !== binding.cycle) return 'adoption-mismatch';
     return 'PUBLISHED';
   }
   if (
@@ -106,7 +112,7 @@ export function assessAnthropicForwardAdmission(
   if (identityProofBuckets(evidence.identityProof, bindingView(binding)) === null) {
     return evidence.identityMismatch ? 'identity-mismatch' : 'proof-unavailable';
   }
-  if (marked) return 'PUBLISHED';
+  if (marked) return evidence.adoptionMarkerCycle === binding.cycle ? 'PUBLISHED' : 'adoption-mismatch';
   const stamped = provedAt(evidence.identityProof);
   if (
     stamped === null
@@ -117,6 +123,7 @@ export function assessAnthropicForwardAdmission(
   ) {
     return 'proof-stale';
   }
+  if (evidence.adoptionMismatch) return 'adoption-mismatch';
   if (_mode === 'receipt') return 'proof-unavailable';
   return evidence.canonicalOwnerEntry ? 'ADMIT_POST_OWNER_RECOVERY' : 'ADMIT_PRE_OWNER';
 }
