@@ -8,6 +8,7 @@ import { appendEvidenceGap, GateFailure, GateRefused, runPiGate } from '../src/p
 import { piEvidenceGapCheck } from '../src/checks/pi-evidence-gap';
 import { defaultPiMigratePaths, migratePiSingleProvider } from '../src/pi-migrate';
 import { createSingleGrantMigration, createStaticKeyMigration, Migration } from '../src/migration';
+import { seedActiveSlots } from './support/adoption-slots';
 import { uuidPoolTransport } from './support/anthropic-pool-rehearse';
 import { MockKeychain, platformKeychain } from '../src/keychain';
 import { redactSecrets } from '../src/redact';
@@ -105,6 +106,7 @@ describe('qlb gate core (S30/S54)', () => {
         undefined,
         {
           authJsonPath: join(anthropicAgent, 'auth.json'),
+          initialActiveAlias: 'member-0001',
           anthropicPoolTransport: uuidPoolTransport([{
             access: 'anthropic-access',
             uuid: '00000000-0000-4000-8000-0000000000d1',
@@ -114,6 +116,9 @@ describe('qlb gate core (S30/S54)', () => {
       const poolPath = join(anthropicAgent, 'anthropic-pool.json');
       const ownerPath = join(anthropicAgent, 'qlb-owner.json');
       const authPath = join(anthropicAgent, 'auth.json');
+      seedActiveSlots(anthropicStore, [{
+        accountId: '00000000-0000-4000-8000-0000000000d1',
+      }], '00000000-0000-4000-8000-0000000000d1');
       writeFileSync(poolPath, JSON.stringify({
         accounts: [{ id: 'anthropic-a', name: 'Anthropic A', accountUuid: '00000000-0000-4000-8000-0000000000d1', credentials: {
           type: 'oauth', access: 'anthropic-access', refresh: 'anthropic-refresh', expires: Date.now() + 60_000,

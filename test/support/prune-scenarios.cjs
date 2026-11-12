@@ -272,8 +272,15 @@ async function createWriterFixture(kind) {
     }));
     // Pool publication runs under the Pi auth lock beside auth.json (P7b8), so the
     // fixture gives the pool its own temp auth.json, as test/migration.test.ts does.
+    const { DatabaseSync } = require('node:sqlite');
+    const slots = new DatabaseSync(dbPath);
+    slots.prepare(`INSERT INTO claude_slots (account_id, email, config_json, dead, added_at, archived_at)
+      VALUES ('00000000-0000-4000-8000-0000000000f1', NULL, '{}', 0, 1, NULL)`).run();
+    slots.close();
+    store.setActiveLogin('anthropic', '00000000-0000-4000-8000-0000000000f1', 'auto', 1);
     migration = new Migration(store, keychain, nativePath, ownerPath, undefined, {
       authJsonPath: path.join(dir, 'auth.json'),
+      initialActiveAlias: 'member-0001',
       anthropicPoolTransport: {
         async getProfile() {
           return { status: 200, body: { account: { uuid: '00000000-0000-4000-8000-0000000000f1' } } };

@@ -124,6 +124,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { planAnthropicAdoption } from './anthropic-adoption';
 import {
   admitAnthropicCompleteSet,
   sourceWitnessForMembers,
@@ -384,6 +385,11 @@ export interface MigrationConfig {
   afterWrite?: (point: MigrationWritePoint) => void;
   /** CLI-only guard: v1 Anthropic conversion requires an explicit provider flag. */
   allowPoolLegacyConversion?: boolean;
+  /**
+   * Pool rehearse alias that must already be the active Claude login.
+   * `rehearse()`'s argument wins when both are set.
+   */
+  initialActiveAlias?: string;
   /** P7a's in-progress journal directory; defaults to ~/.qlb/journal. */
   piMigrateJournalDir?: string;
 }
@@ -729,10 +735,32 @@ export function projectMigrationStatusDetail(detail: Record<string, unknown>, re
     });
   }
   const binding = redactedDetail.binding;
-  if (!isObjectRecord(binding) || !Object.hasOwn(binding, 'completeSetCommitment')) return redactedDetail;
-  const redacted = { ...binding };
-  delete redacted.completeSetCommitment;
-  return { ...redactedDetail, binding: redacted };
+  if (isObjectRecord(binding) && Object.hasOwn(binding, 'completeSetCommitment')) {
+    const redacted = { ...binding };
+    delete redacted.completeSetCommitment;
+    redactedDetail.binding = redacted;
+  }
+  const adoption = redactedDetail.adoptionBinding;
+  if (isObjectRecord(adoption)) {
+    const aliases = Array.isArray(adoption.members)
+      ? adoption.members.flatMap((member) => (
+        isObjectRecord(member) && typeof member.alias === 'string' && /^member-\d{4,}$/.test(member.alias)
+          ? [member.alias]
+          : []
+      ))
+      : [];
+    const initialActiveAlias = typeof adoption.initialActiveAlias === 'string'
+      && /^member-\d{4,}$/.test(adoption.initialActiveAlias)
+      ? adoption.initialActiveAlias
+      : undefined;
+    redactedDetail.adoptionBinding = {
+      version: adoption.version === 1 ? 1 : null,
+      cycle: typeof adoption.cycle === 'string' ? adoption.cycle : null,
+      aliases,
+      ...(initialActiveAlias === undefined ? {} : { initialActiveAlias }),
+    };
+  }
+  return redactedDetail;
 }
 
 /** Bridge the shared Pi-gate document validator to migration's legacy v1 payload. */
@@ -960,6 +988,7 @@ export class Migration {
   private readonly afterStep: ((point: MigrationCrashPoint) => void) | undefined;
   private readonly afterWrite: ((point: MigrationWritePoint) => void) | undefined;
   private readonly allowPoolLegacyConversion: boolean;
+  private readonly initialActiveAlias: string | undefined;
   private readonly sleepSync: (ms: number) => void;
   /** Keeps Pi's auth.json lock fresh during S2's lease wait; throws lock-lost. */
   private piAuthLockRefresh: (() => void) | undefined;
@@ -996,6 +1025,7 @@ export class Migration {
     this.afterStep = config.afterStep;
     this.afterWrite = config.afterWrite;
     this.allowPoolLegacyConversion = config.allowPoolLegacyConversion ?? false;
+    this.initialActiveAlias = config.initialActiveAlias;
     this.sleepSync = config.sleepSync ?? ((ms) => {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     });
@@ -2051,6 +2081,7 @@ export class Migration {
       sourceWitness,
       identityProof: undefined,
       rehearseRefusal: undefined,
+      adoptionBinding: undefined,
       poolV2PublicationStarted: undefined,
     });
 
@@ -2070,8 +2101,14 @@ export class Migration {
    * member, with no refresh, retry, or poll, and persists only if every
    * member succeeds.
    */
-  async rehearse(rehearseFn: RehearseFn, poolTransport?: AnthropicPoolTransport): Promise<MigrationStatus> {
-    if (this.kind === 'pool') return this.rehearseAnthropicPool(poolTransport);
+  async rehearse(
+    rehearseFn: RehearseFn,
+    poolTransport?: AnthropicPoolTransport,
+    initialActive?: string,
+  ): Promise<MigrationStatus> {
+    if (this.kind === 'pool') {
+      return this.rehearseAnthropicPool(poolTransport, initialActive ?? this.initialActiveAlias);
+    }
     return this.rehearseAccounts(rehearseFn);
   }
 
@@ -2084,24 +2121,37 @@ export class Migration {
     return anthropicPoolFetchTransport();
   }
 
-  private failAnthropicRehearsal(code: 'identity-mismatch' | 'proof-unavailable'): never {
+  private failAnthropicRehearsal(code:
+    | 'identity-mismatch'
+    | 'proof-unavailable'
+    | 'token-expired'
+    | 'adoption-slot-missing'
+    | 'adoption-ambiguous'
+    | 'adoption-slot-unusable'
+    | 'initial-active-invalid'
+  ): never {
     const row = this.store.getMigration(this.storeName);
     const detail = parseDetail(row?.detail_json);
     const proved = Object.hasOwn(detail, 'identityProof') || asState(row?.state) === 'VALIDATED';
-    if (code === 'identity-mismatch' || proved) {
+    const persists = code !== 'proof-unavailable';
+    if (persists || proved) {
       this.journal('MIRRORED', {
         identityProof: undefined,
+        adoptionBinding: undefined,
         rehearse: undefined,
-        rehearseRefusal: code === 'identity-mismatch' ? { code: 'identity-mismatch' } : undefined,
+        rehearseRefusal: persists ? { code } : undefined,
       });
     }
     throw Object.assign(
-      new Error(code === 'identity-mismatch' ? 'identity-mismatch' : 'rehearse failed'),
+      new Error(persists ? code : 'rehearse failed'),
       { exitCode: 3 },
     );
   }
 
-  private async rehearseAnthropicPool(explicit: AnthropicPoolTransport | undefined): Promise<MigrationStatus> {
+  private async rehearseAnthropicPool(
+    explicit: AnthropicPoolTransport | undefined,
+    initialActive: string | undefined,
+  ): Promise<MigrationStatus> {
     const current = this.status();
     if (current.state !== 'MIRRORED' && current.state !== 'VALIDATED') {
       throw new Error(`cannot rehearse from state ${current.state}`);
@@ -2128,14 +2178,20 @@ export class Migration {
       if (!loaded || loaded.provider !== 'anthropic') this.failAnthropicRehearsal('proof-unavailable');
       return loaded;
     });
+    const activeAccountId = this.store.getActiveLogin('anthropic')?.accountId ?? null;
+    const plan = planAnthropicAdoption(admitted, this.store.listClaudeAdoptionSlots(), activeAccountId, this.now());
+    if (plan.code) return this.failAnthropicRehearsal(plan.code);
+    const chosen = initialActive === undefined
+      ? undefined
+      : plan.members.find((member) => member.alias === initialActive);
+    if (!chosen || chosen.slot !== 'matched' || chosen.slotAccountId !== activeAccountId) {
+      return this.failAnthropicRehearsal('initial-active-invalid');
+    }
+    const slotByAlias = new Map(plan.members.map((member) => [member.alias, member.slotAccountId]));
     const provedAt = this.now();
     for (let index = 0; index < grants.length; index += 1) {
       const expires = grants[index]?.grant.expires ?? 0;
-      if (expires > 0 && expires <= provedAt) {
-        throw new Error(
-          `${binding.aliases[index]}: staged access token expired — use the native harness once so IT refreshes, then re-run. QLB will not refresh a grant it does not own`,
-        );
-      }
+      if (expires > 0 && expires <= provedAt) return this.failAnthropicRehearsal('token-expired');
     }
     const readings: Array<{ providerUuid: string; buckets: { '5h': number; '7d': number } }> = [];
     const seen = new Set<string>();
@@ -2151,6 +2207,9 @@ export class Migration {
       }
       const identity = readProfileIdentity(member.identityKind, member.identity, profile);
       if (!identity.ok) return this.failAnthropicRehearsal(identity.code);
+      if (identity.providerUuid !== slotByAlias.get(binding.aliases[index] ?? '')) {
+        return this.failAnthropicRehearsal('identity-mismatch');
+      }
       if (seen.has(identity.providerUuid)) return this.failAnthropicRehearsal('identity-mismatch');
       seen.add(identity.providerUuid);
       let usage: AnthropicHttpResult;
@@ -2177,6 +2236,15 @@ export class Migration {
         for (const account of derived) this.store.setAccountStatus(account.id, 'validated');
         this.journal('VALIDATED', {
           identityProof: proof,
+          adoptionBinding: {
+            version: 1,
+            cycle: binding.cycle,
+            members: plan.members.map((member) => ({
+              alias: member.alias,
+              slotAccountId: member.slotAccountId,
+            })),
+            initialActiveAlias: chosen.alias,
+          },
           rehearse: { ok: true, validatedAt: provedAt },
           rehearseRefusal: undefined,
         });
@@ -3139,6 +3207,7 @@ export class Migration {
       binding: undefined,
       identityProof: undefined,
       rehearseRefusal: undefined,
+      adoptionBinding: undefined,
       sourceWitness: undefined,
       postOwnerAdmission: undefined,
       rolledBackAt: Date.now(),
@@ -3663,6 +3732,7 @@ export class Migration {
       sourceWitness: undefined,
       postOwnerAdmission: undefined,
       identityProof: undefined,
+      adoptionBinding: undefined,
       rolledBackAt: Date.now(),
       rolledBackFrom: 'post-commit',
     });

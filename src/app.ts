@@ -132,7 +132,7 @@ const USAGE = `Usage:
   qlb proxy [--info-path <path>] [--idle-ms <n>] [--no-idle] [--port <n>] [--started-by wrapper|cli] [--db <path>]
   qlb consume enable|disable|status --provider anthropic [--json] [--db <path>]
   qlb migrate stage    [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
-  qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
+  qlb migrate rehearse [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--initial-active <alias>] [--confirm-real-cutover]
   qlb migrate commit   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate rollback [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
   qlb migrate resume   [--provider anthropic|xai|kimi-coding|openai-codex|openrouter] --pool-file <path> --owner-file <path> [--auth-json <path>] [--db <path>] [--target-dir <path>] [--confirm-real-cutover]
@@ -261,6 +261,7 @@ type MigrateOpts = {
   db?: string;
   confirmRealCutover: boolean;
   phase?: AnthropicReceiptPhase | 'preflight';
+  initialActive?: string;
 };
 type PolicySetOpts = {
   cmd: 'policy';
@@ -406,6 +407,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
   let confirmRealCutover = false;
   let providerRaw: string | undefined;
   let phaseRaw: string | undefined;
+  let initialActive: string | undefined;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -435,6 +437,15 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     }
     if (arg === '--phase') {
       phaseRaw = rest[++i];
+      continue;
+    }
+    if (arg === '--initial-active') {
+      const alias = rest[++i];
+      if (!alias || alias.startsWith('--')) {
+        console.error('qlb migrate: --initial-active requires an alias');
+        process.exit(1);
+      }
+      initialActive = alias;
       continue;
     }
     if (arg === '--target-dir') {
@@ -476,6 +487,10 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     console.error('qlb migrate: --phase is only valid with receipt');
     process.exit(1);
   }
+  if (initialActive !== undefined && (subRaw !== 'rehearse' || provider !== 'anthropic')) {
+    console.error('qlb migrate: --initial-active is only valid with rehearse --provider anthropic');
+    process.exit(1);
+  }
 
   // config.ts retains the actual winning spelling (flag, env, config file, or
   // default) so normalization cannot erase a hostile segment before migration
@@ -513,6 +528,7 @@ function parseMigrateArgs(args: string[]): MigrateOpts {
     db,
     confirmRealCutover,
     phase: isReceiptPhase(phaseRaw) ? phaseRaw : undefined,
+    ...(initialActive === undefined ? {} : { initialActive }),
   };
 }
 
@@ -1749,6 +1765,7 @@ async function runMigrate(opts: MigrateOpts): Promise<number> {
         status = await mig.rehearse(
           defaultRehearseFn,
           process.env.QLB_TEST_MODE === '1' ? undefined : anthropicPoolFetchTransport(),
+          opts.initialActive,
         );
         break;
       case 'commit':

@@ -15,6 +15,7 @@ import { MockKeychain, qlbKeychainService } from '../src/keychain';
 import { ANTHROPIC_OAUTH_PROFILE_URL, ANTHROPIC_USAGE_URL } from '../src/anthropic-oauth';
 import { Migration, PI_POOL_STORE, anthropicPoolFetchTransport, stagingOwnerPath } from '../src/migration';
 import { openStore, type Store } from '../src/store';
+import { seedActiveSlots } from './support/adoption-slots';
 
 const PROVED_AT = 1_700_000_000_000;
 const EMAIL = 'ada@example.com';
@@ -139,6 +140,16 @@ interface Pool {
   close: () => void;
 }
 
+function adoptionFor(raw: string): Array<{ accountId: string; email: string | null }> {
+  const parsed = JSON.parse(raw) as { accounts?: Array<{ email?: string; accountUuid?: string }> };
+  return (parsed.accounts ?? []).map((account) => {
+    if (typeof account.accountUuid === 'string') return { accountId: account.accountUuid, email: null };
+    const email = account.email ?? '';
+    const accountId = email === EMAIL ? UUID_A : email === OTHER_EMAIL ? UUID_B : `slot-${email}`;
+    return { accountId, email };
+  });
+}
+
 function openPool(raw: string, transport: AnthropicPoolTransport, now = () => PROVED_AT): Pool {
   const dir = mkdtempSync(join(tmpdir(), 'qlb-r1a-proof-'));
   const poolPath = join(dir, 'anthropic-pool.json');
@@ -146,10 +157,13 @@ function openPool(raw: string, transport: AnthropicPoolTransport, now = () => PR
   const authPath = join(dir, 'auth.json');
   writeFileSync(poolPath, raw, { mode: 0o600 });
   const store = openStore(join(dir, 'qlb.db'));
+  const slots = adoptionFor(raw);
+  if (slots[0]) seedActiveSlots(store, slots, slots[0].accountId);
   const kc = new MockKeychain();
   const mig = new Migration(store, kc, poolPath, ownerPath, undefined, {
     authJsonPath: authPath,
     now,
+    initialActiveAlias: 'member-0001',
     anthropicPoolTransport: transport,
   });
   mig.stage();
@@ -357,13 +371,13 @@ describe('anthropic pool rehearsal', () => {
       scripted([], log),
     );
     try {
-      const journal = pool.store.getMigration(PI_POOL_STORE)?.detail_json;
       const error = await rehearseError(pool);
-      assert.match(error.message, /member-0001: staged access token expired/);
-      assert.match(error.message, /will not refresh a grant it does not own/);
+      assert.equal(error.message, 'token-expired');
+      assert.equal(error.exitCode, 3);
       assert.equal(error.message.includes(EMAIL), false);
       assert.deepEqual(log, []);
-      assert.equal(pool.store.getMigration(PI_POOL_STORE)?.detail_json, journal);
+      assert.equal(pool.mig.status().state, 'MIRRORED');
+      assert.deepEqual(detail(pool).rehearseRefusal, { code: 'token-expired' });
       assert.equal(statusOf(pool, TOKEN_A), 'imported-unvalidated');
     } finally {
       pool.close();

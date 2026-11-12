@@ -28,7 +28,21 @@ export type AnthropicReceiptCode =
   | 'proof-unavailable'
   | 'identity-mismatch'
   | 'source-witness-unavailable'
-  | 'proof-stale';
+  | 'proof-stale'
+  | 'token-expired'
+  | 'adoption-slot-missing'
+  | 'adoption-ambiguous'
+  | 'adoption-slot-unusable'
+  | 'initial-active-invalid';
+
+const REHEARSE_REFUSAL_CODES = [
+  'identity-mismatch',
+  'token-expired',
+  'adoption-slot-missing',
+  'adoption-ambiguous',
+  'adoption-slot-unusable',
+  'initial-active-invalid',
+] as const satisfies readonly AnthropicReceiptCode[];
 
 /**
  * `proof-unavailable` is the no-forward plan's fixed code for a phase that
@@ -59,6 +73,8 @@ export type AnthropicReceipt =
       count: number;
       aliases: string[];
       buckets: ReceiptBuckets[];
+      adoption: 'verified';
+      initialActive: string;
     }
   | {
       schemaVersion: 1;
@@ -176,6 +192,32 @@ function bindingField(document: unknown): unknown {
   return isRecord(document) ? document.binding : null;
 }
 
+export function persistedRehearseRefusal(detail: unknown): AnthropicReceiptCode | null {
+  if (!isRecord(detail)) return null;
+  const refusal = detail.rehearseRefusal;
+  if (!isRecord(refusal) || !sameKeys(refusal, ['code']) || typeof refusal.code !== 'string') return null;
+  return (REHEARSE_REFUSAL_CODES as readonly string[]).includes(refusal.code)
+    ? refusal.code as AnthropicReceiptCode
+    : null;
+}
+
+function adoptionReceipt(detail: unknown, binding: PrivateBinding): string | null {
+  if (!isRecord(detail) || !isRecord(detail.adoptionBinding)) return null;
+  const adoption = detail.adoptionBinding;
+  if (adoption.version !== 1 || adoption.cycle !== binding.cycle) return null;
+  const members = adoption.members;
+  if (!Array.isArray(members) || members.length !== binding.memberCount) return null;
+  const aliasesMatch = binding.aliases.every((alias, index) => {
+    const member = members[index];
+    return isRecord(member) && member.alias === alias && typeof member.slotAccountId === 'string' && member.slotAccountId.length > 0;
+  });
+  if (!aliasesMatch) return null;
+  return typeof adoption.initialActiveAlias === 'string'
+    && binding.aliases.includes(adoption.initialActiveAlias)
+    ? adoption.initialActiveAlias
+    : null;
+}
+
 export function projectAnthropicReceipt(
   phase: AnthropicReceiptPhase,
   sources: AnthropicReceiptSources,
@@ -206,7 +248,8 @@ export function projectAnthropicReceipt(
       isRecord(sources.journalDetail) ? sources.journalDetail.identityProof : null,
       journal,
     );
-    if (buckets) {
+    const initialActive = adoptionReceipt(sources.journalDetail, journal);
+    if (buckets && initialActive) {
       return {
         schemaVersion: RECEIPT_SCHEMA_VERSION,
         phase: 'rehearse',
@@ -215,10 +258,13 @@ export function projectAnthropicReceipt(
         count: journal.memberCount,
         aliases: journal.aliases.slice(),
         buckets,
+        adoption: 'verified',
+        initialActive,
       };
     }
-    if (identityMismatchRefusal(sources.journalDetail)) {
-      return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: 'identity-mismatch' };
+    const refusal = persistedRehearseRefusal(sources.journalDetail);
+    if (refusal) {
+      return { schemaVersion: RECEIPT_SCHEMA_VERSION, phase, disposition: 'refused', code: refusal };
     }
   }
   if (phase === 'commit' || phase === 'failure') {
@@ -300,13 +346,13 @@ export function anthropicReceiptBody(receipt: AnthropicReceipt): Record<string, 
     disposition: receipt.disposition,
   };
   if (receipt.disposition === 'refused') {
-    if (
-      receipt.code === 'source-membership-invalid'
+    if (receipt.code && (REHEARSE_REFUSAL_CODES as readonly string[]).includes(receipt.code)
+      || receipt.code === 'source-membership-invalid'
       || receipt.code === ANTHROPIC_PROOF_UNAVAILABLE
-      || receipt.code === 'identity-mismatch'
       || receipt.code === 'source-witness-unavailable'
-      || receipt.code === 'proof-stale'
-    ) body.code = receipt.code;
+      || receipt.code === 'proof-stale') {
+      if (receipt.code) body.code = receipt.code;
+    }
     return body;
   }
   body.membership = 'complete';
@@ -314,6 +360,8 @@ export function anthropicReceiptBody(receipt: AnthropicReceipt): Record<string, 
   body.aliases = receipt.aliases.map((alias) => alias);
   if (receipt.phase === 'rehearse') {
     body.buckets = receipt.buckets.map((bucket) => ({ '5h': bucket['5h'], '7d': bucket['7d'] }));
+    body.adoption = receipt.adoption;
+    body.initialActive = receipt.initialActive;
   }
   return body;
 }
@@ -337,6 +385,8 @@ export function formatAnthropicReceipt(receipt: AnthropicReceipt, json: boolean)
     });
     lines.push(`buckets: ${rendered.join(';')}`);
   }
+  if (body.adoption === 'verified') lines.push('adoption: verified');
+  if (typeof body.initialActive === 'string') lines.push(`initialActive: ${body.initialActive}`);
   return lines.join('\n');
 }
 
