@@ -37,10 +37,13 @@
 // QLB_PI_REHEARSAL=0  → force-inert (rollback verification, R3), even with an owner file.
 // unset               → owner file decides.
 //
-// Consume mode (cswap) has no credential-attributable provider quota reading,
-// so Anthropic is replaced by an unavailable stub before a credential read.
+// Consume mode (cswap): with no owner file and `qlb consume status` = CONSUMED,
+// Anthropic requests use cswap's currently-active Claude Code login (read-only
+// Keychain GET, never refreshed or written) as `cswap-active`. A missing or
+// stale quota reading is unknown and the request proceeds. A fresh provider
+// reading that shows that login exhausted refuses before the Keychain read.
 // Owner file (or rehearsal) + CONSUMED/unknown journal, or a malformed owner
-// file, is likewise a conflict and replaces Anthropic with an error stub.
+// file, is a conflict: Anthropic is replaced by a stub that only returns an error.
 // See decidePiMode in consume.ts.
 
 import { spawn } from "node:child_process";
@@ -107,6 +110,8 @@ import {
   decidePiMode,
   ownerStateForProvider,
   parseConsumeStatus,
+  readActiveClaudeAccess,
+  readConsumeQuotaReadings,
   readOwnerFileState,
   readPiOwnerFile,
   type ConsumeJournal,
@@ -114,7 +119,8 @@ import {
 import { registerKimiCodingProvider } from "./providers/kimi-coding.js";
 import {
   registerConflictProvider,
-  registerUnavailableConsumeProvider,
+  registerConsumeProvider,
+  type Builtin,
   type ProviderApi,
 } from "./consume-provider.js";
 
@@ -345,6 +351,24 @@ function removeRuntimeAnthropicSentinel(ctx: unknown): void {
   delete marker[ANTHROPIC_RUNTIME_SENTINEL_MARKER];
 }
 
+interface BuiltinAnthropicStreams {
+  stream: Builtin;
+  streamSimple: Builtin;
+}
+
+async function resolveBuiltinAnthropicStreams(): Promise<BuiltinAnthropicStreams> {
+  const namespace = (await import("@earendil-works/pi-ai/compat")) as unknown as {
+    anthropicMessagesApi?: () => { stream?: Builtin; streamSimple?: Builtin };
+  };
+  const api = namespace.anthropicMessagesApi?.();
+  if (typeof api?.stream !== "function" || typeof api.streamSimple !== "function") {
+    throw new Error(
+      "qlb-pi: @earendil-works/pi-ai/compat exported no anthropicMessagesApi stream/streamSimple",
+    );
+  }
+  return { stream: api.stream, streamSimple: api.streamSimple };
+}
+
 async function resolveBuiltinAnthropicStreamSimple(): Promise<StreamSimple> {
   // `as unknown as`: Pi's compat types evolve (0.87 narrowed Context → TranscriptContext); we
   // only rely on the runtime shape, which is verified right below and by `qlb doctor` (pi:typecheck).
@@ -532,7 +556,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     footerModelId = event.model.id;
   });
   if (mode === "consume") {
+    let streams: BuiltinAnthropicStreams;
     try {
+      streams = await resolveBuiltinAnthropicStreams();
       catalog = await resolveBuiltinAnthropicCatalog();
     } catch (err) {
       console.error("[qlb-pi] could not resolve builtin anthropic transport/catalog:", err);
@@ -547,12 +573,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       });
       return;
     }
-    registerUnavailableConsumeProvider(providerApi, {
+    registerConsumeProvider(providerApi, streams.streamSimple, {
       createStream: () => createAssistantMessageEventStream() as never,
       models: catalog?.models,
       baseUrl: catalog?.baseUrl,
+      consumeJournal: async () => (await qlbConsumeJournal(5_000)).state,
+      ownerState: () => readOwnerFileState(OWNER_FILE),
+      readAccess: () => readActiveClaudeAccess(),
+      readQuota: () => readConsumeQuotaReadings(qlbDbPath()),
+      shapePayload: shapeAnthropicOAuthPayload,
       recordOutcome,
-    });
+      onDecision: (decision) => {
+        lastDecision = decision;
+      },
+    }, streams.stream);
     pi.on("session_start", (_event, ctx) => {
       setRuntimeAnthropicSentinel(ctx);
     });

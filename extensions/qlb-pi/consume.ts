@@ -1,12 +1,31 @@
-// Consume Option B for Pi replaces Anthropic with an unavailable provider when
-// the cache cannot establish provider-attributable capacity.
+// Consume Option B for Pi: serve cswap's currently-active Claude Code access as
+// the unattributed `cswap-active` identity. Read-only Keychain GET only — never
+// refreshes, never writes, never binds a QLB account slot.
+//
+// A missing or stale quota reading is unknown and the request proceeds. Pi
+// refuses before the Keychain read only when a fresh provider reading for
+// `cswap-active` or the recorded anthropic active login is exhausted.
+// Other slot rows are not the active login and are ignored.
+//
+// The reader duplicates the allowlisted argv and expiry rules previously in
+// src/cswap-native-read.ts so the extension has no dependency on QLB's runtime
+// modules. Its sole shared local dependency is src/redact.ts, which pi:extension
+// verifies and copies for the standalone extension layout.
 
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { isPiProvider, type PiProvider } from "./active-access.js";
 
 export const CSWAP_ACTIVE_ID = "cswap-active";
+export const ACTIVE_CC_SERVICE = "Claude Code-credentials";
+export const SECURITY_BIN = "/usr/bin/security";
+const FALLBACK_ACCOUNT = "claude-code-user";
+/** Same window as src/usage-freshness.ts PROVIDER_READING_MAX_AGE_MS. */
+export const CONSUME_QUOTA_MAX_AGE_MS = 5 * 60 * 1000;
 
 // Shared redaction is intentionally imported from src/: in a package install it
 // resolves within QLB, and in a copied install pi:extension supplies agent/src/redact.ts.
@@ -16,8 +35,12 @@ export { redactEvent, redactSecrets } from "../../src/redact.js";
 // Stable, value-free messages for every consume failure sink (audit, Pi error
 // event, console). Raw diagnostics never cross these boundaries.
 export const CONSUME_ERRORS = {
-  quotaUnavailable:
-    "QLB Anthropic consume unavailable: no fresh provider-attributable quota reading",
+  unreadable: "cswap-active credential unavailable (Claude Code login unreadable)",
+  expired: "cswap-active credential expired; switch or re-login in Claude Code/cswap",
+  disabled:
+    "QLB cswap consume is no longer enabled; restart Pi to return to its own Anthropic provider",
+  quotaExhausted:
+    "QLB Anthropic consume unavailable: the active login's fresh provider quota reading is exhausted",
   conflict:
     "QLB ownership conflict: Pi's Anthropic accounts are QLB-owned (or unknown) while cswap consume is enabled. " +
     "Run `qlb consume disable --provider anthropic` or `qlb migrate rollback --provider anthropic`, then restart Pi.",
@@ -29,9 +52,184 @@ export const CONSUME_ERRORS = {
     "Re-run `qlb consume enable --provider anthropic` or `qlb consume disable --provider anthropic`, then restart Pi.",
 } as const;
 
+export type SecurityRunner = (executable: string, args: readonly string[]) => string;
+
+export interface CswapActiveAccess {
+  access: string;
+  fingerprint: string;
+}
+
+export interface ConsumeQuotaReading {
+  usedPct: number | null;
+  source: string;
+  confidence: string;
+  fetchedAt: number;
+}
+
+/** `unknown` and `fresh` allow the request. `exhausted` refuses before a credential read. */
+export type ConsumeQuotaVerdict = "unknown" | "fresh" | "exhausted";
+
+export function fingerprintAccess(access: string): string {
+  return createHash("sha256").update(access, "utf8").digest("hex");
+}
+
+export function activeKeychainAccount(env: NodeJS.ProcessEnv = process.env): string {
+  if (typeof env.USER === "string" && env.USER.length > 0) return env.USER;
+  try {
+    const name = userInfo().username;
+    if (typeof name === "string" && name.length > 0) return name;
+  } catch {
+    // fall through
+  }
+  return FALLBACK_ACCOUNT;
+}
+
+export function activeCcSecurityArgs(account: string): string[] {
+  return ["find-generic-password", "-a", account, "-w", "-s", ACTIVE_CC_SERVICE];
+}
+
+function defaultRunner(executable: string, args: readonly string[]): string {
+  return execFileSync(executable, [...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+/** Read-only GET of the active Claude Code login; returns only the access token. */
+export function readActiveClaudeAccess(opts: {
+  runner?: SecurityRunner;
+  env?: NodeJS.ProcessEnv;
+  nowMs?: number;
+} = {}): CswapActiveAccess {
+  const runner = opts.runner ?? defaultRunner;
+  let raw: string;
+  try {
+    raw = String(runner(SECURITY_BIN, activeCcSecurityArgs(activeKeychainAccount(opts.env))));
+  } catch {
+    throw new Error(CONSUME_ERRORS.unreadable);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.replace(/\n$/, ""));
+  } catch {
+    throw new Error(CONSUME_ERRORS.unreadable);
+  }
+  const oauth = asRecord(asRecord(parsed)?.claudeAiOauth);
+  const access = oauth?.accessToken;
+  const expiresAt = oauth?.expiresAt;
+  if (typeof access !== "string" || access.length === 0) {
+    throw new Error(CONSUME_ERRORS.unreadable);
+  }
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+    throw new Error(CONSUME_ERRORS.unreadable);
+  }
+  if (expiresAt < (opts.nowMs ?? Date.now())) {
+    throw new Error(CONSUME_ERRORS.expired);
+  }
+  return { access, fingerprint: fingerprintAccess(access) };
+}
+
+function isFreshProviderReading(reading: ConsumeQuotaReading, nowMs: number): boolean {
+  if (reading.confidence !== "authoritative") return false;
+  if (reading.source !== "provider-poll" && reading.source !== "provider-headers") return false;
+  if (typeof reading.usedPct !== "number" || !Number.isFinite(reading.usedPct) || reading.usedPct < 0) {
+    return false;
+  }
+  if (!Number.isFinite(reading.fetchedAt) || reading.fetchedAt > nowMs) return false;
+  return nowMs - reading.fetchedAt <= CONSUME_QUOTA_MAX_AGE_MS;
+}
+
+/**
+ * Missing, stale, cached, imported, or otherwise non-authoritative rows are
+ * `unknown` (allow). A fresh provider percentage below 100 is `fresh` (allow).
+ * Any fresh provider percentage at or above 100 is `exhausted` (refuse).
+ */
+export function classifyConsumeQuota(
+  readings: readonly ConsumeQuotaReading[] | null | undefined,
+  nowMs = Date.now(),
+): ConsumeQuotaVerdict {
+  if (!readings || readings.length === 0) return "unknown";
+  let fresh = false;
+  for (const reading of readings) {
+    if (!isFreshProviderReading(reading, nowMs)) continue;
+    if (reading.usedPct !== null && reading.usedPct >= 100) return "exhausted";
+    fresh = true;
+  }
+  return fresh ? "fresh" : "unknown";
+}
+
+function quotaReading(row: Record<string, unknown>): ConsumeQuotaReading | null {
+  const source = row.source;
+  const confidence = row.confidence;
+  const fetchedAt = row.fetchedAt;
+  if (typeof source !== "string" || typeof confidence !== "string") return null;
+  if (typeof fetchedAt !== "number" || !Number.isFinite(fetchedAt)) return null;
+  const usedPct = row.usedPct;
+  return {
+    usedPct: typeof usedPct === "number" && Number.isFinite(usedPct) ? usedPct : null,
+    source,
+    confidence,
+    fetchedAt,
+  };
+}
+
+function readingsForAccount(db: DatabaseSync, accountId: string): ConsumeQuotaReading[] {
+  const rows = db.prepare(
+    `SELECT used_pct AS usedPct, fetched_at AS fetchedAt, source, confidence
+     FROM snapshots WHERE account_id = ?`,
+  ).all(accountId) as Array<Record<string, unknown>>;
+  const readings: ConsumeQuotaReading[] = [];
+  for (const row of rows) {
+    const reading = quotaReading(row);
+    if (reading) readings.push(reading);
+  }
+  return readings;
+}
+
+/**
+ * Read-only snapshots attributable to the login Pi is about to serve: the
+ * synthetic `cswap-active` row, and the account named by anthropic `active_login`
+ * when QLB has recorded one. Any other slot is ignored. A missing database,
+ * schema, or row is an empty list (`unknown`), never an error.
+ */
+export function readConsumeQuotaReadings(dbPath: string): ConsumeQuotaReading[] {
+  if (!existsSync(dbPath)) return [];
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 200 });
+    let readings: ConsumeQuotaReading[] = [];
+    try {
+      readings = readingsForAccount(db, CSWAP_ACTIVE_ID);
+    } catch {
+      readings = [];
+    }
+    try {
+      const active = db.prepare(
+        `SELECT account_id AS accountId FROM active_login
+         WHERE provider = 'anthropic' AND account_id IS NOT NULL`,
+      ).get() as { accountId?: unknown } | undefined;
+      const accountId = active?.accountId;
+      if (typeof accountId === "string" && accountId.length > 0 && accountId !== CSWAP_ACTIVE_ID) {
+        readings = readings.concat(readingsForAccount(db, accountId));
+      }
+    } catch {
+      // No active-login table is not a quota signal.
+    }
+    return readings;
+  } catch {
+    return [];
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // already unusable
+    }
+  }
 }
 
 /**
@@ -217,4 +415,39 @@ export function conflictMessage(input: PiModeInput): string {
   if ((input.journal ?? "unknown") === "unknown") return CONSUME_ERRORS.stateUnknown;
   const claimsOwnership = input.rehearsal === "1" || input.owner !== "absent";
   return claimsOwnership ? CONSUME_ERRORS.conflict : CONSUME_ERRORS.stateInconsistent;
+}
+
+/**
+ * Adapter for streamWithAuthRetry: at most two reads per request. The first
+ * stream uses read #1; a 401 triggers exactly one reread, and the retry sends
+ * exactly that reread value — only if its fingerprint changed.
+ */
+export function consumeAccessSource(read: () => CswapActiveAccess): {
+  readAccess: () => string;
+  resync: () => Promise<{ resynced: boolean; reason: string }>;
+  sent: () => string[];
+} {
+  let current: CswapActiveAccess | undefined;
+  const sent: string[] = [];
+  return {
+    readAccess: () => {
+      current ??= read();
+      sent.push(current.access);
+      return current.access;
+    },
+    resync: async () => {
+      let next: CswapActiveAccess;
+      try {
+        next = read();
+      } catch {
+        return { resynced: false, reason: "cswap-active reread failed" };
+      }
+      if (current && next.fingerprint === current.fingerprint) {
+        return { resynced: false, reason: "cswap-active access fingerprint unchanged" };
+      }
+      current = next;
+      return { resynced: true, reason: "cswap-active access fingerprint changed" };
+    },
+    sent: () => [...sent],
+  };
 }

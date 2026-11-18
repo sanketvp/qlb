@@ -95,20 +95,19 @@ describe('qlb-pi production default export (Pi jiti loader)', { skip: piAvailabl
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
   });
 
-  it('consume mode without a fresh provider reading fails unavailable through the production entrypoint', () => {
+  it('consume mode with no quota reading reaches the read-only Keychain get', () => {
     const r = load({ states: 'CONSUMED', call: true, marker: true });
     assert.deepEqual(r.calls, ['unregister:anthropic', 'register:anthropic']);
     assert.equal(r.poolStillRegistered, false);
     assert.equal(r.events.length, 1);
-    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.quotaUnavailable);
-    assert.deepEqual(r.outcomes, [{
-      accountId: 'cswap-active', provider: 'anthropic', model: 'claude-sonnet-5',
-      outcome: 'unavailable', error: CONSUME_ERRORS.quotaUnavailable,
-    }]);
-    assert.equal(r.qlbCalls, 1);
+    assert.equal(r.events[0]!.error?.errorMessage, CONSUME_ERRORS.unreadable);
+    assert.equal(r.outcomes.some((outcome) => outcome.error === CONSUME_ERRORS.quotaExhausted), false);
+    assert.equal(r.outcomes.at(-1)?.quota, 'unknown');
+    assert.equal(r.outcomes.at(-1)?.error, CONSUME_ERRORS.unreadable);
+    assert.equal(r.qlbCalls, 2);
     assert.equal(r.gateCalls, 0);
     assert.equal(r.transportCalls, 0);
-    assert.equal(r.securityCalls, 0);
+    assert.equal(r.securityCalls, 1);
   });
 
   it('owner file + CONSUMED is a conflict: pool replaced by an error-only stub', () => {
