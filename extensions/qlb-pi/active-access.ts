@@ -127,6 +127,22 @@ const FIXED_CAUSE_CODES = new Set([
   "cswap-process-check-failed",
   "locks-held",
   "active-login-stale",
+  "token-call-refused",
+  "unknown-provider",
+  "lifecycle-unreadable",
+  "lifecycle-refused",
+  "cutover-begin-in-progress",
+  "not-implemented",
+  "smoke-no-retry",
+  "smoke-token-expired",
+  "smoke-token-expiry-unknown",
+  "refresh-deferred-degraded-read",
+  "refresh-deferred-unattributable",
+  "refresh-deferred-live-read-error",
+  "refresh-deferred-live-unattributed-newer",
+  "refresh-deferred-live-moved",
+  "refresh-deferred-slot-write-failed",
+  "refresh-deferred-unexpected",
 ]);
 const REFUSED_LIFECYCLE_PHASES = new Set(["pre-cutover", "undoing", "rolled-back", "aborted"]);
 

@@ -6,7 +6,10 @@ import { describe, it } from 'node:test';
 
 import tokenCommand, {
   executeToken,
+  INTERACTIVE_PI_PROCESS_TITLE,
+  isNodeProcessTitle,
   tokenCallAllowed,
+  type ParentProcess,
   type TokenCommandDeps,
 } from '../src/commands/token';
 import { createCommandContext, runExecutingCommand } from '../src/app';
@@ -69,6 +72,81 @@ describe('qlb token', () => {
       parent,
       isTty: () => false,
     }), true);
+  });
+
+  it('accepts interactive Pi after process.title replaces argv with pi and ucomm stays node', () => {
+    const { root, script } = fakePiScript();
+    const interactive: ParentProcess = {
+      comm: INTERACTIVE_PI_PROCESS_TITLE,
+      ucomm: 'node',
+      command: 'pi',
+    };
+    const base = {
+      parent: () => interactive,
+      piPackageRoot: () => root,
+      isTty: () => false,
+    };
+
+    assert.equal(isNodeProcessTitle(interactive, INTERACTIVE_PI_PROCESS_TITLE), true);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, base), true);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+      ...base,
+      parent: () => ({ comm: 'pi', ucomm: '/usr/local/bin/node', command: 'pi' }),
+    }), true);
+    assert.equal(tokenCallAllowed({}, base), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, { ...base, isTty: () => true }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+      ...base,
+      piPackageRoot: () => null,
+    }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1', QLB_PI_PACKAGE_ROOT: join(root, 'missing') }, {
+      parent: () => interactive,
+      isTty: () => false,
+    }), false);
+
+    const refused: ParentProcess[] = [
+      { comm: 'pi', command: 'pi' },
+      { comm: 'pi', ucomm: 'pi', command: 'pi' },
+      { comm: 'pi', ucomm: 'bash', command: 'pi' },
+      { comm: 'zsh', ucomm: 'zsh', command: 'pi' },
+      { comm: 'Pi', ucomm: 'node', command: 'Pi' },
+      { comm: 'pi', ucomm: 'node', command: 'pi --provider anthropic' },
+      { comm: 'pi', ucomm: '/usr/local/bin/node', command: `node -r /tmp/preload.js ${script}` },
+      { comm: 'node', ucomm: 'node', command: `node -e process.exit(0) ${script}` },
+      { comm: 'pi-rpc', ucomm: 'node', command: 'pi-rpc' },
+    ];
+    for (const parent of refused) {
+      assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+        ...base,
+        parent: () => parent,
+      }), false, `${parent.comm} ${parent.ucomm ?? ''} ${parent.command}`);
+    }
+  });
+
+  it('accepts an extra retitle only when argv is exactly that title and the executable is node', () => {
+    const { root } = fakePiScript();
+    const rpc: ParentProcess = { comm: 'pi-rpc', ucomm: 'node', command: 'pi-rpc' };
+    const base = {
+      parent: () => rpc,
+      piPackageRoot: () => root,
+      isTty: () => false,
+      retitledProcessTitles: ['pi-rpc'],
+    };
+
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, base), true);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+      ...base,
+      parent: () => ({ ...rpc, ucomm: 'python3' }),
+    }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+      ...base,
+      parent: () => ({ ...rpc, command: 'pi-rpc --eval code' }),
+    }), false);
+    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1' }, {
+      ...base,
+      retitledProcessTitles: ['node', 'pi-rpc --eval'],
+    }), false);
+    assert.equal(isNodeProcessTitle({ comm: 'node', ucomm: 'node', command: 'node' }, 'node'), false);
   });
 
   it('refuses every code-injecting or preload Node option form', () => {
