@@ -1030,6 +1030,15 @@ describe('bindDetectAndResync + MockKeychain', () => {
   });
 });
 
+function journalInventory(
+  rows: Array<{ id: string; provider: string; label: string }>,
+): string {
+  return JSON.stringify({
+    qlbAccountIds: rows.map((row) => row.id),
+    accounts: rows,
+  });
+}
+
 describe('inspectOwnedNativeDrift (read-only)', () => {
   it('warns when copies differ and passes when they match, without writing', async () => {
     let writes = 0;
@@ -1037,10 +1046,23 @@ describe('inspectOwnedNativeDrift (read-only)', () => {
       accounts: [
         { id: 'xai-default', provider: 'xai', label: 'Grok (xAI)' },
         { id: 'acct-a', provider: 'anthropic', label: 'a@example.com' },
+        { id: 'claude-switch', provider: 'anthropic', label: 'claude@example.com' },
       ],
       migrations: [
-        { store: 'pi-xai', state: 'QLB_OWNED' },
-        { store: 'pi-pool', state: 'QLB_OWNED' },
+        {
+          store: 'pi-xai',
+          state: 'QLB_OWNED',
+          detail_json: journalInventory([
+            { id: 'xai-default', provider: 'xai', label: 'Grok (xAI)' },
+          ]),
+        },
+        {
+          store: 'pi-pool',
+          state: 'QLB_OWNED',
+          detail_json: journalInventory([
+            { id: 'acct-a', provider: 'anthropic', label: 'a@example.com' },
+          ]),
+        },
       ],
       readNativeCredential: async (provider) =>
         provider === 'xai' ? grant('native') : grant('same'),
@@ -1055,7 +1077,88 @@ describe('inspectOwnedNativeDrift (read-only)', () => {
     assert.equal(xai?.matches, false);
     assert.equal(anth?.level, 'PASS');
     assert.equal(anth?.matches, true);
+    assert.equal(reports.some((report) => report.accountId === 'claude-switch'), false);
     assert.equal(writes, 2);
+  });
+
+  it('reports a missing owned copy as not found and an unreadable copy as unreadable', async () => {
+    const secret = 'owned-secret-value';
+    const reads: string[] = [];
+    const reports = await inspectOwnedNativeDrift({
+      accounts: [
+        { id: 'pool-ok', provider: 'anthropic', label: 'ok@example.com' },
+        { id: 'pool-missing', provider: 'anthropic', label: 'missing@example.com' },
+        { id: 'pool-unreadable', provider: 'anthropic', label: 'bad@example.com' },
+        { id: 'pool-absent-error', provider: 'anthropic', label: 'gone@example.com' },
+        { id: 'claude-switch', provider: 'anthropic', label: 'claude@example.com' },
+        { id: 'imported-leftover', provider: 'anthropic', label: 'old-import@example.com' },
+      ],
+      migrations: [{
+        store: 'pi-pool',
+        state: 'QLB_OWNED',
+        detail_json: journalInventory([
+          { id: 'pool-ok', provider: 'anthropic', label: 'ok@example.com' },
+          { id: 'pool-missing', provider: 'anthropic', label: 'missing@example.com' },
+          { id: 'pool-unreadable', provider: 'anthropic', label: 'bad@example.com' },
+          { id: 'pool-absent-error', provider: 'anthropic', label: 'gone@example.com' },
+        ]),
+      }],
+      readNativeCredential: async () => grant(secret),
+      readOwnedCredential: async (_provider, accountId) => {
+        reads.push(accountId);
+        if (accountId === 'pool-ok') return grant(secret);
+        if (accountId === 'pool-missing') return null;
+        if (accountId === 'pool-absent-error') {
+          throw new Error('keychain get failed for service=qlb:anthropic:pool-absent-error account=gone@example.com: item not found');
+        }
+        throw new Error('keychain get failed: interaction not allowed');
+      },
+    });
+
+    const byId = new Map(reports.map((report) => [report.accountId, report]));
+    assert.deepEqual(reads, ['pool-ok', 'pool-missing', 'pool-unreadable', 'pool-absent-error']);
+    assert.equal(byId.get('pool-ok')?.level, 'PASS');
+    assert.equal(byId.get('pool-ok')?.matches, true);
+    assert.equal(byId.get('pool-missing')?.level, 'WARN');
+    assert.match(byId.get('pool-missing')?.message ?? '', /QLB Keychain copy not found/);
+    assert.doesNotMatch(byId.get('pool-missing')?.message ?? '', /unreadable/);
+    assert.equal(byId.get('pool-unreadable')?.level, 'WARN');
+    assert.match(byId.get('pool-unreadable')?.message ?? '', /QLB Keychain copy unreadable/);
+    assert.doesNotMatch(byId.get('pool-unreadable')?.message ?? '', /not found/);
+    assert.match(byId.get('pool-absent-error')?.message ?? '', /QLB Keychain copy not found/);
+    assert.equal(byId.has('claude-switch'), false);
+    assert.equal(byId.has('imported-leftover'), false);
+    assert.equal(JSON.stringify(reports).includes(secret), false);
+  });
+
+  it('does not scan provider rows when the owned journal inventory cannot be trusted', async () => {
+    const cases = [
+      '{}',
+      JSON.stringify({
+        qlbAccountIds: ['pool-ok'],
+        accounts: [{ id: 'claude-switch', provider: 'anthropic', label: 'claude@example.com' }],
+      }),
+    ];
+    for (const detail of cases) {
+      let reads = 0;
+      const reports = await inspectOwnedNativeDrift({
+        accounts: [
+          { id: 'pool-ok', provider: 'anthropic', label: 'ok@example.com' },
+          { id: 'claude-switch', provider: 'anthropic', label: 'claude@example.com' },
+        ],
+        migrations: [{ store: 'pi-pool', state: 'QLB_OWNED', detail_json: detail }],
+        readNativeCredential: async () => {
+          reads += 1;
+          return grant('native');
+        },
+        readOwnedCredential: async () => {
+          reads += 1;
+          return grant('native');
+        },
+      });
+      assert.deepEqual(reports, [], detail);
+      assert.equal(reads, 0, detail);
+    }
   });
 });
 
@@ -1086,7 +1189,9 @@ describe('openai-codex JWT credential parsing', () => {
       'eyJhbGciOiJIUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0LWNvZGV4LTEifQ.sig';
     const store = openStore(cfg.dbPath);
     store.upsertAccount(accountId, 'openai-codex', emailLabel);
-    store.upsertMigration('pi-openai-codex', 'QLB_OWNED');
+    store.upsertMigration('pi-openai-codex', 'QLB_OWNED', journalInventory([
+      { id: accountId, provider: 'openai-codex', label: emailLabel },
+    ]));
     store.close();
 
     const kc = new MockKeychain();
@@ -1251,6 +1356,130 @@ describe('qlb doctor native-sync checks', () => {
       kc.getSync(qlbKeychainService('xai', 'xai-default'), 'Grok (xAI)'),
     );
     assert.equal(still.access, 'qlb-copy');
+  });
+
+  it('checks pi-pool members only and does not treat a Claude Code qlb item as the migration copy', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-pool-members-'));
+    temps.push(home);
+    const cfg = defaultConfig(home);
+    const owned = [
+      { id: 'pool-label', label: 'pool-label@example.com', status: 'validated' },
+      { id: 'pool-id', label: 'pool-id@example.com', status: 'validated' },
+      { id: 'pool-missing', label: 'pool-missing@example.com', status: 'imported-unvalidated' },
+      { id: 'pool-unreadable', label: 'pool-unreadable@example.com', status: 'validated' },
+      { id: 'pool-drift', label: 'pool-drift@example.com', status: 'validated' },
+      { id: 'pool-qlb-only', label: 'pool-qlb-only@example.com', status: 'validated' },
+    ] as const;
+    const outsiders = [
+      { id: 'claude-switch', label: 'claude-switch@example.com', status: 'active' },
+      { id: 'imported-leftover', label: 'imported-leftover@example.com', status: 'imported-unvalidated' },
+      { id: 'older-anthropic', label: 'older-anthropic@example.com', status: 'active' },
+    ] as const;
+    const match = 'native-match-token';
+    const ownedDrift = 'owned-drift-token';
+    const nativeDrift = 'native-drift-token';
+    const claudeSlot = 'claude-slot-token';
+    const qlbOnly = 'qlb-only-token';
+    const store = openStore(cfg.dbPath);
+    for (const account of owned) store.upsertAccount(account.id, 'anthropic', account.label, account.status);
+    for (const account of outsiders) store.upsertAccount(account.id, 'anthropic', account.label, account.status);
+    store.upsertAccount('xai-default', 'xai', 'Grok (xAI)');
+    store.upsertMigration('pi-pool', 'QLB_OWNED', journalInventory(
+      owned.map((account) => ({ id: account.id, provider: 'anthropic', label: account.label })),
+    ));
+    store.close();
+
+    const kc = new MockKeychain();
+    const driftCopy = JSON.stringify(grant(ownedDrift));
+    kc.setSync(qlbKeychainService('anthropic', 'pool-label'), 'pool-label@example.com', JSON.stringify(grant(match)));
+    kc.setSync(qlbKeychainService('anthropic', 'pool-id'), 'pool-id', JSON.stringify(grant(match)));
+    kc.setSync(qlbKeychainService('anthropic', 'pool-drift'), 'pool-drift@example.com', driftCopy);
+    kc.setSync(qlbKeychainService('anthropic', 'pool-qlb-only'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(grant(qlbOnly)));
+    kc.setSync(qlbKeychainService('anthropic', 'claude-switch'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(grant(claudeSlot)));
+    const getSync = kc.getSync.bind(kc);
+    const setSync = kc.setSync.bind(kc);
+    const reads: Array<{ service: string; account: string }> = [];
+    let writes = 0;
+    kc.getSync = ((service: string, account: string) => {
+      reads.push({ service, account });
+      if (service === qlbKeychainService('anthropic', 'pool-unreadable')) {
+        throw new Error(`keychain get failed for service=${service} account=${account}: interaction not allowed`);
+      }
+      return getSync(service, account);
+    }) as typeof kc.getSync;
+    kc.setSync = ((service: string, account: string, value: string) => {
+      writes += 1;
+      setSync(service, account, value);
+    }) as typeof kc.setSync;
+
+    const nativeReads: string[] = [];
+    const report = await doctorQlb(cfg, {
+      command: () => 'ok',
+      hostCommand: () => '',
+      keychain: kc,
+      readNativeCredential: async (_provider, accountId) => {
+        nativeReads.push(accountId);
+        return grant(accountId === 'pool-drift' ? nativeDrift : match);
+      },
+    });
+
+    const nativeSync = report.checks.filter((check) => check.name.startsWith('native-sync:'));
+    const byName = new Map(nativeSync.map((check) => [check.name, check]));
+    assert.deepEqual(
+      nativeSync.map((check) => check.name).sort(),
+      owned.map((account) => `native-sync:${account.id}`).sort(),
+    );
+    assert.equal(byName.get('native-sync:pool-label')?.level, 'PASS');
+    assert.equal((byName.get('native-sync:pool-label')?.detail as { matches?: boolean }).matches, true);
+    assert.equal(byName.get('native-sync:pool-id')?.level, 'PASS');
+    assert.equal(byName.get('native-sync:pool-drift')?.level, 'WARN');
+    assert.match(byName.get('native-sync:pool-drift')?.message ?? '', /DIFFERS from native/);
+    assert.equal(byName.get('native-sync:pool-missing')?.level, 'WARN');
+    assert.match(byName.get('native-sync:pool-missing')?.message ?? '', /QLB Keychain copy not found/);
+    assert.doesNotMatch(byName.get('native-sync:pool-missing')?.message ?? '', /unreadable/);
+    assert.equal(byName.get('native-sync:pool-unreadable')?.level, 'WARN');
+    assert.match(byName.get('native-sync:pool-unreadable')?.message ?? '', /QLB Keychain copy unreadable/);
+    assert.doesNotMatch(byName.get('native-sync:pool-unreadable')?.message ?? '', /not found/);
+    assert.equal(byName.get('native-sync:pool-qlb-only')?.level, 'WARN');
+    assert.match(byName.get('native-sync:pool-qlb-only')?.message ?? '', /QLB Keychain copy not found/);
+    for (const account of outsiders) {
+      assert.equal(byName.has(`native-sync:${account.id}`), false, account.id);
+    }
+    assert.equal(byName.has('native-sync:xai-default'), false);
+    assert.deepEqual([...nativeReads].sort(), owned.map((account) => account.id).sort());
+    assert.deepEqual(
+      reads.filter((read) => read.service === qlbKeychainService('anthropic', 'pool-label')).map((read) => read.account),
+      ['pool-label@example.com'],
+    );
+    assert.deepEqual(
+      reads.filter((read) => read.service === qlbKeychainService('anthropic', 'pool-id')).map((read) => read.account),
+      ['pool-id@example.com', 'pool-id'],
+    );
+    assert.deepEqual(
+      reads.filter((read) => read.service === qlbKeychainService('anthropic', 'pool-qlb-only')).map((read) => read.account),
+      ['pool-qlb-only@example.com', 'pool-qlb-only'],
+    );
+    assert.deepEqual(
+      reads.filter((read) => read.service === qlbKeychainService('anthropic', 'pool-missing')).map((read) => read.account),
+      ['pool-missing@example.com', 'pool-missing'],
+    );
+    assert.deepEqual(
+      reads.filter((read) => read.service === qlbKeychainService('anthropic', 'pool-unreadable')).map((read) => read.account),
+      ['pool-unreadable@example.com'],
+    );
+    for (const account of outsiders) {
+      assert.equal(reads.some((read) => read.service === qlbKeychainService('anthropic', account.id)), false, account.id);
+    }
+    assert.equal(reads.some((read) => read.account === QLB_KEYCHAIN_ACCOUNT), false);
+    assert.equal(writes, 0);
+    const serialized = JSON.stringify(nativeSync);
+    for (const secret of [match, ownedDrift, nativeDrift, claudeSlot, qlbOnly]) {
+      assert.equal(serialized.includes(secret), false, secret);
+    }
+    assert.equal(
+      getSync(qlbKeychainService('anthropic', 'pool-drift'), 'pool-drift@example.com'),
+      driftCopy,
+    );
   });
 });
 

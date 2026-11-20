@@ -23,6 +23,7 @@ import { codexSlotIdFromAccessToken } from './codex-auth';
 import { isPiPlaceholder } from './pi-migrate';
 import { QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from './keychain';
 import { isCredentialNotFound } from './credential-backends';
+import { decodeJournalEvidence } from './migration-health';
 import {
   accountIdForSingleGrant,
   genericAuthJsonKey,
@@ -450,6 +451,9 @@ function readOwnedCredentialRawFromKeychain(
   strict = false,
 ): string | null | typeof UNREADABLE {
   const service = qlbKeychainService(provider, accountId);
+  // Migration copies are stored under the label, then the id — the same
+  // coordinates keychainCoords and refresh-lease write. Account name `qlb`
+  // is the Claude Code slot and shared-item name, not this copy.
   const names = [label, accountId].filter((n) => typeof n === 'string' && n.length > 0);
   const tried = new Set<string>();
   for (const account of names) {
@@ -473,7 +477,8 @@ export function readOwnedCredentialFromKeychain(
   accountId: string,
   label: string,
 ): ResyncCredential | null {
-  const raw = readOwnedCredentialRawFromKeychain(keychain, provider, accountId, label);
+  const raw = readOwnedCredentialRawFromKeychain(keychain, provider, accountId, label, true);
+  if (raw === UNREADABLE) throw new Error('QLB Keychain item is unreadable');
   if (raw === null) return null;
   if (isStaticKeyProvider(provider)) return parseApiKeyPayload(raw);
   return parseResyncCredential(raw);
@@ -658,10 +663,14 @@ function nativeExpectedToExist(provider: string): boolean {
 
 /**
  * Read-only drift report for `qlb doctor`. Never writes Keychain.
+ * A QLB_OWNED or RETIRED store is checked only for accounts named by its
+ * trusted journal inventory (`qlbAccountIds` and `accounts`, which must
+ * agree). Other rows for the same provider are not members. An untrusted
+ * inventory is not guessed from the accounts table.
  */
 export async function inspectOwnedNativeDrift(opts: {
   accounts: Array<{ id: string; provider: string; label: string }>;
-  migrations: Array<{ store: string; state: string }>;
+  migrations: Array<{ store: string; state: string; detail_json?: string | null }>;
   readNativeCredential: (
     provider: string,
     accountId: string,
@@ -672,18 +681,30 @@ export async function inspectOwnedNativeDrift(opts: {
     label: string,
   ) => Promise<ResyncCredential | null>;
 }): Promise<NativeDriftReport[]> {
-  const ownedStores = new Set(
-    opts.migrations
-      .filter((m) => OWNED_OR_LATER.has(m.state))
-      .map((m) => m.store),
-  );
+  const membersByStore = new Map<string, {
+    ids: ReadonlySet<string>;
+    providers: ReadonlyMap<string, string>;
+  }>();
+  for (const migration of opts.migrations) {
+    if (!OWNED_OR_LATER.has(migration.state)) continue;
+    const evidence = decodeJournalEvidence(migration);
+    if (!evidence.trusted) continue;
+    membersByStore.set(migration.store, {
+      ids: evidence.participants,
+      providers: evidence.providers,
+    });
+  }
   const reports: NativeDriftReport[] = [];
   for (const acct of opts.accounts) {
     const storeName = migrationStoreNameFor(acct.provider);
-    if (!ownedStores.has(storeName)) continue;
+    const members = membersByStore.get(storeName);
+    if (!members?.ids.has(acct.id)) continue;
+    const recordedProvider = members.providers.get(acct.id);
+    if (recordedProvider !== undefined && recordedProvider !== acct.provider) continue;
 
     let native: ResyncCredential | null = null;
     let owned: ResyncCredential | null = null;
+    let ownedMissing = false;
     try {
       native = await opts.readNativeCredential(acct.provider, acct.id);
     } catch {
@@ -691,8 +712,10 @@ export async function inspectOwnedNativeDrift(opts: {
     }
     try {
       owned = await opts.readOwnedCredential(acct.provider, acct.id, acct.label);
-    } catch {
+      ownedMissing = owned === null;
+    } catch (error) {
       owned = null;
+      ownedMissing = isCredentialNotFound(error);
     }
     const nativeAccess = accessOf(native);
     const ownedAccess = accessOf(owned);
@@ -703,7 +726,9 @@ export async function inspectOwnedNativeDrift(opts: {
         accountId: acct.id,
         level: 'WARN',
         matches: null,
-        message: `QLB_OWNED account ${acct.id} (${acct.provider}): QLB Keychain copy unreadable`,
+        message: ownedMissing
+          ? `QLB_OWNED account ${acct.id} (${acct.provider}): QLB Keychain copy not found`
+          : `QLB_OWNED account ${acct.id} (${acct.provider}): QLB Keychain copy unreadable`,
       });
       continue;
     }
