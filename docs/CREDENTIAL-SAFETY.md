@@ -77,7 +77,16 @@ This is a known, **structural property of sharing credentials with native toolin
   [WARN] native-sync:acct-kimi: QLB Keychain copy DIFFERS from native for acct-kimi (kimi-coding) — native may have refreshed independently; next 401 will auto-resync
   ```
 
-  (Account id illustrative; the message text is exactly what the code emits. A matching fingerprint prints a `[PASS]` line instead, and for rename-strategy providers like Anthropic whose native store is intentionally gone, doctor reports that no comparison is possible rather than warning.)
+  (Account id illustrative; the message text is exactly what the code emits. A matching fingerprint prints a `[PASS]` line instead, and for rename-strategy providers like Anthropic whose native store is intentionally gone, doctor reports that no comparison is possible rather than warning — once it has a readable QLB Keychain copy to compare.)
+
+  **`native-sync` scope while `pi-pool` is `QLB_OWNED` (fix in progress).** Doctor loads every `accounts` row (`SELECT id, provider, label FROM accounts` in `src/diagnostics.ts`) and passes that list to `inspectOwnedNativeDrift` (`src/native-resync.ts`). The function keeps a row when `migrationStoreNameFor(provider)` names a store whose state is `QLB_OWNED` or `RETIRED`. For Anthropic that store is `pi-pool`, so an owned pool makes the check walk every Anthropic database row: owned pool members, Claude Code switching accounts kept for `cswap-anthropic`, and historical non-members. The doctor read goes through `readOwnedCredentialFromKeychain`, which is the non-strict Keychain read. Both an absent item (`isCredentialNotFound`: Keychain status 44, or a message that the item was not found) and a read that failed for any other reason come back as `null`. `inspectOwnedNativeDrift` then emits one warning for both:
+
+  ```text
+  QLB_OWNED account <id> (anthropic): QLB Keychain copy unreadable
+  ```
+
+  A separate change, still in progress, scopes `inspectOwnedNativeDrift` to the accounts that are actual owned `pi-pool` members and reports a missing label separately from an unreadable label. That change is read-only: it does not modify database rows or credentials. Until it lands, a `native-sync` warning on a Claude Code switching account or a historical non-member is this scoping miss. Check it against `qlb migrate status` before treating it as a drifted owned grant.
+
 - **Immediate manual fallback**: re-authenticate the affected account through the **native tool's own login flow**, then bring QLB's ownership of that credential back to a clean state. The credential-safety design has always treated native re-auth as the ultimate fallback — QLB never blocks the native tool from re-authenticating its own accounts, which is exactly what makes recovery straightforward when drift bites.
 
 If you run both QLB-owned and native consumers against the same accounts simultaneously, treat an unexpected auth error on the QLB side as a likely native drift event first, and a QLB-side refresh failure second — check `qlb status` / `qlb doctor`, and check whether a native tool refreshed the account recently.
@@ -95,7 +104,45 @@ Every crash point in the refresh protocol has a named resolution: crash before t
 
 The loopback proxy injects a credential per request — but only for providers whose migration journal says `QLB_OWNED` (or `RETIRED`). For anything else it returns a clear "not yet owned by QLB" error instead of silently falling back to reading native credential files. The proxy itself is loopback-only, token-authenticated, and its token is never written to the database.
 
-**Consume Option B (Anthropic / Claude Code)** is a separate path. When the `cswap-anthropic` journal is `CONSUMED`, the proxy still returns unavailable before reading a Claude Code credential, because that cache is not a credential-attributable provider quota reading and no token is injected or refreshed. Pi is different: it reads the active Claude Code Keychain item and never writes or refreshes it. A missing or stale quota reading is unknown and the request is allowed; Pi refuses that read only when a fresh provider reading for `cswap-active` or the recorded anthropic active login shows the login is exhausted. An expired token is refused, and a 401 re-reads the item once. Other providers are unchanged and still require `QLB_OWNED`/`RETIRED`. The command and journal behavior are documented under [`qlb consume`](CLI.md#qlb-consume).
+**Consume Option B (Anthropic / Claude Code)** is a separate path, and production keeps it off. When the `cswap-anthropic` journal is `CONSUMED`, the proxy still returns unavailable before reading a Claude Code credential, because that cache is not a credential-attributable provider quota reading and no token is injected or refreshed. Pi is different: it reads the active Claude Code Keychain item and never writes or refreshes it. A missing or stale quota reading is unknown and the request is allowed; Pi refuses that read only when a fresh provider reading for `cswap-active` or the recorded anthropic active login shows the login is exhausted. An expired token is refused, and a 401 re-reads the item once. Other providers are unchanged and still require `QLB_OWNED`/`RETIRED`. The command and journal behavior are documented under [`qlb consume`](CLI.md#qlb-consume). Enabling that path while `pi-pool` is owned is refused; see [One Anthropic refresher](#one-anthropic-refresher).
+
+## One Anthropic refresher
+
+Anthropic OAuth rotates the access token on refresh. Two refreshers on the same grants — QLB's owned pool and Claude Code's native pool — invalidate each other's copies. That is the September 8 failure mode in [DESIGN-HISTORY.md](DESIGN-HISTORY.md). The R1b cutover keeps exactly one of them live: `pi-pool` is `QLB_OWNED` (`ownerFile: present`, journal detail `anthropicPoolExtension: disabled`) and `cswap-anthropic` stays `NATIVE`. Switching runs as `qlb auto` under LaunchAgent `com.modus.qlb-auto`. The native Claude pool refresh agent `com.modus.claude-pool-refresh` stays disabled. The procedure is [R1B-CUTOVER-RUNBOOK.md](R1B-CUTOVER-RUNBOOK.md).
+
+`DUAL_OWNERSHIP_REFUSED` in `src/app.ts` is the command-line half of that boundary. `qlb consume enable` exits 1 when `pi-pool` is `MIRRORED`, `VALIDATED`, `QLB_OWNED`, or `RETIRED`, or when `~/.pi/agent/qlb-owner.json` claims Anthropic. A malformed or unreadable owner file counts as a claim; an absent file does not. Forward `qlb migrate stage|rehearse|commit|resume --provider anthropic` exits 1 with the same code while `cswap-anthropic` is `CONSUMED`. `status` and `rollback` still run.
+
+`decidePiMode` in `extensions/qlb-pi/consume.ts` is the in-process half. Pi chooses its Anthropic mode at startup. A malformed owner file is `conflict`. A valid owner file, or `QLB_PI_REHEARSAL=1`, is `owned` only when the consume journal is provably `NATIVE`; any other journal beside that claim is `conflict`. `conflict` registers a stub that returns an error and does not restore `anthropic-pool`. Restart Pi after `qlb consume enable` or `disable`; a session that is already running keeps the mode it chose at launch.
+
+## Pi calls fail closed (S30)
+
+`qlb gate` and `qlb token` print a live credential only for a verified Pi parent. `tokenCallAllowed` (`src/commands/token.ts`) is the predicate. `runPiGate` (`src/pi-gate.ts`) evaluates it before the store opens and before any grant is read.
+
+An unauthorized call fails closed:
+
+```console
+$ QLB_PI_TOKEN_CALL=1 qlb gate anthropic --json --no-refresh
+token-call-refused
+```
+
+The process exits `3`. Stdout is empty. The token, account id, and parent command line are absent from both streams. The stderr line is the fixed cause `token-call-refused`. `--json` does not turn the refusal into a JSON document, and `--no-refresh` is never applied because credential resolution does not start. The same predicate covers `qlb token` for `xai`, `kimi-coding`, and `openrouter`: a refused parent exits `3` with empty stdout. The cause string is written on the gate path.
+
+`extensions/qlb-pi/active-access.ts` allowlists `token-call-refused` in `FIXED_CAUSE_CODES`. When Pi surfaces the refusal, `qlbUnavailable` keeps that code:
+
+```text
+QLB unavailable for anthropic — run qlb doctor (token-call-refused)
+```
+
+A cause that is not on the allowlist would be rewritten to `unknown`. The allowlist exists so the operator sees the real refusal.
+
+What counts as a verified parent, from `tokenCallAllowed` and `piRpcCallAllowed` (`src/pi-rpc-guard.ts`):
+
+- `QLB_PI_TOKEN_CALL` is exactly `1`. Any other value, including an unset variable, is a refusal.
+- stdin and stdout are not TTYs. An interactive shell is a refusal even with the marker set.
+- Interactive Pi sets `process.title` to `pi`. On macOS, libuv overwrites the argv buffer `ps` prints, so `ps comm` and `ps command` are both `pi` while `ps ucomm` stays `node`. The guard accepts that parent only when `ucomm` (macOS `ps ucomm`, or the Linux `/proc/<pid>/exe` basename) is `node`, `nodejs`, or `node.exe`, and `locatePi` resolves `@earendil-works/pi-coding-agent`. A snapshot whose `ucomm` is the title, with Node attested only by a separate executable field, is refused. An argv that still looks like a command line is accepted only when it is Node running a script inside that package's `dist`, with no code-injecting option (`-e`, `-r`, `--require`, `--eval`, `--import`, `--loader`, including those shapes in `NODE_OPTIONS`).
+- Pi RPC sets `process.title` to `pi-rpc`. The title alone is a refusal. `piRpcCallAllowed` requires `comm` and `command` exactly `pi-rpc`, `ucomm` of `node` or `nodejs`, exactly one ELF or Mach-O Node text executable from `lsof -a -p <pid> -d txt -Fn`, `PI_CODING_AGENT=true`, `AI_AGENT=pi`, and `dist/rpc-entry.js` or `dist/bundle/rpc-entry.js` inside the package root. `tokenCallAllowed` calls that function after the marker and TTY checks. Production does not pass the interactive parent snapshot into it, because that snapshot has no `lsof` text executable and would refuse a real RPC parent. The RPC module reads no credentials and writes no logs.
+
+`test/token-guard-process-title.test.ts` (PR #440) is the regression suite for the macOS overwrite. It sets `process.title` to `pi` and to `pi-rpc`, records that `ps` argv becomes the title while the text executable stays `node`, and on macOS records that `ps ucomm` stays `node`. A live `pi-rpc` title whose `ucomm` is the title and whose text executable is absent stays refused. The interactive acceptance landed in `src/commands/token.ts` (PR #439), the RPC verifier is the standalone module `src/pi-rpc-guard.ts` (PR #442), and `tokenCallAllowed` calls `piRpcCallAllowed` (PR #443). PR #441 put `token-call-refused` on the extension allowlist so the gate's exit-3 cause survives into the Pi error event.
 
 ## Retiring a native store comes last
 
@@ -114,5 +161,8 @@ Even after QLB owns your credentials, the original native stores for harnesses l
 | Concurrent refreshes | Generation CAS inside the write transaction; heartbeat lease for de-duplication only |
 | Stale backups | Never trusted: rollback re-exports QLB's *current* grants; backups are used only with a fingerprint proving they were never rotated |
 | Proxy credential access | Fails closed unless the journal says `QLB_OWNED`/`RETIRED` |
+| Two Anthropic refreshers | `pi-pool` `QLB_OWNED` and `cswap-anthropic` `NATIVE` are mutually exclusive; `qlb consume enable` and forward `qlb migrate` exit 1 with `DUAL_OWNERSHIP_REFUSED`, and `decidePiMode` enters `conflict` if both are claimed. See [One Anthropic refresher](#one-anthropic-refresher) |
+| `qlb gate` / `qlb token` from an unverified parent | Exit `3`, stderr `token-call-refused` on the gate path, empty stdout, no credential. See [Pi calls fail closed (S30)](#pi-calls-fail-closed-s30) |
 | Native store removal | Last step, gated on a 7-day / 20-clean-decision soak plus an explicit flag |
 | Native refresh invalidating QLB's copy (shadow-retain providers) | Structural risk of shared credentials, mitigated not eliminated; see [Native credential drift](#native-credential-drift-the-shadow-retain-tradeoff) — drift is fingerprint-detected and auto-resynced (one retry) on the next 401, surfaced proactively by `qlb doctor`, and manually triggerable via `qlb native-resync`; a fingerprint-identical (genuinely revoked) credential still requires native re-auth |
+| `native-sync` on non-member Anthropic rows | Current doctor check walks every Anthropic `accounts` row once `pi-pool` is owned and reports a missing Keychain item as unreadable. A read-only follow-up scopes `inspectOwnedNativeDrift` to owned `pi-pool` members and separates "not found" from "unreadable". No database rows or credentials are modified |
