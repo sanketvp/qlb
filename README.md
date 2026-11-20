@@ -6,7 +6,23 @@ QLB extends the same account-pooling idea to Grok, Kimi K3, and OpenRouter too �
 
 QLB ships with five built-in provider adapters (Claude/Anthropic, Codex, Grok/xAI, Kimi K3, OpenRouter) and can load additional providers as local JavaScript plugins for anything else you use. It never modifies your existing credentials unless you explicitly opt in to full account ownership (see [Credential Safety](docs/CREDENTIAL-SAFETY.md)), and one unavailable provider or broken plugin never crashes the overall status/routing commands.
 
-**Consume Option B (not enabled by this code PR):** QLB can sit on the local request path as the *cross-provider* selector while **cswap remains the Claude account brain**. Anthropic status is read from cswap's cache only. That cache cannot establish credential-attributable provider capacity, so consumed Anthropic requests fail unavailable before the proxy or Pi extension reads a Claude Code credential. A Pi owner file (or an unreadable journal/owner file) together with consume is likewise a conflict: Anthropic is replaced by an error-only stub rather than falling back to `anthropic-pool`. Do not PATH-install `harness/claude` or point `settings.json` at the helper until the separate live-change approvals.
+**Live Anthropic model (Gates 5–7).** Pi's Anthropic pool journal `pi-pool` is `QLB_OWNED`. `qlb migrate status --provider anthropic --json` reports `ownerFile` `present`, `piAtNextLaunch` `QLB works`, and `detail.anthropicPoolExtension` `disabled` (commit moves `~/.pi/agent/extensions/anthropic-pool` to `~/.pi/agent/extensions-disabled-by-qlb/anthropic-pool`). Automatic switching runs under LaunchAgent `com.modus.qlb-auto` (`scripts/launchagents/com.modus.qlb-auto.plist`, written by `qlb auto install-agent` and loaded with `launchctl bootstrap`). While `pi-pool` is `QLB_OWNED`, journal store `cswap-anthropic` stays `NATIVE` (`qlb consume status --provider anthropic` prints `cswap-anthropic: NATIVE`) and LaunchAgent `com.modus.claude-pool-refresh` stays unloaded. `qlb consume enable --provider anthropic` in that state exits 1 and prints `DUAL_OWNERSHIP_REFUSED` (`src/app.ts`). `decidePiMode` in `extensions/qlb-pi/consume.ts` then returns `conflict`, and Pi serves an error-only Anthropic stub. Forward `qlb migrate stage|rehearse|commit|resume --provider anthropic` also exits 1 with `DUAL_OWNERSHIP_REFUSED` while `cswap-anthropic` is `CONSUMED`. Operator steps are in the [R1b cutover runbook](docs/R1B-CUTOVER-RUNBOOK.md).
+
+**Consume Option B** is the other Anthropic mode, and the two modes exclude each other. With `cswap-anthropic` at `CONSUMED`, QLB sits on the local request path as the cross-provider selector and cswap remains the Claude account brain. Anthropic status is read from cswap's cache only. That cache cannot establish credential-attributable provider capacity, so consumed Anthropic requests fail unavailable before the proxy reads a Claude Code credential. Pi consume reads the active Claude Code Keychain item and does not fall back to `anthropic-pool`. A Pi owner file, or an unreadable journal or owner file, together with consume is the same `conflict` stub. Leave `harness/claude` off `PATH` and leave `settings.json` pointed away from the helper.
+
+## Current status
+
+`main` includes the five Gate 6 changes, and Gates 5, 6, and 7 have passed on the live QLB-owned Pi pool:
+
+| Change | What landed |
+|---|---|
+| [#439](https://github.com/sanketvp/qlb/pull/439) | Interactive `pi` process-title guard in `src/commands/token.ts` (`INTERACTIVE_PI_PROCESS_TITLE`, `tokenCallAllowed`) |
+| [#441](https://github.com/sanketvp/qlb/pull/441) | Fixed gate refusal cause `token-call-refused` in `extensions/qlb-pi/active-access.ts` |
+| [#442](https://github.com/sanketvp/qlb/pull/442) | Standalone S30 module `src/pi-rpc-guard.ts` (`piRpcCallAllowed`) |
+| [#443](https://github.com/sanketvp/qlb/pull/443) | `tokenCallAllowed` calls `piRpcCallAllowed` before the interactive-title checks |
+| [#440](https://github.com/sanketvp/qlb/pull/440) | macOS `process.title` overwrite regression suite (`test/token-guard-process-title.test.ts`) |
+
+`pi-pool` is `QLB_OWNED` with `com.modus.qlb-auto` bootstrapped and `cswap-anthropic` left `NATIVE`. A follow-up is in progress for `qlb doctor`'s `native-sync` checks. `inspectOwnedNativeDrift` in `src/native-resync.ts` currently walks every `accounts` row whose provider migration store is `QLB_OWNED` or `RETIRED`, so an owned `pi-pool` also flags Claude Code switching accounts and historical rows, and a missing owned Keychain item is reported as unreadable. That fix will limit the check to owned `pi-pool` members and separate a missing label from an unreadable one. It does not delete database rows or credentials. Those rows are `WARN`; `qlb doctor` still exits 0 unless overall is `FAIL`.
 
 ## Requirements
 
@@ -54,6 +70,28 @@ If `npm link` cannot write a global bin, the script prints fallbacks (`PATH`, el
 
 `qlb init` detects existing credential sources, reports anything missing, and writes a reviewable starter file at `~/.qlb/config.json`. It never prompts, so it is safe to use in scripts and CI. `qlb doctor` performs local checks only by default; add `--live` to opt into provider network calls.
 
+## Release install
+
+The production tree is `~/.qlb/app/current`, which is what `com.modus.qlb-auto` runs. From a clean checkout:
+
+```bash
+npm ci
+npm run build
+node dist/cli.js release install
+qlb pi deploy
+```
+
+`node dist/cli.js release install` (same command as `qlb release install [--sha <sha>]`) publishes this build under `~/.qlb/app/<sha>` and points the `current` symlink at it. A dirty worktree fails with `qlb release: source tree is dirty` (exit 1). A `--sha` that does not match the compiled build stamp exits 3. `qlb pi deploy` copies that release's `extensions/qlb-pi`, plus `src/redact.ts` and `src/pi-owner-document.ts`, to `~/.pi/agent/extensions/qlb-pi` (shared sources sit beside the real extensions directory) and records `pi.deployedAt` and `pi.extensionHash`. After a matching deploy, `qlb doctor` reports `pi:extension` and `pi:extension-drift` as `PASS`.
+
+On macOS, after Gate 5 has committed `pi-pool` to `QLB_OWNED`, install and load the switching agent. `<uid>` is the numeric user id from `id -u`:
+
+```bash
+qlb auto install-agent
+launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.modus.qlb-auto.plist
+```
+
+`qlb auto install-agent` writes `~/Library/LaunchAgents/com.modus.qlb-auto.plist` (mode 0600) with this Node binary and `~/.qlb/app/current/dist/cli.js auto`. Stdout and stderr go to `~/.qlb/auto.log`. The checked-in template with the `REPLACE_WITH_YOUR_USERNAME` placeholders is `scripts/launchagents/com.modus.qlb-auto.plist`; `install-agent` is the command that fills the real paths. Cutover, smoke, and rollback commands are in the [R1b cutover runbook](docs/R1B-CUTOVER-RUNBOOK.md).
+
 ## Installing as a Pi extension
 
 QLB ships a Pi extension at `extensions/qlb-pi/index.ts` that lets [Pi](https://github.com/earendil-works/pi) route Anthropic requests through `qlb resolve` for account selection. `package.json` declares it via the `"pi": { "extensions": [...] }` manifest field that Pi's package installer reads, so it installs like any other Pi package:
@@ -65,8 +103,10 @@ pi install https://github.com/sanketvp/qlb -l        # project-local (.pi/settin
 
 This registers the extension file with Pi — **it is a separate step from installing the `qlb` CLI itself**, and both are required for the extension to actually do anything:
 
-1. **Register the extension** with `pi install` (above).
-2. **Make the `qlb` CLI available.** The extension shells out to a `qlb` binary at runtime (`findQlbCli()` in `extensions/qlb-pi/index.ts`): it looks for a built `dist/cli.js` next to the extension first, then falls back to whatever `qlb` resolves to on `PATH`. Installing the Pi extension alone does **not** build or install that CLI — run `bash scripts/install.sh` (or `npm install && npm run build && npm link`) from this repo so `qlb` is on `PATH`, or otherwise ensure a built `dist/cli.js` ships alongside the installed extension.
+1. **Register the extension** with `pi install` (above), or publish the release copy with `qlb pi deploy` (see [Release install](#release-install)).
+2. **Make the `qlb` CLI available.** The extension shells out to a `qlb` binary at runtime (`findQlbCli()` in `extensions/qlb-pi/index.ts`): it looks for a built `dist/cli.js` next to the extension first, then falls back to whatever `qlb` resolves to on `PATH`. Installing the Pi extension alone does **not** build or install that CLI — run `bash scripts/install.sh` (or `npm install && npm run build && npm link`) from this repo so `qlb` is on `PATH`, or otherwise ensure a built `dist/cli.js` ships alongside the installed extension. The production agent uses `~/.qlb/app/current/dist/cli.js`.
+
+`qlb pi deploy` (`[--dry-run] [--json]`) is the release deployment. It refuses until `qlb release install` has published a `current` tree that contains `qlb-pi`. A successful deploy is what makes doctor checks `pi:extension` and `pi:extension-drift` pass against that release.
 
 Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
 
@@ -206,6 +246,8 @@ See [docs/plugins.md](docs/plugins.md) for the exact adapter shape and a complet
 - [docs/CREDENTIAL-SAFETY.md](docs/CREDENTIAL-SAFETY.md) — what QLB will and will not do with your credentials, and the crash-safety guarantees of the ownership migration.
 - [docs/DESIGN-HISTORY.md](docs/DESIGN-HISTORY.md) — how the design was reviewed, and why local usage accounting was deliberately removed.
 - [docs/plugins.md](docs/plugins.md) — adding custom providers as local JavaScript plugins.
+- [docs/R1B-CUTOVER-RUNBOOK.md](docs/R1B-CUTOVER-RUNBOOK.md) — release install, Gate 5 cutover, Gate 6 smoke and the S30 guard, Gate 7 `com.modus.qlb-auto`, doctor checks, and rollback.
+- [docs/CLAUDE-SWITCHING.md](docs/CLAUDE-SWITCHING.md) — Claude switching provenance, and where QLB's transaction and credential-safety rules differ from the vendored claude-swap port.
 
 ## Design philosophy
 
