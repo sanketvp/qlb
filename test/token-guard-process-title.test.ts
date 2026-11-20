@@ -1,15 +1,17 @@
 /**
- * Pi 1.5.2 sets process.title to "pi" / "pi-rpc", and libuv then overwrites the
- * ps argv buffer. S30 must still allow that parent when macOS ucomm or the
- * mapped executable (lsof txt / /proc/pid/exe) is node or nodejs, and must keep
- * refusing every case below. The allow-cases are red on unpatched main: today
- * tokenCallAllowed requires basename(comm) to be node.
+ * Pi 1.5.2 sets process.title to "pi" / "pi-rpc", and libuv overwrites the ps
+ * argv buffer. Interactive `pi` is allowed when `ucomm` is node/nodejs: macOS
+ * `ps ucomm`, or the Linux `/proc/<pid>/exe` basename that `parentProcess()`
+ * stores in `ucomm`. A snapshot whose `ucomm` is the title, with node proved
+ * only by a separate `executable` field, fails closed.
  *
- * Parent snapshots use these fields: comm, command, ucomm, executable.
+ * `pi-rpc` is allowed only when `piRpcCallAllowed` agrees: `PI_CODING_AGENT=true`,
+ * `AI_AGENT=pi`, `dist/rpc-entry.js` or `dist/bundle/rpc-entry.js`, `ucomm` of
+ * node/nodejs, and a real `textExecutable`. `ucomm: "pi-rpc"` is refused.
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -20,12 +22,22 @@ import { runPiGate } from '../src/pi-gate';
 import { openStore } from '../src/store';
 
 const CALLED = { QLB_PI_TOKEN_CALL: '1' };
+const PI_SIGNALS = { PI_CODING_AGENT: 'true', AI_AGENT: 'pi' };
+const ELF = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 0, 0, 1]);
 
 type TitleParent = {
   comm: string;
   command: string;
   ucomm: string;
+  /** Observed `/proc/pid/exe` or lsof txt path. Not a guard field. */
   executable: string;
+};
+
+type RpcParent = {
+  comm: string;
+  command: string;
+  ucomm: string;
+  textExecutable: string;
 };
 
 type TitleReport = {
@@ -41,6 +53,13 @@ function titleParent(parent: TitleParent): () => TitleParent {
   return () => parent;
 }
 
+function writeNamedExecutable(name: 'node' | 'nodejs'): string {
+  const path = join(mkdtempSync(join(tmpdir(), 'qlb-token-title-bin-')), name);
+  writeFileSync(path, ELF);
+  chmodSync(path, 0o755);
+  return realpathSync(path);
+}
+
 function fakePiPackage(): { root: string; script: string } {
   const dir = mkdtempSync(join(tmpdir(), 'qlb-token-title-'));
   const root = join(dir, 'node_modules', '@earendil-works', 'pi-coding-agent');
@@ -50,6 +69,18 @@ function fakePiPackage(): { root: string; script: string } {
   writeFileSync(script, '#!/usr/bin/env node\n');
   chmodSync(script, 0o755);
   return { root: realpathSync(root), script: realpathSync(script) };
+}
+
+function fakePiRpcPackage(entry: 'rpc-entry.js' | 'bundle/rpc-entry.js'): string {
+  const { root } = fakePiPackage();
+  const entryPath = join(root, 'dist', entry);
+  mkdirSync(join(entryPath, '..'), { recursive: true });
+  writeFileSync(entryPath, 'setInterval(() => {}, 1000);\n');
+  return root;
+}
+
+function rpcParent(parent: RpcParent): () => RpcParent {
+  return () => parent;
 }
 
 function nodeBacked(title: 'pi' | 'pi-rpc', root: string, identity: { ucomm: string; executable: string } = {
@@ -110,39 +141,48 @@ describe('tokenCallAllowed process.title overwrite', () => {
       isTty: () => false,
     }), true);
 
-    const nodejsDir = mkdtempSync(join(tmpdir(), 'qlb-token-title-nodejs-'));
-    const nodejsPath = join(nodejsDir, 'nodejs');
-    symlinkSync(process.execPath, nodejsPath);
     assert.equal(tokenCallAllowed(CALLED, nodeBacked('pi', root, {
       ucomm: 'nodejs',
-      executable: nodejsPath,
+      executable: process.execPath,
     })), true);
 
-    // Linux procps overwrites ucomm to the title as well. The mapped executable stays node.
     assert.equal(tokenCallAllowed(CALLED, nodeBacked('pi', root, {
       ucomm: 'pi',
       executable: process.execPath,
-    })), true);
+    })), false, 'ucomm must prove Node; a separate executable field fails closed');
   });
 
   it('allows an RPC macOS process.title of pi-rpc when the process is node', () => {
-    const { root } = fakePiPackage();
+    const node = writeNamedExecutable('node');
+    const nodejs = writeNamedExecutable('nodejs');
+    const root = fakePiRpcPackage('rpc-entry.js');
+    const bundleRoot = fakePiRpcPackage('bundle/rpc-entry.js');
+    const env = { ...CALLED, ...PI_SIGNALS };
+    const allowed: RpcParent = {
+      comm: 'pi-rpc',
+      command: 'pi-rpc',
+      ucomm: 'node',
+      textExecutable: node,
+    };
+    const call = (parent: RpcParent, packageRoot: string, callEnv: NodeJS.ProcessEnv = env): boolean => tokenCallAllowed(callEnv, {
+      parent: rpcParent(parent),
+      piPackageRoot: () => packageRoot,
+      isTty: () => false,
+    });
 
-    assert.equal(tokenCallAllowed(CALLED, nodeBacked('pi-rpc', root)), true,
-      'RPC macOS process.title=pi-rpc (comm=pi-rpc, command=pi-rpc, ucomm=node) must pass S30');
-    assert.equal(tokenCallAllowed({ QLB_PI_TOKEN_CALL: '1', QLB_PI_PACKAGE_ROOT: root }, {
-      parent: titleParent({
-        comm: 'pi-rpc',
-        command: 'pi-rpc',
-        ucomm: 'node',
-        executable: process.execPath,
-      }),
+    assert.equal(call(allowed, root), true,
+      'RPC macOS process.title=pi-rpc must pass when ucomm and textExecutable are node');
+    assert.equal(tokenCallAllowed({ ...env, QLB_PI_PACKAGE_ROOT: root }, {
+      parent: rpcParent(allowed),
       isTty: () => false,
     }), true);
-    assert.equal(tokenCallAllowed(CALLED, nodeBacked('pi-rpc', root, {
-      ucomm: 'pi-rpc',
-      executable: process.execPath,
-    })), true);
+    assert.equal(call({ ...allowed, ucomm: 'nodejs', textExecutable: nodejs }, root), true);
+    assert.equal(call({ ...allowed, textExecutable: node }, bundleRoot), true);
+
+    assert.equal(call({ ...allowed, ucomm: 'pi-rpc' }, root), false,
+      'ucomm overwritten to pi-rpc fails closed even when textExecutable is Node');
+    assert.equal(call(allowed, fakePiPackage().root), false, 'dist/rpc-entry.js');
+    assert.equal(call(allowed, root, CALLED), false, 'PI_CODING_AGENT and AI_AGENT');
   });
 
   it('records that process.title overwrites ps argv while the executable stays node', () => {
@@ -161,15 +201,18 @@ describe('tokenCallAllowed process.title overwrite', () => {
     }
   });
 
-  it('accepts a live process.title overwrite through the production parent check', () => {
-    for (const title of ['pi', 'pi-rpc'] as const) {
-      const report = runTitleProbe(title);
-      assert.deepEqual(
-        { production: report.production, injected: report.injected },
-        { production: true, injected: true },
-        JSON.stringify(report),
-      );
-    }
+  it('accepts a live process.title of pi through the production parent check', () => {
+    const report = runTitleProbe('pi');
+    assert.equal(report.production, true, JSON.stringify(report));
+    assert.equal(report.injected, true, JSON.stringify(report));
+    assert.match(basename(report.snapshot.executable), /^node(?:js)?$/);
+  });
+
+  it('refuses a live pi-rpc title when ps ucomm is the title and textExecutable is absent', () => {
+    const report = runTitleProbe('pi-rpc');
+    assert.equal(report.production, false, JSON.stringify(report));
+    assert.equal(report.injected, false, JSON.stringify(report));
+    if (process.platform !== 'darwin') assert.equal(report.snapshot.ucomm, 'pi-rpc');
   });
 
   it('still allows an un-overwritten node parent running a script inside Pi dist', () => {
