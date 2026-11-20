@@ -3,6 +3,7 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 
 import { locatePi } from '../pi-integration';
+import { piRpcCallAllowed } from '../pi-rpc-guard';
 import { loadTokenResolver } from '../token';
 import type { TokenResolution } from '../token/xai';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -175,6 +176,15 @@ export function tokenCallAllowed(
 ): boolean {
   if (env.QLB_PI_TOKEN_CALL !== '1') return false;
   if ((deps.isTty ?? (() => process.stdin.isTTY === true || process.stdout.isTTY === true))()) return false;
+  // Pi RPC (`process.title = "pi-rpc"`) overwrites argv, so this runs before the
+  // node-comm checks. Production omits `parent`: `parentProcess()` has no lsof
+  // text executable, and that incomplete snapshot fails closed. An injected
+  // parent is forwarded as-is and still has to satisfy the RPC guard.
+  if (piRpcCallAllowed(env, {
+    isTty: deps.isTty,
+    piPackageRoot: deps.piPackageRoot,
+    ...(deps.parent ? { parent: deps.parent } : {}),
+  })) return true;
   const parent = (deps.parent ?? parentProcess)();
   if (!parent) return false;
   const root = deps.piPackageRoot ? deps.piPackageRoot(env) : packageRoot(env);
