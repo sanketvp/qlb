@@ -295,7 +295,16 @@ function appendGateAutoLog(dbPath: string, line: string): void {
 
 /** S30/S54 gate boundary. Credential resolution is deliberately outside the evidence transaction. */
 export async function runPiGate(providerName: string, deps: PiGateDeps): Promise<number> {
-  if (!isProvider(providerName) || !(deps.guard ?? tokenCallAllowed)(deps.env)) return 3;
+  // Empty stderr becomes "(unknown)" in qlb-pi. Both refusals are fixed and value-free:
+  // never echo the provider argument, env, parent command, or paths.
+  if (!isProvider(providerName)) {
+    deps.stderr?.('unknown-provider');
+    return 3;
+  }
+  if (!(deps.guard ?? tokenCallAllowed)(deps.env)) {
+    deps.stderr?.('token-call-refused');
+    return 3;
+  }
 
   let db: DatabaseSync;
   try {
