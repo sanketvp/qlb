@@ -35,13 +35,15 @@ function fakePiScript(): { root: string; script: string } {
 }
 
 describe('qlb gate core (S30/S54)', () => {
-  it('refuses a wrong parent before resolution with no credential output', async () => {
+  it('refuses a wrong parent before resolution with a fixed cause and no credential output', async () => {
     const stdout: string[] = [];
+    const stderr: string[] = [];
     let read = false;
     const result = await runPiGate('xai', {
       dbPath: fixtureDb(),
       env: { QLB_PI_TOKEN_CALL: '1' },
       deliver: (value) => stdout.push(value),
+      stderr: (line) => stderr.push(line),
       guard: () => false,
       admitted: () => ({ ok: true }),
       prerequisites: () => undefined,
@@ -50,6 +52,46 @@ describe('qlb gate core (S30/S54)', () => {
     assert.equal(result, 3);
     assert.equal(read, false);
     assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['token-call-refused']);
+  });
+
+  it('refuses the default token-call guard with a fixed cause before resolution', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let read = false;
+    const result = await runPiGate('anthropic', {
+      dbPath: fixtureDb(),
+      env: {},
+      deliver: (value) => stdout.push(value),
+      stderr: (line) => stderr.push(line),
+      admitted: () => ({ ok: true }),
+      prerequisites: () => undefined,
+      provider: { read: () => { read = true; return { token: 'fixture-secret', accountId: 'anthropic-default', source: 'fixture' }; } },
+    });
+    assert.equal(result, 3);
+    assert.equal(read, false);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['token-call-refused']);
+  });
+
+  it('refuses an unknown provider with a fixed cause and no credential output', async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let read = false;
+    const result = await runPiGate('not-a-provider', {
+      dbPath: fixtureDb(),
+      env: { QLB_PI_TOKEN_CALL: '1' },
+      deliver: (value) => stdout.push(value),
+      stderr: (line) => stderr.push(line),
+      guard: () => true,
+      admitted: () => ({ ok: true }),
+      prerequisites: () => undefined,
+      provider: { read: () => { read = true; return { token: 'fixture-secret', accountId: 'x', source: 'fixture' }; } },
+    });
+    assert.equal(result, 3);
+    assert.equal(read, false);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(stderr, ['unknown-provider']);
   });
 
   it('counts value-free evidence-gap records for doctor without retrying a DB write', () => {

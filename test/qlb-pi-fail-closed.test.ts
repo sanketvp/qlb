@@ -6,7 +6,10 @@ import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { resolvePiPackageRoot } from '../src/pi-integration';
+import { qlbUnavailable, type PiProvider } from '../extensions/qlb-pi/active-access';
 import { CONSUME_ERRORS } from '../extensions/qlb-pi/consume';
+import { createAnthropicSource } from '../extensions/qlb-pi/providers/anthropic';
+import { createOpenAICodexSource, gateCause } from '../extensions/qlb-pi/providers/openai-codex';
 
 const ROOT = join(__dirname, '..', '..');
 const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ?? '/nonexistent-pi';
@@ -32,7 +35,148 @@ const CAUSES = [
   { name: 'phase=pre-cutover', cause: 'phase=pre-cutover', code: 3, stderr: 'qlb gate: refused: phase=pre-cutover' },
   { name: 'undo-in-progress', cause: 'undo-in-progress', code: 3, stderr: 'qlb gate: refused: undo-in-progress' },
   { name: 'codex-token-expired-renewer-idle', cause: 'codex-token-expired-renewer-idle', code: 1, stderr: 'codex-token-expired-renewer-idle' },
+  // S30 guard refusal. runPiGate writes this bare code; it must not collapse to unknown.
+  { name: 'token call refused', cause: 'token-call-refused', code: 3, stderr: 'token-call-refused' },
 ] as const;
+
+/**
+ * Every fixed refusal stderr code emitted by src/pi-gate.ts and src/gate/*.ts.
+ * phase=* values are allowlisted by safeCause's lifecycle regex, not the set.
+ * Single-consume failures that are not GateFailure stay credential-unavailable
+ * inside failureCode, so they are represented by that code only.
+ */
+const AUDITED_GATE_REFUSAL_CODES = [
+  'unknown-provider',
+  'token-call-refused',
+  'store-open-failed',
+  'lifecycle-refused',
+  'lifecycle-unreadable',
+  'cutover-begin-in-progress',
+  'undo-in-progress',
+  'cswap-process-alive',
+  'cswap-process-check-failed',
+  'owner-file-malformed',
+  'provider-not-applicable',
+  'owner-entry-missing',
+  'anthropic-pool-present',
+  'placeholder-missing',
+  'missing-provider-gate',
+  'credential-unavailable',
+  'phase=pre-cutover',
+  'phase=undoing',
+  'phase=rolled-back',
+  'phase=aborted',
+  'no-credentials',
+  'credential-expiry-unusable',
+  'token-expired',
+  'refresh-failed',
+  'invalid-client',
+  'foreign-credential',
+  'relogin-needed',
+  'locks-held',
+  'identity-mismatch',
+  'refresh-deferred-degraded-read',
+  'refresh-deferred-unattributable',
+  'refresh-deferred-live-read-error',
+  'refresh-deferred-live-unattributed-newer',
+  'refresh-deferred-live-moved',
+  'refresh-deferred-slot-write-failed',
+  'refresh-deferred-unexpected',
+  'store-unmirrored',
+  'gate-context-unset',
+  'active-login-unset',
+  'active-slot-missing',
+  'keychain-unavailable',
+  'active-login-stale',
+  'smoke-no-retry',
+  'smoke-token-expired',
+  'smoke-token-expiry-unknown',
+  'not-implemented',
+] as const;
+
+const UNLISTED_STDERR = [
+  '',
+  'unknown',
+  'raw failure detail must not escape',
+  '/Users/someone/.qlb/credentials-linux.json',
+  'sk-ant-api03-fixture-secret',
+  'token-call-refused\n/tmp/secret',
+  'qlb gate: refused: /tmp/secret',
+  'phase=cutting-over',
+  'phase=retired',
+  'phase=not-a-phase',
+  'refresh-deferred-not-a-real-reason',
+  'smoke-token-expired extra',
+  'QLB_PI_TOKEN_CALL=1',
+  'Bearer fixture-token',
+] as const;
+
+function doctorCause(provider: PiProvider, cause: string): string {
+  const message = qlbUnavailable(provider, cause).error.errorMessage;
+  const prefix = `QLB unavailable for ${provider} — run qlb doctor (`;
+  assert.equal(message, `${prefix}${message.slice(prefix.length, -1)})`);
+  return message.slice(prefix.length, -1);
+}
+
+function causeCode(error: unknown): string {
+  const cause = (error as { causeCode?: unknown } | null)?.causeCode;
+  return typeof cause === 'string' ? cause : 'unknown';
+}
+
+describe('qlb-pi gate refusal causes', () => {
+  it('maps an exit-3 guard refusal through both provider readers to token-call-refused', async () => {
+    const anthropic = createAnthropicSource({
+      runGate: async () => ({ code: 3, stdout: '', stderr: 'token-call-refused' }),
+    });
+    const codex = createOpenAICodexSource({
+      runGate: async () => ({ code: 3, stdout: '', stderr: 'qlb gate: refused: token-call-refused\n' }),
+    });
+    await assert.rejects(anthropic.read(), (error: unknown) => {
+      assert.equal(causeCode(error), 'token-call-refused');
+      assert.equal(doctorCause('anthropic', causeCode(error)), 'token-call-refused');
+      return true;
+    });
+    await assert.rejects(codex.read(), (error: unknown) => {
+      assert.equal(causeCode(error), 'token-call-refused');
+      assert.equal(doctorCause('openai-codex', causeCode(error)), 'token-call-refused');
+      return true;
+    });
+  });
+
+  it('keeps every audited gate and smoke refusal code and collapses unlisted stderr', () => {
+    for (const code of AUDITED_GATE_REFUSAL_CODES) {
+      assert.equal(gateCause(code), code, code);
+      assert.equal(gateCause(`qlb gate: refused: ${code}`), code, code);
+      assert.equal(doctorCause('anthropic', gateCause(code)), code, code);
+      assert.equal(doctorCause('openai-codex', code), code, code);
+    }
+    for (const raw of UNLISTED_STDERR) {
+      const parsed = gateCause(raw);
+      assert.equal(doctorCause('anthropic', parsed), 'unknown', raw);
+      assert.equal(doctorCause('openai-codex', raw), 'unknown', raw);
+      const message = qlbUnavailable('anthropic', raw).error.errorMessage;
+      assert.equal(message.includes('sk-ant'), false, raw);
+      assert.equal(message.includes('/Users'), false, raw);
+      assert.equal(message.includes('/tmp'), false, raw);
+      assert.equal(message.includes('fixture-token'), false, raw);
+      assert.equal(message.includes('QLB_PI_TOKEN_CALL'), false, raw);
+    }
+  });
+
+  it('collapses empty exit-3 stderr to unknown without reading a credential', async () => {
+    const source = createAnthropicSource({
+      runGate: async () => ({ code: 3, stdout: '{"token":"must-not-leak"}', stderr: '' }),
+    });
+    await assert.rejects(source.read(), (error: unknown) => {
+      const message = error instanceof Error ? error.message : '';
+      assert.equal(message, 'QLB gate anthropic unavailable');
+      assert.equal(causeCode(error), 'unknown');
+      assert.equal(doctorCause('anthropic', causeCode(error)), 'unknown');
+      assert.equal(`${message} ${causeCode(error)}`.includes('must-not-leak'), false);
+      return true;
+    });
+  });
+});
 
 const loader = String.raw`
 import { createRequire } from 'node:module';
