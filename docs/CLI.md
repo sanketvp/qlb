@@ -6,7 +6,7 @@ Global behavior:
 
 - Configuration resolves in this order: CLI flag → environment variable → `~/.qlb/config.json` → built-in default. `--config` or `QLB_CONFIG_PATH` selects a different config file. See the [README](../README.md#configuration) for the full field/env/flag table.
 - `qlb <command> --json` always exists where output is structured, and `--json` output is additive (fields are kept, not renamed).
-- Exit codes: `0` on success, `1` on "ran but nothing available" (e.g. `EXHAUSTED`, doctor `FAIL`), `2` on a refused destructive operation.
+- Exit codes: `0` on success, `1` on "ran but nothing available" (e.g. `EXHAUSTED`, doctor `FAIL`) and on `DUAL_OWNERSHIP_REFUSED`, `2` on a usage error or a refused destructive operation, `3` on a fail-closed refusal that must not print a credential (the S30 gate's `token-call-refused`, and lifecycle refusals such as `qlb gate: refused: <code>`).
 
 ## `qlb init`
 
@@ -84,7 +84,8 @@ Beyond the core and per-provider lines, doctor also reports provider-usage compa
 | `consume:marker` | cswap consume is enabled, or a consume marker file exists | `PASS` when the journal says `CONSUMED` and the marker is present. `FAIL` when `CONSUMED` but the marker is missing (new Pi sessions will not use cswap). `WARN` when the marker exists without `CONSUMED` (Pi refuses Anthropic until reconciled). |
 | `undo:incomplete` | always | `FAIL` while the lifecycle is `undoing`, or when a rolled-back or aborted lifecycle retains the `cswap-restore-pending` fence; resume recovery with `qlb undo cswap --resume`. `PASS` when no incomplete undo remains, and `N/A` outside undo-related lifecycle phases. |
 | `undo:lineage-match` | always; `N/A` outside terminal undo phases and `WARN` when lifecycle state is unavailable | Reads QLB and C-swap Keychain credentials without changing either. `PASS` when every lineage matches and no encrypted fallback remains. `WARN` when a readable C-swap credential rotated after a completed hand-back. `FAIL` for malformed hand-back structure, missing or malformed C-swap credentials, required-state/refusal failures, unavailable credential reads, or a leftover encrypted fallback. `N/A` when the lifecycle was not produced by undo or is outside terminal undo phases. |
-| `pi:extension` | always, except when Pi and the extension are installed but the QLB repo root cannot be located | `PASS` when the installed `qlb-pi` extension and its sibling `~/.pi/agent/src/redact.ts` match this repo's sources, or when Pi / the extension is not installed. `WARN` when the installed copy has drifted (the fix copies `extensions/qlb-pi/*.ts` and `src/redact.ts`) or the Pi package behind the launcher on `PATH` cannot be located (set `QLB_PI_PACKAGE_ROOT`). |
+| `pi:extension` | always, except when Pi and the extension are installed but the QLB repo root cannot be located | `PASS` when the installed `~/.pi/agent/extensions/qlb-pi` tree and its shared sources match this repo, or when Pi / the extension is not installed. Shared sources are `redact.ts` and `pi-owner-document.ts` beside the resolved extensions directory (`~/.pi/agent/src/` when `extensions` is a real directory). `WARN` when the installed copy has drifted (the fix is `qlb pi deploy`, which publishes the current release rather than a hand copy) or the Pi package behind the launcher on `PATH` cannot be located (set `QLB_PI_PACKAGE_ROOT`). |
+| `pi:extension-drift` | always | Compares that same install with the extension inside `~/.qlb/app/current`, not with the git checkout. `PASS` when `pi.deployedAt` is recorded and the installed hash, the recorded `pi.extensionHash`, and the current-release hash are the same (`installed qlb-pi deployment hash matches the current release`). `WARN` when nothing has been deployed (`not deployed`), the deployment record cannot be read, or the current release cannot be planned. `FAIL` when the hash differs (`installed qlb-pi deployment hash differs from the current release`), a legacy `.qlb-pi-` staging directory is still under `extensions`, or the installed tree is unavailable. `qlb release install` followed by `qlb pi deploy` makes this row pass. `pi:extension` passes with it when this repo's `extensions/qlb-pi` matches those same bytes. |
 | `pi:seam:<name>` | Pi and the extension are installed | One line per Pi API the extension depends on (`anthropicMessagesApi`, `registerProvider`, `model_select`, `after_provider_response`); flags a Pi upgrade that removed one. |
 | `pi:typecheck` | `--live` only | Typechecks the extension against the Pi you actually run. |
 | `hermes:checkout` | no Hermes checkout at `~/.hermes/hermes-agent` | `PASS`; all other Hermes checks are skipped. |
@@ -96,7 +97,9 @@ Beyond the core and per-provider lines, doctor also reports provider-usage compa
 | `hermes:models`, `hermes:version` | same | The Hermes `/model` picker lists what QLB policies serve; the Hermes version marker. |
 | `hermes:seam:<name>` | same, `--live` only | The Hermes symbols the plugin patches still exist with the expected signature. |
 
-For QLB-owned accounts, doctor also runs the `native-sync` credential-drift check, with per-account results in its detail — see [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff).
+For QLB-owned accounts, doctor also runs the `native-sync` credential-drift check. `qlb doctor --list-checks --json` names the registered check `native-sync`; a live report emits one `native-sync:<accountId>` row per compared account (level and message on that row, with `provider` and `matches` in `detail`). The comparison is `inspectOwnedNativeDrift` in `src/native-resync.ts`. It is read-only: it does not write Keychain items, delete database rows, or otherwise touch credentials. See [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff) for the resync that runs later, on a real 401.
+
+That check is broader than the owned Pi pool today. If `pi-pool` is `QLB_OWNED` or `RETIRED`, every Anthropic row in `accounts` is compared, including valid Claude Code switching accounts and historical rows that are not owned `pi-pool` members. Other providers are included the same way when their own `pi-<provider>` store is `QLB_OWNED` or `RETIRED`. A missing owned Keychain item and an unreadable one are the same WARN: `QLB Keychain copy unreadable`. A follow-up change is in progress so `inspectOwnedNativeDrift` scopes strictly to owned `pi-pool` members and distinguishes a missing Keychain item from an unreadable one. That follow-up still must not delete database rows or touch credentials. Until it lands, treat a `native-sync:<accountId>` WARN on a Claude Code switching account or a historical row as this scoping gap, not as a signal to prune the row or rewrite the Keychain item.
 
 ## `qlb report cutover`
 
@@ -109,6 +112,14 @@ Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EX
 ## `qlb auto`
 
 Run QLB's Anthropic autoswitch loop. `--once` performs one live tick; `--dry-run` makes a decision without mutating state or switching credentials. The normal loop refuses to run while an active lifecycle drill is in progress.
+
+On the verified Gate 5 host, `pi-pool` is `QLB_OWNED` and this loop is the Pi auto-switcher. It runs under the per-user LaunchAgent `com.modus.qlb-auto` (`~/Library/LaunchAgents/com.modus.qlb-auto.plist`). `qlb auto install-agent` writes that plist (mode `0600`) and does not call `launchctl`. The plist runs the release CLI:
+
+```text
+<node> ~/.qlb/app/current/dist/cli.js auto
+```
+
+`RunAtLoad` is true. `KeepAlive` restarts the loop unless it exited successfully (`SuccessfulExit` false), with `ThrottleInterval` 60. Stdout and stderr both append to `~/.qlb/auto.log`. Install `qlb release install` before `install-agent`, because the plist points at `~/.qlb/app/current`. A second live loop exits `3` with `qlb auto: auto-already-running`. `install-agent` prints `installed <plist path>` and exits `0`; a usage error exits `2` (`usage: qlb auto install-agent`) and a write failure exits `1`.
 
 Automatic switching and parking use only fresh, direct provider quota readings. Cached, imported, stale, or advisory rows remain available for display but cannot create a quota verdict; when the active provider measurement is unavailable or a transient usage poll fails, the loop holds rather than switching on a synthetic exhaustion result.
 
@@ -126,7 +137,7 @@ The credential-free breaker drill is `qlb auto --once --inject breaker-rows anth
 
 An active fire drill can finish with `qlb lifecycle drill-done` only after all four facts were recorded after the drill began: an injected `usage-5xx` failover, a rolled-back `qlb switch anthropic <account_id> --inject fail-step 8`, the injected `breaker-rows` refusal, and an undo hand-back plan. Record the last fact without changing credentials with `QLB_FAULT_INJECTION=1 qlb undo cswap --dry-run --record-drill`; `--record-drill` is accepted only with `--dry-run`. If any fact is missing, `drill-done` exits 3 and names the missing facts. `qlb retire cswap` rechecks this same evidence predicate before retirement.
 
-Flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject <usage-5xx|breaker-rows> anthropic`.
+Loop flags: `[--once] [--dry-run] [--json]`. Fault injection additionally requires `QLB_FAULT_INJECTION=1` and exactly `--once --inject <usage-5xx|breaker-rows> anthropic`. `install-agent` takes no flags. The full usage line is `qlb auto [--once] [--dry-run] [--json] | qlb auto --once [--json] --inject <usage-5xx|breaker-rows> anthropic | qlb auto install-agent | qlb auto resume anthropic [--json] | qlb auto scope anthropic [all|<model>] [--json] | qlb auto drill-begin [--json]`.
 
 ## `qlb auto scope anthropic`
 
@@ -583,6 +594,8 @@ resume:    noop
 
 `qlb migrate status` and `qlb migrate status --json` are diagnostic. They report the filesystem and journal view, including `detail`, and are not a receipt. Status omits `completeSetCommitment` (including its digest). That commitment stays in the private journal and staging file. Diagnostic `detail` can still show staged account labels, and after a successful Anthropic rehearsal it can show `identityProof` aliases and the fixed `5h` / `7d` readings. The receipt does not print labels, and status output is not publication authority.
 
+Gate 5's Anthropic path is `stage`, then `rehearse`, then `commit`, with `status` and `rollback` available throughout. After that commit, `pi-pool` is `QLB_OWNED`. The verified status fields are `ownerFile: "present"`, `piAtNextLaunch: "QLB works"`, and `detail.anthropicPoolExtension: "disabled"` (commit moves Pi's `extensions/anthropic-pool` to `extensions-disabled-by-qlb/anthropic-pool` and records that disposition). Human status prints those as `owner: present` and `pi next: QLB works`. `store` stays `pi-pool`, `strategy` stays `rename`, and the JSON object still includes `state`, `updatedAt`, `nativeStore`, `resumeAction`, `provider`, and the rest of `detail`. Once that commit's hygiene has finished, the native pool file is the `.pre-qlb` copy and, with no rollback intent pending, `resume` is `noop (already QLB_OWNED)`. `pi next: QLB works` means the next Pi launch uses QLB. `status` and `rollback` keep working while cswap consume is enabled; `stage`, `rehearse`, `commit`, and `resume` do not (see [`qlb consume`](#qlb-consume)).
+
 ### `qlb migrate receipt`
 
 Anthropic-only read-only receipt, and the only operational migration receipt:
@@ -804,7 +817,85 @@ $ qlb consume disable --provider anthropic
 cswap-anthropic: NATIVE
 ```
 
-`--provider` must be `anthropic`. Enable writes `consume-anthropic.json` `{state:"CONSUMED"}` (no tokens) beside the QLB database (`~/.qlb/` by default; `QLB_DB_PATH` / config `dbPath` move it, and Pi resolves it the same way — a per-invocation `--db`/`--db-path` flag is not visible to Pi), then upserts journal store `cswap-anthropic=CONSUMED`. Disable journals `NATIVE` and deletes the marker. `qlb migrate status --provider anthropic` stays on the pi-pool ladder (`NATIVE` until a real migrate) — consume is a different store. `consume enable` refuses with `DUAL_OWNERSHIP_REFUSED` while Pi's Anthropic accounts are QLB-owned (pi-pool `MIRRORED`/`VALIDATED`/`QLB_OWNED`/`RETIRED`, or a Pi owner file exists), and forward `qlb migrate stage|rehearse|commit|resume --provider anthropic` refuses with the same code while consume is enabled (`status` and `rollback` still work). Pi chooses its Anthropic mode at startup, so restart running Pi sessions after `enable`/`disable`; a Pi that starts while the marker and journal disagree (mid-change or after a crash) refuses Anthropic until you re-run `enable` or `disable`. The proxy still fails an Anthropic consume request as unavailable before reading a Claude Code credential, because routing has no credential-attributable provider quota for `cswap-active`. Pi does not use that gate. In consume mode Pi serves the active Claude Code Keychain item (`Claude Code-credentials`) with a read-only `find-generic-password`: it never refreshes or writes the token, it refuses an expired token, and after one HTTP 401 it re-reads the item once and retries only if the access fingerprint changed. A missing quota reading, or a stale, cached, imported, or otherwise non-authoritative one, is `unknown`; the request proceeds and the outcome log records `quota:"unknown"`. Pi refuses before that Keychain read only when a fresh provider reading (`provider-poll` or `provider-headers`, `authoritative`, at most five minutes old) stored for `cswap-active` or for the account named by the anthropic `active_login` row has `usedPct` of at least 100. Readings on other slots are ignored, so a stale fleet cannot block Pi. A Pi owner file (or an unreadable journal/owner file) together with consume is an error-only stub rather than a fallback to `anthropic-pool`. cswap remains the Claude account brain; QLB does not attribute the Keychain login to a sequence slot, so an `active_login` row is only as accurate as the last account QLB recorded.
+`--provider` must be `anthropic`. Enable writes `consume-anthropic.json` `{state:"CONSUMED"}` (no tokens) beside the QLB database (`~/.qlb/` by default; `QLB_DB_PATH` / config `dbPath` move it, and Pi resolves it the same way — a per-invocation `--db`/`--db-path` flag is not visible to Pi), then upserts journal store `cswap-anthropic=CONSUMED`. Disable journals `NATIVE` and deletes the marker. Consume is a different store from `pi-pool`. With Gate 5 committed, `pi-pool` stays `QLB_OWNED` and `cswap-anthropic` stays `NATIVE`: Claude Code keeps its own switching path, and Pi keeps the owned pool. Do not enable consume on that host. `com.modus.claude-pool-refresh` stays disabled for the same reason; QLB's Pi loop is `com.modus.qlb-auto`, not that agent.
+
+`qlb consume enable --provider anthropic` then exits `1` with empty stdout and this stderr line. It does not write the marker or the journal:
+
+```text
+qlb consume enable: DUAL_OWNERSHIP_REFUSED — Pi's Anthropic accounts are QLB-owned (pi-pool QLB_OWNED). Roll back with `qlb migrate rollback --provider anthropic` first.
+```
+
+The same refusal fires for pi-pool `MIRRORED`, `VALIDATED`, or `RETIRED`, or when a Pi owner file is present or unreadable (`pi-pool owner file present` when the journal has no owning state). The other direction matches: `qlb migrate stage|rehearse|commit|resume --provider anthropic` exits `1` with `qlb migrate <sub>: DUAL_OWNERSHIP_REFUSED — cswap consume is enabled for Anthropic.` while consume is enabled. `qlb migrate status` and `qlb migrate rollback` still run.
+
+`decidePiMode` in `extensions/qlb-pi/consume.ts` is the Pi-side half of that guard. A valid Anthropic owner file (or `QLB_PI_REHEARSAL=1`) plus a consume journal of `NATIVE` is `owned`. The same ownership claim plus `CONSUMED`, or plus a journal Pi could not read, is `conflict`, as is a malformed owner file. Conflict replaces Anthropic with an error-only stub. It does not fall back to `anthropic-pool`. The stub tells you to run `qlb consume disable --provider anthropic` or `qlb migrate rollback --provider anthropic`, then restart Pi.
+
+Pi chooses its Anthropic mode at startup, so restart running Pi sessions after a successful `enable` or `disable`. A Pi that starts while the marker and journal disagree (mid-change or after a crash) refuses Anthropic until you re-run `enable` or `disable`. The proxy still fails an Anthropic consume request as unavailable before reading a Claude Code credential, because routing has no credential-attributable provider quota for `cswap-active`. Pi does not use that gate. In consume mode Pi serves the active Claude Code Keychain item (`Claude Code-credentials`) with a read-only `find-generic-password`: it never refreshes or writes the token, it refuses an expired token, and after one HTTP 401 it re-reads the item once and retries only if the access fingerprint changed. A missing quota reading, or a stale, cached, imported, or otherwise non-authoritative one, is `unknown`; the request proceeds and the outcome log records `quota:"unknown"`. Pi refuses before that Keychain read only when a fresh provider reading (`provider-poll` or `provider-headers`, `authoritative`, at most five minutes old) stored for `cswap-active` or for the account named by the anthropic `active_login` row has `usedPct` of at least 100. Readings on other slots are ignored, so a stale fleet cannot block Pi. cswap remains the Claude account brain; QLB does not attribute the Keychain login to a sequence slot, so an `active_login` row is only as accurate as the last account QLB recorded.
+
+## `qlb gate`
+
+S30 credential boundary for Pi. `qlb-pi` calls it per request with `QLB_PI_TOKEN_CALL=1`. A shell that is not that Pi parent never receives a credential.
+
+```text
+usage: qlb gate anthropic|openai-codex|xai|kimi-coding|openrouter [--json] [--retry-after-401 sha256-at:…]
+```
+
+`--json` is accepted and is how Pi asks for the envelope. A refusal still prints no JSON. `--retry-after-401` takes one `sha256-at:` fingerprint (64 hex digits). `--no-refresh` is accepted only with `anthropic` (the usage line does not list it). It is the bounded smoke path: the gate does not refresh. Combining it with `--retry-after-401` prints `smoke-no-retry` on stderr and exits `1`. An access token with no expiry prints `smoke-token-expiry-unknown` and exits `1`; an expired one prints `smoke-token-expired` and exits `1`. Any other flag, or `--no-refresh` on another provider, is a usage error (exit `2`, the usage line on stderr).
+
+The guard lives in `tokenCallAllowed` (`src/commands/token.ts`) and `piRpcCallAllowed` (`src/pi-rpc-guard.ts`). Both require `QLB_PI_TOKEN_CALL=1`. Either stdin or stdout being a TTY is a refusal. An interactive Pi parent is accepted only when Pi's package root can be located and `process.title` has replaced argv with exactly `pi` while the executable name is still Node (`ps comm` and `ps command` are `pi`, `ps ucomm` stays `node` on macOS). Pi RPC mode is a separate check. A `pi-rpc` title is accepted only when the kernel comm, the Node text executable, Pi's RPC environment, and an RPC entry inside the located package agree. An argv that was not overwritten is accepted only when it is Node running that package's `dist/rpc-entry.js` or `dist/bundle/rpc-entry.js`, with no code-injecting option. A title by itself is not enough. Any uncertainty refuses.
+
+Lifecycle admission runs first. A phase that does not admit `gate` exits `3` with `qlb gate: refused: <code>` and empty stdout. After admission, an unauthorized parent exits `3` with stderr `token-call-refused` and empty stdout, before any credential read. Setting `QLB_PI_TOKEN_CALL=1` does not authorize a plain shell:
+
+```console
+$ QLB_PI_TOKEN_CALL=1 qlb gate anthropic --json --no-refresh
+# stderr only; stdout is empty; exit 3
+token-call-refused
+```
+
+`qlb-pi` maps that stderr line through the fixed cause list in `extensions/qlb-pi/active-access.ts`, so Pi shows `QLB unavailable for anthropic — run qlb doctor (token-call-refused)` instead of a raw parent-process dump. The cause list is data: `token-call-refused` is one of the codes safe to display.
+
+A successful call prints one JSON object on the secret channel and nothing else. The object is `{ token, accountId, source }` plus `chatgptAccountId` and `expiresAt` only when the provider supplied them. Do not log it.
+
+## `qlb token`
+
+Same S30 parent check as `qlb gate`, for the three static resolvers that are not pool gates: `xai`, `kimi-coding`, and `openrouter`.
+
+```text
+qlb token xai|kimi-coding|openrouter
+```
+
+There is no `--json` flag. A missing provider, any extra argument, or a failed `tokenCallAllowed` check exits `3` with empty stdout and empty stderr. It does not print `token-call-refused`; that cause string is the `qlb gate` refusal. A resolver failure after the guard has passed exits `1`. Success prints the credential on stdout and nothing else. Anthropic and OpenAI Codex go through `qlb gate`, not `qlb token`.
+
+`QLB_PI_TOKEN_CALL` must be `1`, the process must not be a TTY, and the parent must pass the interactive `pi` title check or `piRpcCallAllowed`. Interactive `pi` is the `process.title` case above. `pi-rpc` is delegated to `src/pi-rpc-guard.ts` and does not replace that interactive title.
+
+## `qlb release install`
+
+Publishes one immutable build under `~/.qlb/app/<sha>` and atomically points the relative symlink `~/.qlb/app/current` at that directory. `qlb auto install-agent` and `qlb pi deploy` both read `current`.
+
+```console
+$ node dist/cli.js release install
+installed <sha> at ~/.qlb/app/<sha>
+```
+
+`qlb release install` is the same command once `qlb` is on `PATH`. With a clean source tree the SHA is `git rev-parse HEAD`. A dirty tree exits `1` with `qlb release: source tree is dirty`. When git cannot name `HEAD`, pass `--sha <sha>` or the command exits `1` with `qlb release: cannot determine release SHA; pass --sha <sha>`. Usage errors (`qlb release: expected install [--sha <sha>]`) exit `2`. An integrity failure (`ReleaseIntegrityError`: incomplete tree, digest mismatch, unexpected symlink, and the same class of refusal) exits `3` with `qlb release: <message>`.
+
+The command copies the compiled tree, checks the build stamp, writes a manifest of `{ sha, digest }`, and only then swaps `current`. An existing SHA directory is reused only when its manifest matches the bytes just built.
+
+## `qlb pi deploy`
+
+Copies `qlb-pi` from the release selected by `~/.qlb/app/current` onto the Pi agent directory, so doctor can see one installed tree.
+
+```text
+qlb pi deploy [--dry-run] [--json]
+```
+
+`qlb release install` has to have succeeded first. The source is `~/.qlb/app/<sha>/extensions/qlb-pi` plus that release's `src/redact.ts` and `src/pi-owner-document.ts`. The target is `~/.pi/agent/extensions/qlb-pi`, with the two shared files beside the resolved extensions directory. Deploy replaces the whole directory from a staging dir outside `extensions/` (so a half-published tree is restored), records `pi.deployedAt` (epoch seconds) and `pi.extensionHash`, and is what makes `pi:extension` and `pi:extension-drift` pass when the installed bytes match the current release and, for `pi:extension`, this repo.
+
+```console
+$ qlb pi deploy
+deployed <hash> from ~/.qlb/app/<sha>/extensions/qlb-pi to ~/.pi/agent/extensions/qlb-pi
+```
+
+`--dry-run` prints `would deploy …` and writes nothing. `--json` prints `{ "source", "target", "hash", "dryRun" }` and does not include the timestamp. A repeated or unknown flag exits `2` with `qlb pi deploy: expected [--dry-run] [--json]`. A missing `current` release exits `1` with `qlb pi deploy: current release is missing or invalid under ~/.qlb/app; run qlb release install first`. Publishing across volumes exits `1`. The thrown text is `qlb pi deploy: the Pi extensions folder and ~/.pi/agent are on different volumes; this layout is not supported`, and the command wrapper prefixes `qlb pi deploy:` again.
 
 ## `/qlb` (Pi in-session command)
 
