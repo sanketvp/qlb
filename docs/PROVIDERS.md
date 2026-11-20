@@ -24,6 +24,14 @@ Two optional `Adapter` fields (`src/types.ts`) tailor refresh behavior; absent m
 - **Confidence:** `authoritative` — this is the provider's own gauge, fetched fresh at decision time.
 - **Caveats:** an expired or invalid access token surfaces as `auth expired or invalid — needs re-login` on that account only. Phase-0 adapters never refresh tokens themselves; expired accounts need the native harness to log in once.
 
+### Pi pool and Claude Code switching
+
+Anthropic is two stores, and the verified Gates 5, 6, and 7 state keeps them apart.
+
+`pi-pool` is `QLB_OWNED`. `qlb migrate status --provider anthropic` reports `ownerFile: "present"`, `piAtNextLaunch: "QLB works"`, and `detail.anthropicPoolExtension: "disabled"`. Pi's next launch uses QLB. Auto-switching for that pool runs as `qlb auto` under LaunchAgent `com.modus.qlb-auto`. The S30 guard in `qlb-pi` is what serves those credentials: Pi calls `qlb gate anthropic --json` with `QLB_PI_TOKEN_CALL=1`, and any other parent gets exit `3`, stderr `token-call-refused`, and empty stdout. See the [CLI reference](CLI.md#qlb-gate).
+
+`cswap-anthropic` stays `NATIVE`. That is the Claude Code switching journal, not the Pi pool. `qlb consume enable --provider anthropic` is refused with `DUAL_OWNERSHIP_REFUSED` while `pi-pool` is `QLB_OWNED`, so consume cannot take the same accounts. `com.modus.claude-pool-refresh` stays disabled; Claude Code switching does not run through that agent or through `qlb-pi`. How the two owners coexist is written up in [CLAUDE-SWITCHING.md](CLAUDE-SWITCHING.md).
+
 ### Claude login expiry (L41)
 
 `loginExpiryField()` names the field used by `loginExpiresAtIso`: `refreshTokenExpiresAt`, an epoch-millisecond timestamp rendered as UTC ISO-8601. **L41: verified for a claude-swap/QLB refresh only** — its in-place OAuth update never writes this field (`test/oracle/claude-swap-v0.28.0/src/claude_swap/oauth.py:188-196`). No upstream test exercises the field across a refresh: the refresh fixture omits it (`test/oracle/claude-swap-v0.28.0/tests/test_oauth.py:424-434`), so the refresh test only asserts access- and refresh-token rotation (`test_oauth.py:474-492`). Claude Code's native refresh is not established by the oracle and remains to be confirmed from the X1/X2 field recordings before `login-expiry-jump` rows are treated as hard. The login-expiry test identifies and renders `refreshTokenExpiresAt` (`test_oauth.py:1507-1524`).
