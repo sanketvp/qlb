@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { execFileSync as ExecFileSync } from 'node:child_process';
 import test from 'node:test';
 
-import { CswapProcessCheckError, listCswapProcesses, listCswapProcessesAsync, listCswapProcessesToSignal, listCswapProcessesToSignalAsync } from '../src/cswap-processes';
+import { CswapProcessCheckError, isCswapCommandToSignal, listCswapProcesses, listCswapProcessesAsync, listCswapProcessesToSignal, listCswapProcessesToSignalAsync } from '../src/cswap-processes';
 
 const childProcess = require('node:child_process') as { execFileSync: typeof ExecFileSync };
 const supportedPlatform: NodeJS.Platform = 'darwin';
@@ -195,4 +195,147 @@ test('throws CswapProcessCheckError on unsupported platforms', () => {
     }),
     CswapProcessCheckError,
   );
+});
+
+// A14c: CPython short-option grammar for -c/-m/-W/-X.
+// https://docs.python.org/3/using/cmdline.html#interface-options
+const a14cNeverDetected = [
+  'python3 -cm claude_swap',
+  'python3 -mm claude_swap',
+  'python3 -Xm claude_swap',
+  'python3 -Wm claude_swap',
+  '/usr/bin/python3 -Icm claude_swap auto',
+  '/usr/bin/python3 -Imm claude_swap auto',
+];
+
+const a14cNotSignalTargets = [
+  ...a14cNeverDetected,
+  'python3 -c__import__("time").sleep(600) -m claude_swap',
+  // The flattened ps form of python3 -IW 'ignore:message -m claude_swap' -c 'print(1)'.
+  'python3 -IW ignore:message -m claude_swap -c print(1)',
+  'python3 -c print(1) -m claude_swap',
+  'python3 -Ic print(1) -m claude_swap',
+];
+
+const a14cDetected = [
+  'python3 -Im claude_swap',
+  'python3 -Bm claude_swap',
+  'python3 -IBm claude_swap',
+  'python3 -IWignore -m claude_swap',
+  'python3 -um claude_swap',
+  'python3 -Em claude_swap',
+  'python3 -X importtime -m claude_swap',
+  'python3 -W ignore -m claude_swap',
+];
+
+function psTable(commands: readonly string[]): string {
+  return commands.map((command, index) => ` ${1000 + index} ${command}`).join('\n');
+}
+
+function pidsOf(commands: readonly string[]): { pid: number }[] {
+  return commands.map((_, index) => ({ pid: 1000 + index }));
+}
+
+test('A14c: -c, -m, -W and -X consume their value before a later m', () => {
+  for (const list of [listCswapProcesses, listCswapProcessesToSignal]) {
+    assert.deepEqual(list({ platform: supportedPlatform, runPs: () => psTable(a14cNeverDetected) }), []);
+  }
+});
+
+test('A14c: -c code and clustered -W with a separate value are never signal targets', () => {
+  for (const command of a14cNotSignalTargets) {
+    assert.equal(isCswapCommandToSignal(command), false, command);
+  }
+});
+
+test('A14c: no-argument flags and attached or standalone -W/-X values still find -m claude_swap', () => {
+  const runPs = () => psTable(a14cDetected);
+  assert.deepEqual(listCswapProcesses({ platform: supportedPlatform, runPs }), pidsOf(a14cDetected));
+  assert.deepEqual(listCswapProcessesToSignal({ platform: supportedPlatform, runPs }), pidsOf(a14cDetected));
+});
+
+// A verbatim copy of main's (2030710) strict signal classifier. The new
+// classifier must never signal a process this one would not have signalled.
+function mainPythonArguments(args: string): string | undefined {
+  const interpreter = /(^|\/)python(?:\d+(?:\.\d+)*)?(?=\s|$)/i.exec(args);
+  if (interpreter === null || interpreter.index === undefined) return undefined;
+  return args.slice(interpreter.index + interpreter[0].length).trimStart();
+}
+
+function mainIsCswapModuleOption(args: string): boolean {
+  const moduleOption = /^-([A-Za-z]*)m\s*claude_swap(\.|\s|$)/.exec(args);
+  if (moduleOption === null) return false;
+  return !/[WX]/.test(moduleOption[1]);
+}
+
+function mainStrictFirstPythonScriptIsCswap(args: string): boolean {
+  let remaining = mainPythonArguments(args);
+  if (remaining === undefined) return false;
+  let option: RegExpExecArray | null;
+  while (true) {
+    if (mainIsCswapModuleOption(remaining)) return true;
+    option = /^(?:(?:-W|-X|-Q)\s+\S+|--check-hash-based-pycs(?:=\S+|\s+\S+)|-\S+)\s+/.exec(remaining);
+    if (option === null) break;
+    remaining = remaining.slice(option[0].length);
+  }
+  const script = /^(\S+)/.exec(remaining)?.[1];
+  return script !== undefined && /(^|\/)(cswap|claude-swap)$/.test(script);
+}
+
+function mainIsCswapCommandToSignal(args: string): boolean {
+  const separator = args.indexOf(' ');
+  const executable = separator === -1 ? args : args.slice(0, separator);
+  if (/(^|\/)(cswap|claude-swap)$/.test(executable)) return true;
+  return mainPythonArguments(executable) !== undefined && mainStrictFirstPythonScriptIsCswap(args);
+}
+
+test('A14c: the strict signal classifier never signals a command main would not', () => {
+  const tricky = [
+    ...a14cNotSignalTargets,
+    ...a14cDetected,
+    'python3 -IW cswap',
+    'python3 -W cswap',
+    'python3 -W -m claude_swap',
+    'python3 -m -u cswap',
+    'python3 -?m claude_swap',
+    'python3 -I?m claude_swap',
+    'python3 -1m claude_swap',
+    'python3 -- -m claude_swap',
+    'python3 -- cswap',
+    'python3 - cswap',
+    'python3 -Q new -m claude_swap',
+    'python3 -Qm claude_swap',
+    'python3 -mclaude_swapm claude_swap',
+    'python3 -IXdev -m claude_swap',
+    'python3 -IX dev -m claude_swap',
+    'python3 --check-hash-based-pycs always -m claude_swap',
+    'python3 --check-hash-based-pycs=always -IWm claude_swap',
+    '/opt/claude-swap/bin/python -c import cswap',
+  ];
+  const interpreters = ['python3', '/usr/bin/python3'];
+  const parts = [
+    '-I', '-u', '-IW', '-W', '-X', '-Q', '-Wignore', '-Xm', '-c', '-cm', '-mm', '-m', '-Im',
+    '-mclaude_swap', '-c__import__("time").sleep(600)', '--', '-', '--check-hash-based-pycs',
+    '--version', '-?m', 'ignore', 'print(1)', 'cswap', 'claude_swap', 'claude_swap.cli',
+    '/usr/local/bin/cswap',
+  ];
+  const generated: string[] = [];
+  for (const interpreter of interpreters) {
+    for (const a of parts) {
+      generated.push(`${interpreter} ${a}`);
+      for (const b of parts) {
+        generated.push(`${interpreter} ${a} ${b}`);
+        for (const c of parts) generated.push(`${interpreter} ${a} ${b} ${c}`);
+      }
+    }
+  }
+
+  let newTargets = 0;
+  for (const command of [...tricky, ...generated]) {
+    if (isCswapCommandToSignal(command)) {
+      newTargets += 1;
+      assert.equal(mainIsCswapCommandToSignal(command), true, `new signal target that main did not signal: ${command}`);
+    }
+  }
+  assert.ok(newTargets > 0, 'the comparison must include real signal targets');
 });
