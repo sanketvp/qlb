@@ -187,7 +187,7 @@ export function createSwitchAnthropicCommand(deps: SwitchAnthropicCommandDeps = 
   return {
     name: 'switch anthropic',
     async execute(args: string[], ctx: CommandContext): Promise<number> {
-      const parsedInjection = parseInjectFlag(args, ctx.env);
+      const parsedInjection = parseInjectFlag(args, ctx.env, ['fail-step']);
       if ('usage' in parsedInjection) {
         ctx.stderr(parsedInjection.usage);
         return 2;
