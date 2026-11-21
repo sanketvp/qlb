@@ -781,7 +781,7 @@ Exit codes:
 | Reason | Direction | Meaning |
 |---|---|---|
 | `phase=<state>`, `undo-in-progress` | both | The lifecycle phase does not admit the command. |
-| `cutover-begin-in-progress` | both | A `qlb cutover begin` has not finished (its marker is still set); only `qlb doctor` and `qlb status` are admitted until it clears. |
+| `cutover-begin-in-progress` | both | A `qlb cutover begin` has not finished (its marker is still set). |
 | `cswap-process-alive`, `cswap-process-check-failed` | both | A C-swap process is running, or the process check failed (checked before and again under the locks). |
 | `journal-absent`, `journal-malformed` | both | There is no journal, or it can't be read. |
 | `journal-identity-invalid` | both | The journal names slots the slot inventory does not match. |
