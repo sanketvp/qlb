@@ -23,6 +23,7 @@ const PYTHON = 'python3';
 const PYTHON_REQUIREMENT = 'vendored claude-swap v0.28.0 requires Python 3.12 or newer';
 const CSWAP_V028_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
 const CHILD_TIMEOUT_MS = 10_000;
+const PROBE_TIMEOUT_MS = 5_000;
 
 type ChildOutput = { stdout: string; stderr: string };
 type SpawnedPython = { child: ChildProcess; output: ChildOutput };
@@ -129,24 +130,39 @@ async function terminateChild(child: ChildProcess | undefined, output: ChildOutp
   await waitForChildExit(child, output ?? { stdout: '', stderr: '' }, `${description} cleanup`);
 }
 
-function findVendoredPython(path = process.env.PATH): string | undefined {
+type PythonProbe = { python: string; reason?: undefined } | { python?: undefined; reason: string };
+
+/** Finds a Python >=3.12 for the vendored oracle; every probe is bounded so a wedged interpreter or uv skips, not hangs. */
+function findVendoredPython(path = process.env.PATH, timeoutMs = PROBE_TIMEOUT_MS): PythonProbe {
   const env = { ...process.env, PATH: path };
-  const isCompatible = (python: string): boolean => {
-    const result = spawnSync(
-      python,
-      ['-I', '-B', '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
-      { encoding: 'utf8', env },
-    );
-    if (result.error || result.status !== 0) return false;
-    const [major, minor] = result.stdout.trim().split('.').map(Number);
-    return major > 3 || (major === 3 && minor >= 12);
+  const run = (label: string, command: string, args: string[]): { stdout: string } | { reason: string } => {
+    const result = spawnSync(command, args, { encoding: 'utf8', env, timeout: timeoutMs, killSignal: 'SIGKILL' });
+    if ((result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') {
+      return { reason: `${label} probe timed out after ${timeoutMs} ms` };
+    }
+    if (result.error || result.status !== 0) {
+      return { reason: `${label} probe failed (${result.error?.message ?? `exit ${result.status ?? result.signal}`})` };
+    }
+    return { stdout: result.stdout.trim() };
+  };
+  const compatible = (python: string): PythonProbe => {
+    const version = run(`${python} version`, python, [
+      '-I', '-B', '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")',
+    ]);
+    if ('reason' in version) return version;
+    const [major, minor] = version.stdout.split('.').map(Number);
+    return major > 3 || (major === 3 && minor >= 12) ? { python } : { reason: `${python} is ${version.stdout}` };
   };
 
-  if (isCompatible(PYTHON)) return PYTHON;
-  const uv = spawnSync('uv', ['python', 'find', '3.12'], { encoding: 'utf8', env });
-  if (uv.error || uv.status !== 0) return undefined;
-  const candidate = uv.stdout.trim();
-  return candidate && isCompatible(candidate) ? candidate : undefined;
+  const system = compatible(PYTHON);
+  if (system.python) return system;
+  const uvArgs = ['python', 'find', '>=3.12'];
+  const uvLabel = `uv ${uvArgs.join(' ')}`;
+  const uv = run(uvLabel, 'uv', uvArgs);
+  if ('reason' in uv) return { reason: `${system.reason}; ${uv.reason}` };
+  if (!uv.stdout) return { reason: `${system.reason}; ${uvLabel} printed no path` };
+  const found = compatible(uv.stdout);
+  return found.python ? found : { reason: `${system.reason}; ${found.reason}` };
 }
 
 function spawnVendoredPython(python: string, home: string, body: string): SpawnedPython {
@@ -169,10 +185,75 @@ function spawnVendoredPython(python: string, home: string, body: string): Spawne
 it('detects missing Python and uv through an injected PATH without throwing', async () => {
   const noCommands = await mkdtemp(join(tmpdir(), 'qlb-no-python-or-uv-'));
   try {
-    assert.equal(findVendoredPython(noCommands), undefined);
+    const probe = findVendoredPython(noCommands);
+    assert.equal(probe.python, undefined);
+    assert.match(probe.reason ?? '', /python3 version probe failed/);
+    assert.match(probe.reason ?? '', /uv python find >=3\.12 probe failed/);
   } finally {
     await rm(noCommands, { recursive: true, force: true });
   }
+});
+
+describe('vendored Python probe on an injected PATH', () => {
+  const FAST_PROBE_MS = 300;
+  const PROBE_BOUND_MS = 5_000;
+
+  async function fakeCommand(dir: string, name: string, script: string): Promise<string> {
+    const path = join(dir, name);
+    await writeFile(path, `#!/bin/sh\n${script}\n`);
+    await chmod(path, 0o755);
+    return path;
+  }
+
+  async function withFakeBin(run: (bin: string, fixtures: string) => Promise<void>): Promise<void> {
+    const root = await mkdtemp(join(tmpdir(), 'qlb-python-probe-'));
+    const bin = join(root, 'bin');
+    const fixtures = join(root, 'fixtures');
+    try {
+      await mkdir(bin);
+      await mkdir(fixtures);
+      await run(bin, fixtures);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it('skips an incompatible python3 and takes the interpreter uv finds for >=3.12', async () => {
+    await withFakeBin(async (bin, fixtures) => {
+      const python313 = await fakeCommand(fixtures, 'python3.13', 'echo 3.13');
+      await fakeCommand(bin, 'python3', 'echo 3.9');
+      await fakeCommand(bin, 'uv', [
+        '[ "$#" -eq 3 ] && [ "$1" = python ] && [ "$2" = find ] && [ "$3" = ">=3.12" ] || exit 2',
+        `echo ${JSON.stringify(python313)}`,
+      ].join('\n'));
+      assert.deepEqual(findVendoredPython(bin, FAST_PROBE_MS), { python: python313 });
+    });
+  });
+
+  it('bounds a wedged python3 version probe and names it in the reason', async () => {
+    await withFakeBin(async (bin) => {
+      await fakeCommand(bin, 'python3', 'exec /bin/sleep 30');
+      const started = Date.now();
+      const probe = findVendoredPython(bin, FAST_PROBE_MS);
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < PROBE_BOUND_MS, `probe took ${elapsed} ms`);
+      assert.equal(probe.python, undefined);
+      assert.match(probe.reason ?? '', new RegExp(`python3 version probe timed out after ${FAST_PROBE_MS} ms`));
+    });
+  });
+
+  it('bounds a wedged uv probe and names it in the reason', async () => {
+    await withFakeBin(async (bin) => {
+      await fakeCommand(bin, 'python3', 'echo 3.9');
+      await fakeCommand(bin, 'uv', 'exec /bin/sleep 30');
+      const started = Date.now();
+      const probe = findVendoredPython(bin, FAST_PROBE_MS);
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < PROBE_BOUND_MS, `probe took ${elapsed} ms`);
+      assert.equal(probe.python, undefined);
+      assert.match(probe.reason ?? '', new RegExp(`uv python find >=3\\.12 probe timed out after ${FAST_PROBE_MS} ms`));
+    });
+  });
 });
 
 async function pythonHolder(python: string, home: string, seconds: number): Promise<SpawnedPython> {
@@ -709,9 +790,9 @@ describe('Claude Code proper-lockfile locks', () => {
   });
 
   it('blocks behind vendored C-swap v0.28.0 and blocks it in return', async (t) => {
-    const python = findVendoredPython();
+    const { python, reason } = findVendoredPython();
     if (!python) {
-      t.skip(PYTHON_REQUIREMENT);
+      t.skip(`${PYTHON_REQUIREMENT} (${reason})`);
       return;
     }
     assert.equal(existsSync(CSWAP_V028_SOURCE), true, `missing vendored oracle at ${CSWAP_V028_SOURCE}`);
