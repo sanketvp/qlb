@@ -691,7 +691,7 @@ export async function doctorQlb(
     /** Tests inject Hermes paths and runner; production resolves them per call from the environment. */
     hermes?: HermesIntegrationOptions;
     /** Tests inject the Pi agent dir, extension dir and location; production resolves them per call. */
-    pi?: PiIntegrationOptions;
+    pi?: Pick<PiIntegrationOptions, 'agentDir' | 'extensionDir' | 'pi'>;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -1006,7 +1006,7 @@ export async function doctorQlb(
     }
   }
   try {
-    checks.push(...piIntegrationChecks({ typecheck: options.live === true, ...options.pi }));
+    checks.push(...piIntegrationChecks({ ...options.pi, typecheck: options.live === true }));
   } catch (err) {
     checks.push({ name: 'pi', level: 'WARN', message: `pi checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
