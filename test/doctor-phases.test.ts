@@ -619,6 +619,40 @@ describe('doctor lifecycle phase fixtures (HP-H3-11)', () => {
     });
   }
 
+  it('pre-cutover store with no lifecycle row is overall PASS with N/A rows', async () => {
+    // Production has no lifecycle row at all until `cutover begin`.
+    const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-phase-no-row-'));
+    const config = defaultConfig(home);
+    openStore(config.dbPath).close();
+    const report = await withTestQlbHome(home, () => doctorQlb(config, {
+      appendHealthLog: true,
+      command: () => '',
+      hostCommand: () => '',
+      hostPlatform: 'linux',
+      hostShell: undefined,
+      hostShellExists: () => false,
+      keychain: keychain(),
+      now: () => NOW,
+      piProcessList: () => '',
+      cswapProcesses: () => [],
+      cswapAgentStatus: () => 'not-loaded',
+    }));
+
+    assert.equal(level(report, 'lifecycle:phase'), 'PASS');
+    for (const name of ['claude:slots', 'codex:slots', 'claude:active', 'relogin:7d', 'auto:parked', 'auto:agent', 'claude:switch-journal', 'journal:in-progress', 'journal:orphaned', 'undo:incomplete', 'undo:lineage-match']) {
+      assert.equal(level(report, name), 'N/A', `no-row ${name}`);
+    }
+    assert.equal(report.s64.overall, 'PASS');
+    const rows = new DatabaseSync(config.dbPath);
+    try {
+      const row = rows.prepare('SELECT phase, overall, failing_json AS failingJson FROM health_log WHERE id = ?')
+        .get(report.healthLogId!) as { phase: string; overall: string; failingJson: string } | undefined;
+      assert.deepEqual({ ...row }, { phase: 'pre-cutover', overall: 'PASS', failingJson: '[]' });
+    } finally {
+      rows.close();
+    }
+  });
+
   it('covers each phase class with controlled health-log, applicability, and S64 fixtures', async () => {
     const reports = new Map<Phase, Awaited<ReturnType<typeof doctorQlb>>>();
     for (const phase of PHASES) {
