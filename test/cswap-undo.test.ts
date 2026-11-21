@@ -1051,13 +1051,17 @@ describe('qlb undo cswap hand-back', () => {
         }, 5);
       });
       let barrier: string | Error | undefined;
-      let lockInodes: { oauthRefresh: number; credentials: number } | undefined;
+      let lockStats: { oauthRefresh: { ino: bigint; birthtimeNs: bigint }; credentials: { ino: bigint; birthtimeNs: bigint } } | undefined;
       let exportedWhileHeld = false;
       const locksStillHeld = () => {
-        if (lockInodes === undefined) return false;
+        if (lockStats === undefined) return false;
         try {
-          return statSync(locks.oauthRefreshLockDir).ino === lockInodes.oauthRefresh
-            && statSync(locks.credentialsLockDir).ino === lockInodes.credentials
+          const oauthRefresh = statSync(locks.oauthRefreshLockDir, { bigint: true });
+          const credentials = statSync(locks.credentialsLockDir, { bigint: true });
+          return oauthRefresh.ino === lockStats.oauthRefresh.ino
+            && (lockStats.oauthRefresh.birthtimeNs === 0n || oauthRefresh.birthtimeNs === lockStats.oauthRefresh.birthtimeNs)
+            && credentials.ino === lockStats.credentials.ino
+            && (lockStats.credentials.birthtimeNs === 0n || credentials.birthtimeNs === lockStats.credentials.birthtimeNs)
             && !events.includes('acquired');
         } catch {
           return false;
@@ -1080,12 +1084,12 @@ describe('qlb undo cswap hand-back', () => {
               error instanceof Error ? error : new Error(String(error)));
             if (barrier === 'contended') {
               try {
-                lockInodes = {
-                  oauthRefresh: statSync(locks.oauthRefreshLockDir).ino,
-                  credentials: statSync(locks.credentialsLockDir).ino,
+                lockStats = {
+                  oauthRefresh: statSync(locks.oauthRefreshLockDir, { bigint: true }),
+                  credentials: statSync(locks.credentialsLockDir, { bigint: true }),
                 };
               } catch {
-                lockInodes = undefined;
+                lockStats = undefined;
               }
             }
           }
