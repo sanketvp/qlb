@@ -15,16 +15,36 @@ import { parseDocument } from 'yaml';
 import type { DoctorCheck } from './diagnostics';
 import { HERMES_LAUNCHD_LABEL, HERMES_WATCH_LABEL } from './setup-hermes';
 
-const HERMES_HOME = process.env.HERMES_HOME ?? join(qlbHomeDir(), '.hermes');
-const HERMES_CHECKOUT = join(HERMES_HOME, 'hermes-agent');
-const HERMES_CONFIG = join(HERMES_HOME, 'config.yaml');
-const HERMES_PYTHON = join(HERMES_CHECKOUT, 'venv', 'bin', 'python');
-const PLUGIN_DIR = join(HERMES_HOME, 'plugins', 'model-providers', 'qlb');
-const PLUGIN_STATUS = process.env.QLB_HERMES_PLUGIN_STATUS ?? join(qlbHomeDir(), '.qlb', 'hermes-plugin.json');
-// Same label `qlb setup hermes` writes the agent under (QLB_LAUNCHD_LABEL overrides it).
-const LAUNCHD_PLIST = join(qlbHomeDir(), 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`);
-const WATCH_LAUNCHD_PLIST = join(qlbHomeDir(), 'Library', 'LaunchAgents', `${HERMES_WATCH_LABEL}.plist`);
-const HERMES_SCRIPTS = ['qlb-proxy-token', 'qlb-hermes-watch', 'qlb-hermes-models'].map((name) => join(HERMES_HOME, 'scripts', name));
+/** Every filesystem path the Hermes checks read, resolved once per call. */
+export interface HermesPaths {
+  home: string;
+  checkout: string;
+  config: string;
+  python: string;
+  pluginDir: string;
+  /** Plugin load status; the seam probe passes it to Hermes as QLB_HERMES_PLUGIN_STATUS. */
+  pluginStatus: string;
+  launchdPlist: string;
+  watchLaunchdPlist: string;
+  scripts: string[];
+}
+
+export function hermesPaths(env: NodeJS.ProcessEnv = process.env, userHome: string = qlbHomeDir(env)): HermesPaths {
+  const home = env.HERMES_HOME ?? join(userHome, '.hermes');
+  const checkout = join(home, 'hermes-agent');
+  return {
+    home,
+    checkout,
+    config: join(home, 'config.yaml'),
+    python: join(checkout, 'venv', 'bin', 'python'),
+    pluginDir: join(home, 'plugins', 'model-providers', 'qlb'),
+    pluginStatus: env.QLB_HERMES_PLUGIN_STATUS ?? join(userHome, '.qlb', 'hermes-plugin.json'),
+    // Same label `qlb setup hermes` writes the agent under (QLB_LAUNCHD_LABEL overrides it).
+    launchdPlist: join(userHome, 'Library', 'LaunchAgents', `${HERMES_LAUNCHD_LABEL}.plist`),
+    watchLaunchdPlist: join(userHome, 'Library', 'LaunchAgents', `${HERMES_WATCH_LABEL}.plist`),
+    scripts: ['qlb-proxy-token', 'qlb-hermes-watch', 'qlb-hermes-models'].map((name) => join(home, 'scripts', name)),
+  };
+}
 
 /** Hermes seams QLB depends on: (python module, symbol, expected parameter names or null). */
 const HERMES_SEAMS: Array<{ module: string; symbol: string; params: string[] | null; why: string }> = [
@@ -46,17 +66,20 @@ const HERMES_SEAMS: Array<{ module: string; symbol: string; params: string[] | n
 /** providers: entry keys QLB writes; if Hermes stops accepting one, config-check will flag it. */
 const REQUIRED_PROVIDER_KEYS = ['api', 'transport', 'key_cmd', 'session_affinity_header'];
 
+type HermesRunOptions = { timeoutMs?: number; cwd?: string; env?: Record<string, string> };
+
 export interface HermesIntegrationOptions {
   /** Skip the python seam probe (slow-ish, ~1s). doctor --live turns it on. */
   probeSeams?: boolean;
-  run?: (cmd: string, args: string[], opts?: { timeoutMs?: number; env?: Record<string, string> }) => string;
+  /** Paths to inspect; defaults to hermesPaths() for the current environment. */
+  paths?: HermesPaths;
+  run?: (cmd: string, args: string[], opts?: HermesRunOptions) => string;
 }
 
-function defaultRun(cmd: string, args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): string {
-  // Hermes modules are imported from the checkout, not installed into the venv: cwd matters.
+function defaultRun(cmd: string, args: string[], opts: HermesRunOptions = {}): string {
   return execFileSync(cmd, args, {
-    encoding: 'utf8', timeout: opts.timeoutMs ?? 20_000, stdio: ['ignore', 'pipe', 'pipe'], cwd: HERMES_CHECKOUT,
-    env: { ...process.env, PYTHONWARNINGS: 'ignore', HERMES_HOME, ...(opts.env ?? {}) },
+    encoding: 'utf8', timeout: opts.timeoutMs ?? 20_000, stdio: ['ignore', 'pipe', 'pipe'], cwd: opts.cwd,
+    env: { ...process.env, PYTHONWARNINGS: 'ignore', ...(opts.env ?? {}) },
   });
 }
 
@@ -118,29 +141,33 @@ export function yamlNamesQlbProvider(yaml: string): boolean {
 }
 
 export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}): DoctorCheck[] {
-  const run = options.run ?? defaultRun;
+  const paths = options.paths ?? hermesPaths();
+  const exec = options.run ?? defaultRun;
+  // Hermes modules are imported from the checkout, not installed into the venv: cwd matters.
+  const run = (cmd: string, args: string[], opts: HermesRunOptions = {}): string =>
+    exec(cmd, args, { ...opts, cwd: paths.checkout, env: { HERMES_HOME: paths.home, ...(opts.env ?? {}) } });
   const checks: DoctorCheck[] = [];
 
-  if (!existsSync(HERMES_CHECKOUT)) {
-    checks.push({ name: 'hermes:checkout', level: 'PASS', message: `no Hermes checkout at ${HERMES_CHECKOUT}; skipping Hermes checks` });
+  if (!existsSync(paths.checkout)) {
+    checks.push({ name: 'hermes:checkout', level: 'PASS', message: `no Hermes checkout at ${paths.checkout}; skipping Hermes checks` });
     return checks;
   }
 
   // 1. Hermes config still routes through the proxy with the keys QLB relies on.
-  const cfg = readText(HERMES_CONFIG);
+  const cfg = readText(paths.config);
   const parsedConfig = cfg == null ? null : parseYaml(cfg);
   const configValue = parsedConfig != null && 'value' in parsedConfig ? parsedConfig.value : undefined;
 
   // Hermes is installed but QLB was never wired into it (or was deliberately unwired). That is
   // "off", not "broken": no config trace, plugin, scripts, or either launchd agent. A config
   // that cannot be read or parsed is not off because we cannot prove it has no QLB trace.
-  const configHasQlbTrace = cfg == null ? existsSync(HERMES_CONFIG)
+  const configHasQlbTrace = cfg == null ? existsSync(paths.config)
     : parsedConfig != null && 'error' in parsedConfig ? true : parsedValueNamesQlbProvider(configValue);
   const integrationAbsent = !configHasQlbTrace
-    && !existsSync(PLUGIN_DIR)
-    && !existsSync(LAUNCHD_PLIST)
-    && !existsSync(WATCH_LAUNCHD_PLIST)
-    && !HERMES_SCRIPTS.some(existsSync);
+    && !existsSync(paths.pluginDir)
+    && !existsSync(paths.launchdPlist)
+    && !existsSync(paths.watchLaunchdPlist)
+    && !paths.scripts.some(existsSync);
   if (integrationAbsent) {
     checks.push({
       name: 'hermes:integration', level: 'WARN',
@@ -151,9 +178,9 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   }
 
   if (cfg == null) {
-    checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot read ${HERMES_CONFIG}` });
+    checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot read ${paths.config}` });
   } else if (parsedConfig != null && 'error' in parsedConfig) {
-    checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot parse ${HERMES_CONFIG}: ${parsedConfig.error}` });
+    checks.push({ name: 'hermes:config', level: 'FAIL', message: `cannot parse ${paths.config}: ${parsedConfig.error}` });
   } else {
     const missing: string[] = [];
     const root = configValue;
@@ -200,10 +227,10 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   // 2. Plugin present and last load succeeded (status file is rewritten on every Hermes start,
   //    and by the --live seam probe below, which runs provider discovery first).
   const pluginCheck = (): DoctorCheck => {
-    if (!existsSync(join(PLUGIN_DIR, '__init__.py'))) {
-      return { name: 'hermes:plugin', level: 'FAIL', message: `QLB Hermes plugin missing at ${PLUGIN_DIR}`, detail: { fix: 'qlb setup hermes' } };
+    if (!existsSync(join(paths.pluginDir, '__init__.py'))) {
+      return { name: 'hermes:plugin', level: 'FAIL', message: `QLB Hermes plugin missing at ${paths.pluginDir}`, detail: { fix: 'qlb setup hermes' } };
     }
-    const status = readText(PLUGIN_STATUS);
+    const status = readText(paths.pluginStatus);
     if (status == null) {
       return { name: 'hermes:plugin', level: 'WARN', message: 'plugin installed but has not reported a load yet (start Hermes once, or run doctor --live)' };
     }
@@ -218,13 +245,13 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
         detail: s,
       };
     } catch {
-      return { name: 'hermes:plugin', level: 'WARN', message: `unparseable plugin status at ${PLUGIN_STATUS}` };
+      return { name: 'hermes:plugin', level: 'WARN', message: `unparseable plugin status at ${paths.pluginStatus}` };
     }
   };
   // 3. Local Hermes patch still on the checkout (until PR #119677 lands upstream).
-  const gitHead = readText(join(HERMES_CHECKOUT, '.git', 'HEAD'))?.trim() ?? '';
+  const gitHead = readText(join(paths.checkout, '.git', 'HEAD'))?.trim() ?? '';
   const branch = gitHead.startsWith('ref: refs/heads/') ? gitHead.slice('ref: refs/heads/'.length) : '(detached)';
-  const auxSrc = readText(join(HERMES_CHECKOUT, 'agent', 'auxiliary_client.py')) ?? '';
+  const auxSrc = readText(join(paths.checkout, 'agent', 'auxiliary_client.py')) ?? '';
   const hasRawCodexFix = /if not req\.raw_codex:\s*\n\s*client = CodexAuxiliaryClient\(client, final_model\)/.test(auxSrc)
     // upstream may land an equivalent fix with different text — accept either shape
     || /raw_codex[\s\S]{0,200}CodexAuxiliaryClient\(client, final_model\)/.test(auxSrc) && !/entry_api_mode == "codex_responses":\s*\n\s*client = CodexAuxiliaryClient/.test(auxSrc);
@@ -247,10 +274,10 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   // 4. Proxy supervisor.
   if (process.platform === 'darwin') {
-    if (!existsSync(LAUNCHD_PLIST)) {
-      checks.push({ name: 'hermes:proxy-supervisor', level: 'WARN', message: `launchd plist missing (${LAUNCHD_PLIST}); proxy will not survive reboot` });
+    if (!existsSync(paths.launchdPlist)) {
+      checks.push({ name: 'hermes:proxy-supervisor', level: 'WARN', message: `launchd plist missing (${paths.launchdPlist}); proxy will not survive reboot` });
     } else {
-      const plist = readText(LAUNCHD_PLIST) ?? '';
+      const plist = readText(paths.launchdPlist) ?? '';
       const port = /--port<\/string>\s*<string>(\d+)/.exec(plist)?.[1];
       const providers = isMapping(configValue) ? configValue.providers : undefined;
       const anthropic = isMapping(providers) ? providers['qlb-anthropic'] : undefined;
@@ -270,7 +297,7 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
   }
 
   // 5. Live seam probe (opt-in): import the exact Hermes symbols the plugin patches.
-  if (options.probeSeams && existsSync(HERMES_PYTHON)) {
+  if (options.probeSeams && existsSync(paths.python)) {
     const script = [
       'import importlib, inspect, json, os, logging',
       'logging.disable(logging.CRITICAL)',
@@ -291,7 +318,7 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
       'print(json.dumps(out))',
     ].join('\n');
     try {
-      const raw = run(HERMES_PYTHON, ['-c', script], { timeoutMs: 30_000, env: { QLB_SEAMS: JSON.stringify(HERMES_SEAMS.map(({ module, symbol, params }) => ({ module, symbol, params }))) } });
+      const raw = run(paths.python, ['-c', script], { timeoutMs: 30_000, env: { QLB_HERMES_PLUGIN_STATUS: paths.pluginStatus, QLB_SEAMS: JSON.stringify(HERMES_SEAMS.map(({ module, symbol, params }) => ({ module, symbol, params }))) } });
       const line = raw.trim().split('\n').pop() ?? '[]';
       const results = JSON.parse(line) as Array<{ seam: string; ok: boolean; params?: string[]; error?: string }>;
       for (const r of results) {
@@ -335,8 +362,8 @@ export function hermesIntegrationChecks(options: HermesIntegrationOptions = {}):
 
   // 6. Hermes version marker so a drift report can say "since <sha>".
   try {
-    const sha = readText(join(HERMES_CHECKOUT, '.git', gitHead.startsWith('ref: ') ? gitHead.slice(5) : 'HEAD'))?.trim().slice(0, 12);
-    const mtime = statSync(join(HERMES_CHECKOUT, 'agent', 'anthropic_credentials.py')).mtime.toISOString();
+    const sha = readText(join(paths.checkout, '.git', gitHead.startsWith('ref: ') ? gitHead.slice(5) : 'HEAD'))?.trim().slice(0, 12);
+    const mtime = statSync(join(paths.checkout, 'agent', 'anthropic_credentials.py')).mtime.toISOString();
     checks.push({ name: 'hermes:version', level: 'PASS', message: `hermes-agent ${branch}@${sha ?? '?'} (adapter mtime ${mtime})` });
   } catch { /* informational only */ }
 

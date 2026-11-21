@@ -45,8 +45,8 @@ import {
   type ResyncCredential,
 } from './native-resync';
 import type { AccountSnapshot, Adapter } from './types';
-import { hermesIntegrationChecks } from './hermes-integration';
-import { piIntegrationChecks } from './pi-integration';
+import { hermesIntegrationChecks, type HermesIntegrationOptions } from './hermes-integration';
+import { piIntegrationChecks, type PiIntegrationOptions } from './pi-integration';
 import { piExtensionDriftCheck } from './checks/pi-extension-drift';
 import { piStaleSessionsCheck } from './checks/pi-stale-sessions';
 import {
@@ -194,7 +194,9 @@ export function listCheckNames(): string[] {
 /**
  * Reconcile runtime output with the registry without ever turning diagnostics
  * into an exception path. Dynamic prefix checks remain individual report rows;
- * registry mistakes stay visible through doctor:registry.
+ * registry mistakes stay visible through doctor:registry. A registry that loads
+ * but is empty or lacks doctor:registry fails closed: the runtime rows are kept
+ * and one doctor:registry FAIL is appended last.
  */
 export function registeredDoctorChecks(
   checks: DoctorCheck[],
@@ -249,7 +251,13 @@ export function registeredDoctorChecks(
       report.push({ name: definition.name, level: 'PASS', message: 'not applicable on this host' });
     }
   }
-  return [...report, ...unregistered];
+  const rows = [...report, ...unregistered];
+  if (definitions.some((definition) => definition.name === 'doctor:registry')) return rows;
+  const missing = definitions.length === 0 ? 'no check definitions loaded, including doctor:registry' : 'no doctor:registry definition';
+  return [
+    ...rows,
+    { name: 'doctor:registry', level: 'FAIL', message: `registry incomplete: ${[missing, ...mismatches].join('; ')}` },
+  ];
 }
 
 export function createCommandRunner(exec: ExecFileSyncFn = execFileUtf8): CommandRunner {
@@ -680,6 +688,10 @@ export async function doctorQlb(
     cswapAgentStatus?: () => CswapAgentStatus;
     /** The CLI enables the append-only v5 health history; library callers default read-only. */
     appendHealthLog?: boolean;
+    /** Tests inject Hermes paths and runner; production resolves them per call from the environment. */
+    hermes?: HermesIntegrationOptions;
+    /** Tests inject the Pi agent dir, extension dir and location; production resolves them per call. */
+    pi?: PiIntegrationOptions;
   } = {},
 ): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -967,7 +979,7 @@ export async function doctorQlb(
   // Hermes integration (external to the Hermes checkout): config, plugin, local fix, supervisor,
   // and — with --live — the exact Hermes symbols the plugin patches. Never throws.
   try {
-    checks.push(...hermesIntegrationChecks({ probeSeams: options.live === true }));
+    checks.push(...hermesIntegrationChecks({ probeSeams: options.live === true, ...options.hermes }));
   } catch (err) {
     checks.push({ name: 'hermes', level: 'WARN', message: `hermes checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
@@ -994,7 +1006,7 @@ export async function doctorQlb(
     }
   }
   try {
-    checks.push(...piIntegrationChecks({ typecheck: options.live === true }));
+    checks.push(...piIntegrationChecks({ typecheck: options.live === true, ...options.pi }));
   } catch (err) {
     checks.push({ name: 'pi', level: 'WARN', message: `pi checks failed: ${err instanceof Error ? err.message : String(err)}` });
   }
