@@ -1079,10 +1079,14 @@ describe('qlb undo cswap hand-back', () => {
             barrier = await firstOf('contended', 'acquired').catch((error: unknown) =>
               error instanceof Error ? error : new Error(String(error)));
             if (barrier === 'contended') {
-              lockInodes = {
-                oauthRefresh: statSync(locks.oauthRefreshLockDir).ino,
-                credentials: statSync(locks.credentialsLockDir).ino,
-              };
+              try {
+                lockInodes = {
+                  oauthRefresh: statSync(locks.oauthRefreshLockDir).ino,
+                  credentials: statSync(locks.credentialsLockDir).ino,
+                };
+              } catch {
+                lockInodes = undefined;
+              }
             }
           }
           try {
@@ -1101,7 +1105,10 @@ describe('qlb undo cswap hand-back', () => {
         resyncActive: undefined,
         getProfile: async () => { throw new Error('the fixture keeps one lineage, so no profile request is needed'); },
       }, [], ctx);
-      assert.equal(barrier, 'contended', barrier instanceof Error ? barrier.message : 'the writer acquired the credential lock while undo held it');
+      const barrierMessage = barrier instanceof Error ? barrier.message
+        : barrier === undefined ? `undo never read the live Claude Code item under the hold:\n${f.output.join('\n')}`
+          : 'the writer acquired the credential lock while undo held it';
+      assert.equal(barrier, 'contended', barrierMessage);
       assert.equal(exitCode, 0, f.output.join('\n'));
       assert.equal(await shared.get('claude-swap', 'account-1-a@example.test'), l1);
       assert.equal(exportedWhileHeld, true, 'the active export did not occur while the credential locks were held');
