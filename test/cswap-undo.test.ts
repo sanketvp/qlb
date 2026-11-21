@@ -1050,9 +1050,24 @@ describe('qlb undo cswap hand-back', () => {
           if (seen !== undefined) { stop(); resolve(seen); }
         }, 5);
       });
-      let barrierPassed = false;
+      let barrier: string | Error | undefined;
+      let lockInodes: { oauthRefresh: number; credentials: number } | undefined;
+      let exportedWhileHeld = false;
+      const locksStillHeld = () => {
+        if (lockInodes === undefined) return false;
+        try {
+          return statSync(locks.oauthRefreshLockDir).ino === lockInodes.oauthRefresh
+            && statSync(locks.credentialsLockDir).ino === lockInodes.credentials
+            && !events.includes('acquired');
+        } catch {
+          return false;
+        }
+      };
       const keychain = {
-        set: shared.set.bind(shared),
+        set: async (service: string, account: string, credential: string) => {
+          if (service === 'claude-swap' && account === 'account-1-a@example.test') exportedWhileHeld = locksStillHeld();
+          await shared.set(service, account, credential);
+        },
         get: async (service: string, account: string) => {
           if (service === paths.keychainService && account === liveAccount && child === undefined) {
             // First live read, inside withActiveLocks: start the competing
@@ -1061,27 +1076,35 @@ describe('qlb undo cswap hand-back', () => {
               locks.oauthRefreshLockDir, locks.credentialsLockDir, keychainPath, paths.keychainService, liveAccount, w2], { stdio: ['ignore', 'pipe', 'inherit'] });
             child.stdout!.setEncoding('utf8');
             child.stdout!.on('data', (chunk: string) => events.push(...chunk.split('\n').filter(Boolean)));
-            assert.equal(await firstOf('contended', 'acquired'), 'contended', 'the writer acquired the credential lock while undo held it');
-            barrierPassed = true;
+            barrier = await firstOf('contended', 'acquired').catch((error: unknown) =>
+              error instanceof Error ? error : new Error(String(error)));
+            if (barrier === 'contended') {
+              lockInodes = {
+                oauthRefresh: statSync(locks.oauthRefreshLockDir).ino,
+                credentials: statSync(locks.credentialsLockDir).ino,
+              };
+            }
           }
           try {
             return await shared.get(service, account);
-          } catch {
-            // The shared FileKeychain has no not-found error class; report the absent item as the fake Keychain does.
-            throw new Error('item not found');
+          } catch (error) {
+            if (error instanceof Error && error.message === 'fixture credential unavailable') throw new Error('item not found');
+            throw error;
           }
         },
       };
 
-      assert.equal(await undo(f, {
+      const exitCode = await undo(f, {
         keychain,
         withActiveLocks: undefined,
         readActiveCredential: undefined,
         resyncActive: undefined,
         getProfile: async () => { throw new Error('the fixture keeps one lineage, so no profile request is needed'); },
-      }, [], ctx), 0, f.output.join('\n'));
-      assert.equal(barrierPassed, true);
+      }, [], ctx);
+      assert.equal(barrier, 'contended', barrier instanceof Error ? barrier.message : 'the writer acquired the credential lock while undo held it');
+      assert.equal(exitCode, 0, f.output.join('\n'));
       assert.equal(await shared.get('claude-swap', 'account-1-a@example.test'), l1);
+      assert.equal(exportedWhileHeld, true, 'the active export did not occur while the credential locks were held');
       await firstOf('written');
       assert.deepEqual(events, ['contended', 'acquired', 'written']);
       assert.equal(await shared.get(paths.keychainService, liveAccount), w2);
