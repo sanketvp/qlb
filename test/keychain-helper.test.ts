@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import childProcess = require('node:child_process');
 import { execFileSync, execFileSync as runFile, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -831,6 +831,61 @@ sleep 8`);
       runFile(binary, ['--keychain', keychain, 'selftest', `qlb-test-a2b-${randomBytes(8).toString('hex')}`], {
         stdio: 'ignore', timeout: 5_000,
       });
+    } finally {
+      try { runFile('/usr/bin/security', ['delete-keychain', keychain], { stdio: 'ignore' }); } catch { /* cleanup */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an empty payload for both set forms before touching a disposable Keychain', {
+    // Opt-in only: ordinary test runs must not access any real Keychain.
+    skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
+  }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-empty-'));
+    const keychain = join(dir, 't.keychain-db');
+    const missing = join(dir, 'missing.keychain-db');
+    const binary = join(dir, 'qlb-keychain-helper');
+    const password = randomBytes(24).toString('hex');
+    const service = `qlb-test-empty-${randomBytes(8).toString('hex')}`;
+    const account = 'qlb';
+    const helper = (keychainPath: string, args: string[], input: string) =>
+      spawnSync(binary, ['--keychain', keychainPath, ...args], { input, encoding: 'utf8', timeout: 5_000 });
+    const stored = () => runFile('/usr/bin/security', [
+      'find-generic-password', '-a', account, '-s', service, '-w', keychain,
+    ], { encoding: 'utf8', timeout: 5_000 }).replace(/\n$/, '');
+    const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+    const assertEmptyPayload = (result: ReturnType<typeof helper>) => {
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 1);
+      assert.equal(result.stderr, 'qlb-keychain-helper: empty payload\n');
+    };
+    try {
+      runFile('/usr/bin/swiftc', ['-o', binary, 'native/keychain-helper/main.swift'], { stdio: 'ignore' });
+      runFile('/usr/bin/security', ['create-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      runFile('/usr/bin/security', ['unlock-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      const seed = randomBytes(16).toString('hex');
+      const seeded = helper(keychain, ['set', service, account], seed);
+      assert.equal(seeded.status, 0, seeded.stderr);
+      assert.equal(stored(), seed);
+
+      // (b) Neither form overwrites an existing item with zero bytes.
+      assertEmptyPayload(helper(keychain, ['set', service, account], ''));
+      assert.equal(stored(), seed);
+      assertEmptyPayload(helper(keychain, ['set', '--if-sha256', sha256(seed), service, account], ''));
+      assert.equal(stored(), seed);
+
+      // (a) The payload is validated before the requested keychain is opened. This runs after (b)
+      // on purpose: SecKeychainOpen accepts a missing path, and an unguarded plain `set` then adds
+      // the item to the default keychain. A regression must fail above, in the disposable keychain.
+      assertEmptyPayload(helper(missing, ['set', '--if-sha256', sha256(seed), service, account], ''));
+      assertEmptyPayload(helper(missing, ['set', service, account], ''));
+      assert.equal(existsSync(missing), false);
+
+      // (c) A nonempty write still succeeds, so the fixture can observe a change.
+      const next = randomBytes(16).toString('hex');
+      const updated = helper(keychain, ['set', '--if-sha256', sha256(seed), service, account], next);
+      assert.equal(updated.status, 0, updated.stderr);
+      assert.equal(stored(), next);
     } finally {
       try { runFile('/usr/bin/security', ['delete-keychain', keychain], { stdio: 'ignore' }); } catch { /* cleanup */ }
       rmSync(dir, { recursive: true, force: true });
