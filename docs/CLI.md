@@ -739,6 +739,85 @@ still clears it and reports `resumed: "cleared-invalid"` with
 
 Flags: `[--json]`.
 
+## `qlb claude journal resolve`
+
+Usage: `qlb claude journal resolve --forward|--back`.
+
+Resolves an unfinished Claude switch journal (`claude-switch.json`) whose
+owner process has died, on the operator's explicit request. Automatic
+reconciliation only ever rolls a switch back. This command is the only way to
+complete one forward.
+
+- `--back` restores the outgoing account. It puts back the pre-switch
+  `oauthAccount` in the Claude config, and restores the live credential only
+  when the live item still holds exactly what the switch wrote. It records a
+  `rolled-back` switch row.
+- `--forward` completes the switch to the target account. It finishes the
+  config step and commits the switch row. It needs the live credential to
+  still match the target slot's credential.
+
+Both directions take the switch lock, Claude Code's credential locks, the
+journal owner lock and the config-path lock, in that order. Both then close
+the journal, delete the staged rollback blob, and remove the journal file.
+
+Admission operation: `claude-journal-resolve`, admitted in the `cutting-over`,
+`cutover` and `retired` phases.
+
+Exit codes:
+
+- `0`: resolved. It prints `Claude journal resolved forward|back`, with the
+  12-character fingerprint prefixes of the credentials involved. When cleanup
+  partly failed, it adds the warning
+  `completed with cleanup warnings: journal|staged|lock-timeout`. The switch
+  itself is still resolved.
+- `1`: an unexpected error, for example an unreadable store, or a config file
+  that can't be parsed during `--back`. It prints
+  `qlb claude journal resolve: failed`.
+- `2`: bad usage (not exactly one of `--forward` or `--back`).
+- `3`: refused, with `qlb claude journal resolve: refused: <reason>`. Nothing
+  is changed. The reasons:
+
+| Reason | Direction | Meaning |
+|---|---|---|
+| `phase=<state>`, `undo-in-progress`, `cutover-begin-in-progress` | both | The lifecycle phase does not admit the command. |
+| `cswap-process-alive`, `cswap-process-check-failed` | both | A C-swap process is running, or the process check failed (checked before and again under the locks). |
+| `journal-absent`, `journal-malformed` | both | There is no journal, or it can't be read. |
+| `journal-identity-invalid` | both | The journal names slots the slot inventory does not match. |
+| `journal-finished` | both | The journal is already closed or committed. |
+| `owner-alive` | both | The switch that wrote the journal is still running. |
+| `lock-timeout` | both | A lock wasn't acquired in time. |
+| `staged-unreadable` | back | The staged rollback copy of the outgoing credential is missing or can't be read. |
+| `live-unreadable` | both | Claude Code's live credential can't be read. |
+| `live-not-outgoing` | back | The live credential is neither the switch's written bytes, the staged copy, nor the outgoing account. |
+| `credentials-not-written` | forward | The switch never finished writing the target credential, so only `--back` applies. |
+| `target-unreadable` | forward | The target slot's credential can't be read. |
+| `target-lineage-missing` | forward | The live credential no longer matches the target slot's credential, for example because Claude Code renewed it. |
+| `target-invalid` | forward | The target slot has no usable `oauthAccount`. |
+| `config-invalid` | forward | The Claude config can't be read or parsed. |
+| `config-moved` | forward | The Claude config changed since the switch recorded it. |
+
+### Stuck journal
+
+If Claude Code renews its token after the switch wrote the target credential
+but before the journal was closed, both directions can refuse:
+
+- `--back` refuses `live-not-outgoing`, because the live credential is now a
+  renewed one;
+- `--forward` refuses `target-lineage-missing`, because the live credential
+  no longer matches the target slot's copy.
+
+While the journal stays in place:
+
+- the doctor row `claude:switch-journal` shows FAIL;
+- every Claude switch, manual or made by `qlb auto`, refuses
+  `switch-journal-present`, so automatic switching is paused;
+- Claude Code itself stays signed in to the target account.
+
+There is a known double-renewal hazard in this state: QLB can renew a grant
+that Claude Code also holds. So the owner should resolve the journal promptly.
+Recovery is supervised by the owner. Don't delete or move the journal, the
+staged blob or any credential by hand.
+
 ## `qlb setup`
 
 Non-destructive harness wiring: prints copy-paste snippets only, never edits files outside this repo.
