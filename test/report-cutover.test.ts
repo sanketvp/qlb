@@ -688,7 +688,21 @@ test('report cutover with only a denied soft relogin can pass and write its rece
     seed(subject, { piDeferred: true, drill: true });
     insertRelogin(subject, 'unattributed-rotation', true);
     assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC18:relogins').message,
+      `no counted Anthropic or Codex relogin events; excused by user denial: #1@${NOW - 9 * DAY}`);
     assert.equal(configRow(subject, 'report.receiptAt'), String(NOW));
+  } finally { subject.close(); }
+});
+
+test('report cutover names counted relogins when AC18 has no rows', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC18:relogins').message,
+      'no counted Anthropic or Codex relogin events');
   } finally { subject.close(); }
 });
 

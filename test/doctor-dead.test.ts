@@ -389,7 +389,18 @@ describe('A7 doctor health primitives', () => {
     });
 
     it('relogin:7d excuses a denied soft relogin', () => {
-      assert.equal(relogin7dCheck(relogin('unattributed-rotation', true), 'cutover').level, 'PASS');
+      const dbPath = fixture();
+      write(dbPath, `INSERT INTO relogin_events (ts, provider, kind, detail, evidence, user_denied_at)
+        VALUES (9_000, 'anthropic', 'external-login', 'sha256:1111111111111111', 'unattributed-rotation', 9_500)`);
+      const result = relogin7dCheck(dbPath, 'cutover', 10_000);
+      assert.equal(result.level, 'PASS');
+      assert.equal(result.message, 'no counted relogin events in the last 7 days; excused by user denial: #1@9000');
+    });
+
+    it('relogin:7d names counted relogins when its window is empty', () => {
+      const result = relogin7dCheck(fixture(), 'cutover', 10_000);
+      assert.equal(result.level, 'PASS');
+      assert.equal(result.message, 'no counted relogin events in the last 7 days');
     });
 
     it('relogin:7d counts an undenied soft relogin', () => {

@@ -30,15 +30,16 @@ export function relogin7dCheck(
     if (!APPLICABLE_PHASES.has(phase)) {
       return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
     }
-    const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now })
-      .filter(countsAsRelogin);
-    return events.length === 0
-      ? { name: 'relogin:7d', level: 'PASS', message: 'no relogin events in the last 7 days' }
+    const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now });
+    const counted = events.filter(countsAsRelogin);
+    const excused = events.filter((event) => !countsAsRelogin(event));
+    return counted.length === 0
+      ? { name: 'relogin:7d', level: 'PASS', message: `no counted relogin events in the last 7 days${excused.length === 0 ? '' : `; excused by user denial: ${excused.map((event) => `#${event.id}@${event.ts}`).join(', ')}`}` }
       : {
         name: 'relogin:7d',
         level: 'FAIL',
-        message: `${events.length} relogin event(s) in the last 7 days`,
-        detail: events.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
+        message: `${counted.length} relogin event(s) in the last 7 days`,
+        detail: counted.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
       };
   });
 }
