@@ -9,7 +9,7 @@ const TOKEN_PATTERNS: readonly RegExp[] = [
   /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
   /(?<![A-Za-z0-9])xai-[A-Za-z0-9]{32,}(?![A-Za-z0-9])/g,
   /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?![A-Za-z0-9_-])/g,
-  /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}={0,}(?![A-Za-z0-9\-._~+/=])/gi,
+  /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}(?:=+|(?![A-Za-z0-9\-._~+/=]))/gi,
 ];
 
 const SENSITIVE_KEY = new Set([

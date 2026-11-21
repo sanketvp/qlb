@@ -460,6 +460,36 @@ describe('redaction of serialized JSON string literals (TC-1)', () => {
     assert.deepEqual(JSON.parse(JSON.parse(result).x), { authorization: REDACTED });
   });
 
+  it('redacts padded Bearer credentials after reserializing an escape-hidden token', () => {
+    const bearerCredential = `Bearer ${'A'.repeat(24)}==`;
+    const text = `{"message":"line${BS}n${longSk} ${bearerCredential}${BS}/v1"}`;
+    const result = redactSecrets(text, []);
+    assert.equal(result.includes(bearerCredential), false);
+    assert.deepEqual(JSON.parse(result), { message: `line\n${REDACTED} ${REDACTED}/v1` });
+  });
+
+  it('redacts padded Bearer credentials after reserializing an escaped registered secret', () => {
+    const bearerCredential = `Bearer ${'A'.repeat(24)}==`;
+    const secret = 'password\nxyz';
+    const text = JSON.stringify({ message: `line\n${secret} ${bearerCredential}/v1` });
+    const result = redactSecrets(text, [secret]);
+    assert.equal(result.includes(bearerCredential), false);
+    assert.deepEqual(JSON.parse(result), { message: `line\n${REDACTED} ${REDACTED}/v1` });
+  });
+
+  it('redacts padded Bearer credentials before a slash in plain text', () => {
+    const bearerCredential = `Bearer ${'A'.repeat(24)}==`;
+    assert.equal(redactSecrets(`${bearerCredential}/v1`, []), `${REDACTED}/v1`);
+  });
+
+  it('redacts padded Bearer credentials after reserializing nested JSON', () => {
+    const bearerCredential = `Bearer ${'A'.repeat(24)}==`;
+    const inner = `{"message":"line${BS}n${longSk} ${bearerCredential}${BS}/v1"}`;
+    const result = redactSecrets(JSON.stringify({ x: inner }), []);
+    assert.equal(result.includes(bearerCredential), false);
+    assert.deepEqual(JSON.parse(JSON.parse(result).x), { message: `line\n${REDACTED} ${REDACTED}/v1` });
+  });
+
   it('a registered escaped literal secret is replaced before literal redaction', () => {
     const secret = `head-opaque "a${BS}n${longSk}" tail-opaque`;
     const result = redactSecrets(`error ${secret} end`, [secret]);
