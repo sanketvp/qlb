@@ -9,7 +9,7 @@ import { describe, it } from 'node:test';
 import { CONFIG_ENV_VARS, defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
 import { discoverChecks } from '../src/registry';
-import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
+import { MACOS_SECURITY_BIN, MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
 import { persistStash } from '../src/single-stash';
 import { validatedAdvisoryMessage } from '../src/migration-health';
@@ -432,9 +432,17 @@ describe('qlb doctor', () => {
   it('reports a timed out Keychain probe as WARN, never PASS', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-keychain-timeout-'));
     const timeout = Object.assign(new Error('fake security timed out'), { code: 'ETIMEDOUT' });
+    const calls: Array<{ file: string; args: readonly string[]; timeout: number | undefined }> = [];
     const report = await doctorQlb(defaultConfig(home), {
-      command: () => { throw timeout; },
+      command: createCommandRunner((file, args, options) => {
+        calls.push({ file, args, timeout: options?.timeout });
+        throw timeout;
+      }),
     });
+    const probe = calls.find((call) => call.args.join(' ') === 'list-keychains -d user');
+    assert.equal(probe?.file, MACOS_SECURITY_BIN);
+    assert.equal(probe?.timeout, 5_000);
+    assert.ok(calls.every((call) => call.timeout === 5_000), JSON.stringify(calls));
     const keychain = report.checks.find((check) => check.name === 'keychain');
     const openrouter = report.providers.find((provider) => provider.provider === 'openrouter');
 
