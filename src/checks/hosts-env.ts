@@ -18,7 +18,19 @@ const HOST_ENVIRONMENT_VARIABLES = [
   'ANTHROPIC_AUTH_TOKEN',
   'OPENAI_API_KEY',
   'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_OAUTH_TOKEN',
 ] as const;
+
+// Runs inside `/bin/sh -c`: $1 is the launchctl path, the rest are the watched names. Each value
+// is tested in the shell and never printed; stdout carries only watched names and `!error`.
+const LAUNCHCTL_PROBE_SCRIPT = [
+  'l=$1; shift',
+  'for n in "$@"; do',
+  `  v=$("$l" getenv "$n") || { echo '!error'; continue; }`,
+  `  [ -n "$v" ] && printf '%s\\n' "$n"`,
+  'done',
+  'exit 0',
+].join('\n');
 
 function probeHostTool(command: HostCommandRunner, name: 'herdr' | 'orca'): string {
   try {
@@ -53,6 +65,37 @@ function selectLoginShell(
   return { path: shellExists(shell) ? shell : null, unsupportedShell: null };
 }
 
+/** Names set in the login shell, or null when its environment could not be read. */
+function loginShellVariables(command: HostCommandRunner, shell: string): string[] | null {
+  try {
+    const lines = command(shell, ['-lic', 'env'], { env: minimalLoginShellEnvironment() }).split(/\r?\n/);
+    return HOST_ENVIRONMENT_VARIABLES.filter((name) => lines.some((line) => line.startsWith(`${name}=`)));
+  } catch {
+    return null;
+  }
+}
+
+/** Names launchctl reports as set, and whether any read failed. Values never leave the shell. */
+function launchctlVariables(
+  command: HostCommandRunner,
+  launchctl: string,
+): { names: string[]; failed: boolean } {
+  let lines: string[];
+  try {
+    lines = command('/bin/sh', ['-c', LAUNCHCTL_PROBE_SCRIPT, 'sh', launchctl, ...HOST_ENVIRONMENT_VARIABLES], {
+      env: minimalLoginShellEnvironment(),
+    }).split(/\r?\n/).filter((line) => line !== '');
+  } catch {
+    return { names: [], failed: true };
+  }
+  const watched: readonly string[] = HOST_ENVIRONMENT_VARIABLES;
+  return {
+    names: HOST_ENVIRONMENT_VARIABLES.filter((name) => lines.includes(name)),
+    // `!error`, or anything else that is not a watched name, is a failed read and is never echoed.
+    failed: lines.some((line) => !watched.includes(line)),
+  };
+}
+
 /** Detect host overrides without retaining, displaying, or serializing their values. */
 export function probeHostEnvironment(
   command: HostCommandRunner,
@@ -60,6 +103,8 @@ export function probeHostEnvironment(
     platform: NodeJS.Platform;
     shell: string | undefined;
     shellExists: (path: string) => boolean;
+    /** Absolute launchctl path to probe on darwin; null skips the launchctl probe. */
+    launchctl: string | null;
   },
 ): DoctorCheck {
   const detail = {
@@ -69,6 +114,24 @@ export function probeHostEnvironment(
   const shell = options.platform === 'win32'
     ? { path: null, unsupportedShell: null }
     : selectLoginShell(options.shell, options.shellExists);
+  const shellVariables = shell.path ? loginShellVariables(command, shell.path) : [];
+  const launchctlPath = options.platform === 'darwin' ? options.launchctl : null;
+  const launchctl = launchctlPath !== null
+    ? launchctlVariables(command, launchctlPath)
+    : { names: [], failed: false };
+
+  const hits: string[] = [];
+  if (shellVariables?.length) hits.push(`login shell sets ${shellVariables.join(', ')}`);
+  if (launchctl.names.length > 0) hits.push(`launchctl sets ${launchctl.names.join(', ')}`);
+  const failures: string[] = [];
+  if (shellVariables === null) failures.push('could not read login shell environment');
+  if (launchctl.failed) failures.push('could not read launchctl environment');
+  if (hits.length > 0 || failures.length > 0) {
+    const parts = hits.length > 0
+      ? [...hits, ...failures, 'Orca/Herdr-launched tools may bypass QLB-managed logins']
+      : failures;
+    return { name: 'hosts:env', level: 'WARN', message: parts.join('; '), detail };
+  }
   if (!shell.path) {
     return {
       name: 'hosts:env',
@@ -79,26 +142,12 @@ export function probeHostEnvironment(
       detail,
     };
   }
-  try {
-    const environment = command(shell.path, ['-lic', 'env'], { env: minimalLoginShellEnvironment() });
-    const setVariables = HOST_ENVIRONMENT_VARIABLES.filter((name) =>
-      environment.split(/\r?\n/).some((line) => line.startsWith(`${name}=`)),
-    );
-    if (setVariables.length > 0) {
-      return {
-        name: 'hosts:env',
-        level: 'WARN',
-        message: `login shell sets ${setVariables.join(', ')}; Orca/Herdr-launched tools may bypass QLB-managed logins`,
-        detail,
-      };
-    }
-    return {
-      name: 'hosts:env',
-      level: 'PASS',
-      message: 'no QLB-bypassing variables are set in the login shell environment',
-      detail,
-    };
-  } catch {
-    return { name: 'hosts:env', level: 'WARN', message: 'could not read login shell environment', detail };
-  }
+  return {
+    name: 'hosts:env',
+    level: 'PASS',
+    message: launchctlPath !== null
+      ? 'no QLB-bypassing variables are set in the login shell or launchctl environment'
+      : 'no QLB-bypassing variables are set in the login shell environment',
+    detail,
+  };
 }
