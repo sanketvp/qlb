@@ -374,6 +374,29 @@ describe('A7 doctor health primitives', () => {
     assert.equal(active.level, 'FAIL');
   });
 
+  describe('S65 relogin rule (TC-13)', () => {
+    function relogin(evidence: string, denied: boolean): string {
+      const dbPath = fixture();
+      const now = Date.now();
+      write(dbPath, `INSERT INTO relogin_events (ts, provider, kind, detail, evidence, user_denied_at)
+        VALUES (?, 'anthropic', 'external-login', 'sha256:1111111111111111', ?, ?)`, now - 1_000, evidence, denied ? now - 500 : null);
+      return dbPath;
+    }
+
+    it('relogin:7d counts a denied hard relogin', () => {
+      assert.equal(relogin7dCheck(relogin('login-expiry-jump', true), 'cutover').level, 'FAIL');
+      assert.equal(relogin7dCheck(relogin('auth-time', true), 'cutover').level, 'FAIL');
+    });
+
+    it('relogin:7d excuses a denied soft relogin', () => {
+      assert.equal(relogin7dCheck(relogin('unattributed-rotation', true), 'cutover').level, 'PASS');
+    });
+
+    it('relogin:7d counts an undenied soft relogin', () => {
+      assert.equal(relogin7dCheck(relogin('unattributed-rotation', false), 'cutover').level, 'FAIL');
+    });
+  });
+
   it('treats a healed relogin inside the window as unhealthy', () => {
     const dbPath = fixture();
     const store = openStore(dbPath);

@@ -1,5 +1,5 @@
 import { check, guardCheck } from './_check';
-import { reloginsInWindow } from '../relogin';
+import { countsAsRelogin, reloginsInWindow } from '../relogin';
 import type { HealthCheck } from './claude-slots';
 import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 
@@ -10,7 +10,7 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 )));
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** S26/AC17: any non-denied relogin in the current seven-day window is unhealthy. */
+/** S26/AC17: any relogin that counts under S65 in the current seven-day window is unhealthy. */
 export function relogin7dCheck(
   dbPath: string,
   phase: string,
@@ -31,7 +31,7 @@ export function relogin7dCheck(
       return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
     }
     const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now })
-      .filter((event) => event.userDeniedAt == null);
+      .filter(countsAsRelogin);
     return events.length === 0
       ? { name: 'relogin:7d', level: 'PASS', message: 'no relogin events in the last 7 days' }
       : {
