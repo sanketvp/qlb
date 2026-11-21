@@ -945,13 +945,15 @@ describe('qlb undo cswap hand-back', () => {
       beginUndo(f);
       const slots = ['a', 'b', 'c', 'd', 'e'].map((name, index) => ({
         accountId: `account-${name}`, number: index + 1, email: `${name}@example.test`, item: `account-${index + 1}-${name}@example.test`,
-        // a and b have rotated lineages in C-swap; c, d and e have no C-swap item yet.
         rotated: name === 'a' || name === 'b',
+        hasEnc: name === 'a' || name === 'b' || name === 'd',
       }));
       for (const slot of slots) {
         addSlot(f, { accountId: slot.accountId, number: slot.number, email: slot.email, refresh: `refresh-current-${slot.number}`, active: slot.number === 1 });
         if (slot.rotated) {
           f.keychain.set('claude-swap', slot.item, credentialWithRefresh(slot.accountId, `refresh-stale-${slot.number}`));
+        }
+        if (slot.hasEnc) {
           writeFileSync(join(f.backup, 'credentials', `.creds-${slot.number}-${slot.email}.enc`), 'stale encrypted fixture');
         }
       }
@@ -987,6 +989,8 @@ describe('qlb undo cswap hand-back', () => {
         const value = await f.keychain.get('claude-swap', slot.item).catch(() => null);
         assert.equal(value, slot.rotated ? credentialWithRefresh(slot.accountId, `refresh-stale-${slot.number}`) : null, slot.item);
       }
+      assert.equal(existsSync(join(f.backup, 'credentials', '.creds-2-b@example.test.enc')), false);
+      assert.equal(existsSync(join(f.backup, 'credentials', '.creds-4-d@example.test.enc')), true);
 
       crashAfter = null;
       f.output.length = 0;
@@ -998,7 +1002,11 @@ describe('qlb undo cswap hand-back', () => {
         assert.equal(prevWrites.get(`${slot.item}.prev`) ?? 0, slot.rotated ? 1 : 0, `${slot.item}.prev writes`);
         assert.equal(await f.keychain.get('claude-swap', slot.item), credentialWithRefresh(slot.accountId, `refresh-current-${slot.number}`), slot.item);
       }
-      assert.deepEqual([...encDeletes.values()], [1, 1]);
+      assert.deepEqual(Object.fromEntries(encDeletes), {
+        [join(f.backup, 'credentials', '.creds-1-a@example.test.enc')]: 1,
+        [join(f.backup, 'credentials', '.creds-2-b@example.test.enc')]: 1,
+        [join(f.backup, 'credentials', '.creds-4-d@example.test.enc')]: 1,
+      });
       const done = openStore(f.dbPath);
       try { assert.equal(phase(done).state, 'rolled-back'); } finally { done.close(); }
     } finally { close(f); }
