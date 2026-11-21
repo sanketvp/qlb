@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,6 +16,10 @@ import { runAutoCommand } from '../src/commands/auto';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
 import { MockKeychain } from '../src/keychain';
+import { macosKeychainAccountName } from '../src/keychain-allowlist';
+import { claudePaths } from '../src/cc-paths';
+import { claudeLockPaths } from '../src/cc-locks';
+import { FileKeychain } from './support/file-keychain';
 import { runPiGate } from '../src/pi-gate';
 import { undoLineageMatchCheck } from '../src/checks/undo-lineage-match';
 import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
@@ -1010,6 +1015,80 @@ describe('qlb undo cswap hand-back', () => {
       const done = openStore(f.dbPath);
       try { assert.equal(phase(done).state, 'rolled-back'); } finally { done.close(); }
     } finally { close(f); }
+  });
+
+  it('a Claude Code writer during the active export waits, and the export carries the live bytes read under the hold', async () => {
+    const f = fixture();
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      beginUndo(f);
+      addSlot(f, { accountId: 'account-a', number: 1, email: 'a@example.test', refresh: 'refresh-shared', active: true });
+      const ctx = context(f);
+      const paths = claudePaths({ home: f.home, env: ctx.env });
+      const locks = claudeLockPaths({ home: f.home, env: ctx.env });
+      mkdirSync(paths.configHome, { recursive: true });
+      writeFileSync(paths.globalConfigPath, JSON.stringify({ oauthAccount: { accountUuid: 'account-a', emailAddress: 'a@example.test' } }));
+      const liveAccount = macosKeychainAccountName(ctx.env);
+      // Three distinct values of one lineage: the QLB slot (S0), the live
+      // Claude Code item undo must read under the hold (L1), and the
+      // competing writer's later refresh (W2).
+      const s0 = credentialWithRefresh('account-a', 'refresh-shared', { accessToken: 'access-slot-s0' });
+      const l1 = credentialWithRefresh('account-a', 'refresh-shared', { accessToken: 'access-live-l1' });
+      const w2 = credentialWithRefresh('account-a', 'refresh-shared', { accessToken: 'access-writer-w2' });
+      const keychainPath = join(f.root, 'file-keychain.json');
+      const shared = new FileKeychain(keychainPath);
+      await shared.set('qlb:anthropic:account-a', 'qlb', s0);
+      await shared.set(paths.keychainService, liveAccount, l1);
+
+      const events: string[] = [];
+      // Resolves with whichever of `wanted` the writer reports first.
+      const firstOf = (...wanted: string[]) => new Promise<string>((resolve, reject) => {
+        const stop = () => { clearTimeout(timer); clearInterval(check); };
+        const timer = setTimeout(() => { stop(); reject(new Error(`writer never reported ${wanted.join('|')}; saw ${events.join(',')}`)); }, 15_000);
+        const check = setInterval(() => {
+          const seen = events.find((event) => wanted.includes(event));
+          if (seen !== undefined) { stop(); resolve(seen); }
+        }, 5);
+      });
+      let barrierPassed = false;
+      const keychain = {
+        set: shared.set.bind(shared),
+        get: async (service: string, account: string) => {
+          if (service === paths.keychainService && account === liveAccount && child === undefined) {
+            // First live read, inside withActiveLocks: start the competing
+            // writer and hold the export until it has hit the held lock.
+            child = spawn(process.execPath, [join(support, 'claude-credential-lock-writer.cjs'),
+              locks.oauthRefreshLockDir, locks.credentialsLockDir, keychainPath, paths.keychainService, liveAccount, w2], { stdio: ['ignore', 'pipe', 'inherit'] });
+            child.stdout!.setEncoding('utf8');
+            child.stdout!.on('data', (chunk: string) => events.push(...chunk.split('\n').filter(Boolean)));
+            assert.equal(await firstOf('contended', 'acquired'), 'contended', 'the writer acquired the credential lock while undo held it');
+            barrierPassed = true;
+          }
+          try {
+            return await shared.get(service, account);
+          } catch {
+            // The shared FileKeychain has no not-found error class; report the absent item as the fake Keychain does.
+            throw new Error('item not found');
+          }
+        },
+      };
+
+      assert.equal(await undo(f, {
+        keychain,
+        withActiveLocks: undefined,
+        readActiveCredential: undefined,
+        resyncActive: undefined,
+        getProfile: async () => { throw new Error('the fixture keeps one lineage, so no profile request is needed'); },
+      }, [], ctx), 0, f.output.join('\n'));
+      assert.equal(barrierPassed, true);
+      assert.equal(await shared.get('claude-swap', 'account-1-a@example.test'), l1);
+      await firstOf('written');
+      assert.deepEqual(events, ['contended', 'acquired', 'written']);
+      assert.equal(await shared.get(paths.keychainService, liveAccount), w2);
+    } finally {
+      child?.kill();
+      close(f);
+    }
   });
 
   it('the production plist mover treats a missing QLB agent as nothing to move', async () => {
