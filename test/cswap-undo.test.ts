@@ -496,7 +496,7 @@ describe('undo hand-back admission fence (HP-K12-3)', () => {
       assert.equal(await runExecutingCommand(counted, context(f)), 3);
       assert.equal(f.output.length, 1);
       // Do not pin guidance: Pi's parsers accept only the bare code; TC-15 fixes the CLI side.
-      assert.match(f.output[0]?.replace(/^ERR:/, '') ?? '', /^qlb gate: refused: undo-in-progress(;|$)/);
+      assert.match(f.output[0] ?? '', /^ERR:qlb gate: refused: undo-in-progress(;|$)/);
       assert.equal(entered, 0);
     } finally { close(f); }
   });
