@@ -939,6 +939,71 @@ describe('qlb undo cswap hand-back', () => {
     } finally { close(f); }
   });
 
+  it('a crash after the third primary export resumes with no duplicate writes', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const slots = ['a', 'b', 'c', 'd', 'e'].map((name, index) => ({
+        accountId: `account-${name}`, number: index + 1, email: `${name}@example.test`, item: `account-${index + 1}-${name}@example.test`,
+        // a and b have rotated lineages in C-swap; c, d and e have no C-swap item yet.
+        rotated: name === 'a' || name === 'b',
+      }));
+      for (const slot of slots) {
+        addSlot(f, { accountId: slot.accountId, number: slot.number, email: slot.email, refresh: `refresh-current-${slot.number}`, active: slot.number === 1 });
+        if (slot.rotated) {
+          f.keychain.set('claude-swap', slot.item, credentialWithRefresh(slot.accountId, `refresh-stale-${slot.number}`));
+          writeFileSync(join(f.backup, 'credentials', `.creds-${slot.number}-${slot.email}.enc`), 'stale encrypted fixture');
+        }
+      }
+      const primaries = new Set(slots.map((slot) => slot.item));
+      const primaryWrites = new Map<string, number>();
+      const prevWrites = new Map<string, number>();
+      const encDeletes = new Map<string, number>();
+      let crashAfter: number | null = 3;
+      const keychain = {
+        get: f.keychain.get.bind(f.keychain),
+        set: async (service: string, account: string, value: string) => {
+          await f.keychain.set(service, account, value);
+          if (service !== 'claude-swap') return;
+          if (account.endsWith('.prev')) {
+            prevWrites.set(account, (prevWrites.get(account) ?? 0) + 1);
+            return;
+          }
+          if (!primaries.has(account)) return;
+          primaryWrites.set(account, (primaryWrites.get(account) ?? 0) + 1);
+          const written = [...primaryWrites.values()].reduce((sum, count) => sum + count, 0);
+          if (crashAfter !== null && written === crashAfter) throw new Error('fixture crash after a persisted primary export');
+        },
+      };
+      const deleteEnc = (path: string) => { encDeletes.set(path, (encDeletes.get(path) ?? 0) + 1); rmSync(path, { force: true }); };
+
+      assert.notEqual(await undo(f, { keychain, deleteEnc }), 0);
+      const fenced = openStore(f.dbPath);
+      try { assert.equal(phase(fenced).state, 'undoing'); } finally { fenced.close(); }
+      assert.equal(primaryWrites.size, 3, JSON.stringify([...primaryWrites]));
+      const untouched = slots.filter((slot) => !primaryWrites.has(slot.item));
+      assert.equal(untouched.length, 2);
+      for (const slot of untouched) {
+        const value = await f.keychain.get('claude-swap', slot.item).catch(() => null);
+        assert.equal(value, slot.rotated ? credentialWithRefresh(slot.accountId, `refresh-stale-${slot.number}`) : null, slot.item);
+      }
+
+      crashAfter = null;
+      f.output.length = 0;
+      assert.equal(await undo(f, { keychain, deleteEnc }, ['--resume', '--json']), 0, f.output.join('\n'));
+      assert.equal(JSON.parse(f.output.at(-1)!).state, 'rolled-back');
+
+      for (const slot of slots) {
+        assert.equal(primaryWrites.get(slot.item), 1, `${slot.item} primary writes`);
+        assert.equal(prevWrites.get(`${slot.item}.prev`) ?? 0, slot.rotated ? 1 : 0, `${slot.item}.prev writes`);
+        assert.equal(await f.keychain.get('claude-swap', slot.item), credentialWithRefresh(slot.accountId, `refresh-current-${slot.number}`), slot.item);
+      }
+      assert.deepEqual([...encDeletes.values()], [1, 1]);
+      const done = openStore(f.dbPath);
+      try { assert.equal(phase(done).state, 'rolled-back'); } finally { done.close(); }
+    } finally { close(f); }
+  });
+
   it('the production plist mover treats a missing QLB agent as nothing to move', async () => {
     const f = fixture();
     const savedTestMode = process.env.QLB_TEST_MODE;
