@@ -329,6 +329,18 @@ function usableUsagePct(value: unknown): number | undefined {
   return isFiniteNumber(value) ? value : undefined;
 }
 
+/**
+ * Validate a usage window's `resets_at` the way C-swap's `format_reset` does.
+ *
+ * Parity with Python >= 3.11 `datetime.fromisoformat` is claimed only for the
+ * two shapes the usage endpoint sends: extended ISO-8601 with an optional
+ * fraction and either a `Z` or a `+00:00` offset (`2026-10-24T17:00:00Z`,
+ * `2026-10-24T17:00:00.428838+00:00`). It is not a port of the full 3.11+
+ * grammar. Off those shapes it can disagree in both directions: it rejects
+ * shapes Python accepts (a comma fraction, `+HH` or `+HH:MM:SS` offsets,
+ * basic or week dates, hour-only times, a separator other than `T`, `t` or
+ * space), and it accepts lowercase `t`/`z`, which Python rejects.
+ */
 function validatedResetAt(value: unknown): string | undefined {
   if (isPythonFalsy(value)) return undefined;
   if (typeof value !== 'string') throw new TypeError('resets_at must be a string');
