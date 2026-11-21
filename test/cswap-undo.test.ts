@@ -494,7 +494,9 @@ describe('undo hand-back admission fence (HP-K12-3)', () => {
       };
 
       assert.equal(await runExecutingCommand(counted, context(f)), 3);
-      assert.deepEqual(f.output, ['ERR:qlb gate: refused: undo-in-progress; run qlb undo cswap --resume']);
+      assert.equal(f.output.length, 1);
+      // Do not pin guidance: Pi's parsers accept only the bare code; TC-15 fixes the CLI side.
+      assert.match(f.output[0]?.replace(/^ERR:/, '') ?? '', /^qlb gate: refused: undo-in-progress(;|$)/);
       assert.equal(entered, 0);
     } finally { close(f); }
   });
@@ -525,6 +527,11 @@ describe('undo hand-back admission fence (HP-K12-3)', () => {
       }), 3);
       assert.deepEqual(errors, ['undo-in-progress']);
       assert.equal(deliveries, 0);
+      const evidence = openStore(f.dbPath);
+      try {
+        assert.equal(evidence.getConfig('pi.anthropic.lastServedBy'), null);
+        assert.equal(evidence.getConfig('pi.anthropic.lastServedAccountId'), null);
+      } finally { evidence.close(); }
     } finally { close(f); }
   });
 
