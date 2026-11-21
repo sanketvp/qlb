@@ -478,27 +478,53 @@ describe('qlb undo cswap --dry-run', () => {
 });
 
 describe('undo hand-back admission fence (HP-K12-3)', () => {
-  it('qlb gate anthropic started 10 ms after the fence exits 3 undo-in-progress with zero POSTs', async () => {
+  it('qlb gate after the undo fence is refused at dispatch and the command body never runs', async () => {
     const f = fixture();
     try {
       beginUndo(f);
       const store = openStore(f.dbPath);
       try { assert.equal(transition(store, 'undoing', 10).ok, true); } finally { store.close(); }
-      let posts = 0;
+      const match = resolveCommand(['gate', 'anthropic'], discoverCommands());
+      assert.ok(match);
+      assert.equal(match.command.name, 'gate');
+      let entered = 0;
+      const counted = {
+        command: { ...match.command, execute: async (args: string[], ctx: CommandContext) => { entered += 1; return match.command.execute!(args, ctx); } },
+        args: match.args,
+      };
+
+      assert.equal(await runExecutingCommand(counted, context(f)), 3);
+      assert.deepEqual(f.output, ['ERR:qlb gate: refused: undo-in-progress; run qlb undo cswap --resume']);
+      assert.equal(entered, 0);
+    } finally { close(f); }
+  });
+
+  it('a fence committed during the provider read blocks delivery', async () => {
+    const f = fixture();
+    try {
+      beginUndo(f);
+      const now = Date.now();
+      let deliveries = 0;
       const errors: string[] = [];
       assert.equal(await runPiGate('anthropic', {
-        dbPath: f.dbPath, env: context(f).env, deliver: () => assert.fail('credential delivery must not run'),
-        stderr: (line) => errors.push(line), guard: () => true,
-        admitted: () => {
-          const admissionStore = openStore(f.dbPath);
-          try { return assertAdmitted(admissionStore, 'gate'); } finally { admissionStore.close(); }
+        dbPath: f.dbPath, env: context(f).env,
+        deliver: () => { deliveries += 1; },
+        stderr: (line) => errors.push(line),
+        guard: () => true,
+        cswapProcesses: () => [],
+        prerequisites: async () => undefined,
+        now: () => now,
+        provider: {
+          read: async () => {
+            // The undo fence commits on another connection while the gate holds the credential read.
+            const fence = openStore(f.dbPath);
+            try { assert.equal(transition(fence, 'undoing', now).ok, true); } finally { fence.close(); }
+            return { token: 'fixture-gate-token', accountId: 'account-a', source: 'fixture', expiresAt: now + 10 * 60_000 };
+          },
         },
-        prerequisites: () => assert.fail('gate prerequisites must not run'),
-        provider: { read: async () => { posts += 1; throw new Error('unexpected POST'); } },
-        now: () => 20,
       }), 3);
       assert.deepEqual(errors, ['undo-in-progress']);
-      assert.equal(posts, 0);
+      assert.equal(deliveries, 0);
     } finally { close(f); }
   });
 
