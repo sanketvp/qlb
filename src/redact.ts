@@ -55,12 +55,79 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   const values = [...new Set(secrets.filter(Boolean))];
   const replacements = [...new Set(values.flatMap((secret) => [fingerprint(secret), secret]))]
     .sort((a, b) => b.length - a.length);
-  let out = replacements.length > 0
-    ? text.replace(new RegExp(replacements.map(escapeRegExp).join('|'), 'g'), REDACTED)
-    : text;
+  const known = replacements.length > 0 ? new RegExp(replacements.map(escapeRegExp).join('|'), 'g') : undefined;
+  // Whole registered secrets win before anything is decoded, so a registered
+  // credential blob is never split by the literal pass below.
+  const exact = known ? text.replace(known, REDACTED) : text;
+  // A JSON escape (\n, \t, \u0001, ...) hides a token boundary from the raw
+  // patterns, so string literals are also redacted in their decoded form.
+  // Markers already inserted are skipped, so a registered secret that is a
+  // substring of the marker cannot corrupt it.
+  const redactDecoded = (value: string): string => redactTokenPatterns(known
+    ? value.split(REDACTED).map((part) => part.replace(known, REDACTED)).join(REDACTED)
+    : value);
+  return redactTokenPatterns(redactJsonStringLiterals(exact, redactDecoded, 0));
+}
 
+function redactTokenPatterns(text: string): string {
+  let out = text;
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
+}
+
+// A decoded literal that itself holds serialized JSON is scanned once more.
+const MAX_LITERAL_DEPTH = 2;
+
+/**
+ * Yields every complete JSON string literal span with one linear scan (no
+ * regex, so no backtracking) and replaces the spans whose decoded value
+ * changes under `redact`. Unterminated text and non-JSON spans are untouched.
+ */
+function redactJsonStringLiterals(text: string, redact: (value: string) => string, depth: number): string {
+  let out = '';
+  let copied = 0;
+  let backslash = text.indexOf('\\');
+  let cursor = text.indexOf('"');
+  while (cursor !== -1) {
+    // Jump between quotes and backslashes with native searches; a backslash
+    // escapes the next character, so the literal ends at the first quote that
+    // no backslash consumed.
+    let scan = cursor + 1;
+    let escaped = false;
+    let end = text.indexOf('"', scan);
+    while (end !== -1 && backslash !== -1 && backslash < end) {
+      if (backslash >= scan) {
+        escaped = true;
+        scan = backslash + 2;
+        if (scan > end) end = text.indexOf('"', scan);
+      }
+      backslash = text.indexOf('\\', Math.max(scan, backslash + 1));
+    }
+    if (end === -1) break;
+    // A literal with no escape decodes to itself; the raw pass sees it exactly.
+    const replaced = escaped ? redactJsonStringLiteral(text.slice(cursor, end + 1), redact, depth) : undefined;
+    if (replaced !== undefined) {
+      out += text.slice(copied, cursor) + replaced;
+      copied = end + 1;
+    }
+    cursor = text.indexOf('"', end + 1);
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+
+function redactJsonStringLiteral(span: string, redact: (value: string) => string, depth: number): string | undefined {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(span);
+  } catch {
+    return undefined;
+  }
+  if (typeof decoded !== 'string') return undefined;
+  let redacted = redact(decoded);
+  if (depth + 1 < MAX_LITERAL_DEPTH && redacted.includes('"')) {
+    redacted = redactJsonStringLiterals(redacted, redact, depth + 1);
+  }
+  return redacted === decoded ? undefined : JSON.stringify(redacted);
 }
 
 const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]

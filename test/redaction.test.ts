@@ -345,6 +345,110 @@ describe('redaction', () => {
 // "redaction proof" rows fail if the named writer boundary stops redacting;
 // "non-propagation control" rows assert the writer's fixed artifact and do
 // not claim a redactor ran. Later slices add the remaining writers here.
+describe('redaction of serialized JSON string literals (TC-1)', () => {
+  const BS = '\\';
+  const longSk = 'sk-' + 'ant-' + 'q'.repeat(40);
+  const xai = 'xai-' + 'Q'.repeat(40);
+
+  it('a token after a JSON letter escape is redacted', () => {
+    const escapes = ['n', 'r', 't', 'b', 'f', 'u0001'];
+    for (const escape of escapes) {
+      for (const token of [longSk, xai, jwt]) {
+        // Built by hand: JSON.stringify never emits some of these escapes.
+        const text = `{"message":"line${BS}${escape}${token} tail"}`;
+        const result = redactSecrets(text, []);
+        assert.equal(result.includes(token.slice(0, 12)), false, `${escape} ${token.slice(0, 4)}`);
+        assert.equal(JSON.parse(result).message.includes(REDACTED), true);
+      }
+    }
+  });
+
+  it('a backslash-u-0041 escape before sk- is not a token boundary', () => {
+    const text = `{"message":"${BS}u0041${longSk}"}`;
+    assert.equal(redactSecrets(text, []), text);
+    assert.equal(redactSecrets(`A${longSk}`, []), `A${longSk}`);
+  });
+
+  it('an escape inside a token is redacted whole', () => {
+    // Raw text has sk- plus 8 characters before the escape, too short for the raw pattern.
+    const token = 'sk-' + 'abcdefgh' + 'a' + 'z'.repeat(30);
+    const escaped = 'sk-abcdefgh' + `${BS}u0061` + 'z'.repeat(30);
+    const text = `{"message":"before ${escaped} after"}`;
+    const result = redactSecrets(text, []);
+    assert.equal(JSON.parse(result).message, `before ${REDACTED} after`);
+    for (const fragment of ['sk-abcdefgh', 'z'.repeat(30), token]) assert.equal(result.includes(fragment), false, fragment);
+  });
+
+  it('Bearer with an escaped tab inside serialized JSON is redacted', () => {
+    const credential = 'A'.repeat(32);
+    const result = redactSecrets(`{"header":"Bearer${BS}t${credential}"}`, []);
+    assert.equal(result.includes(credential), false);
+    assert.equal(JSON.parse(result).header, REDACTED);
+  });
+
+  it('an escaped backslash before n does not create a token boundary', () => {
+    const text = JSON.stringify({ m: `a${BS}n${longSk}` });
+    assert.equal(redactSecrets(text, []), text);
+  });
+
+  it('redacted serialized JSON still parses and keeps its layout', () => {
+    const value = { a: 1, nested: { message: 'x\n' + longSk, keep: 'plain' }, list: ['y\t' + jwt, 2] };
+    for (const text of [JSON.stringify(value), JSON.stringify(value, null, 2)]) {
+      const result = redactSecrets(text, []);
+      const parsed = JSON.parse(result);
+      assert.deepEqual(parsed, { a: 1, nested: { message: 'x\n' + REDACTED, keep: 'plain' }, list: ['y\t' + REDACTED, 2] });
+      assert.equal(result.split('\n').length, text.split('\n').length);
+      assert.equal(result.replace(/"[^"]*\[redacted\]"/g, '""'), text.replace(/"x\\n[^"]*"|"y\\t[^"]*"/g, '""'));
+    }
+  });
+
+  // Linear-time guard: a quadratic scan of 1 MB takes minutes, so a loose bound
+  // still catches a regression while tolerating a loaded test machine.
+  it('1 MB of unterminated escaped quotes, and 1 MB of valid JSON, each redact in linear time', () => {
+    const unterminated = '"' + `${BS}"`.repeat(512 * 1024);
+    const valid = JSON.stringify(Array.from({ length: 40_000 }, (_, index) => ({ id: index, note: `n${BS}${index}` })));
+    assert.ok(unterminated.length >= 1024 * 1024 && valid.length >= 1024 * 1024);
+    for (const text of [unterminated, valid]) {
+      const started = performance.now();
+      const result = redactSecrets(text, []);
+      const elapsed = performance.now() - started;
+      assert.equal(result, text);
+      assert.ok(elapsed < 2_000, `${elapsed.toFixed(1)} ms`);
+    }
+  });
+
+  it('a registered whole credential JSON blob with an sk- field and an opaque grant is replaced whole', () => {
+    const opaque = 'opaque-grant-' + 'g'.repeat(24);
+    const blob = JSON.stringify({ claudeAiOauth: { accessToken: longSk, refreshToken: opaque } });
+    const result = redactSecrets(`backend failed on ${blob} while writing`, [blob]);
+    assert.equal(result, `backend failed on ${REDACTED} while writing`);
+    assert.equal(result.includes(opaque), false);
+  });
+
+  it('a registered secret spanning a quote in plain text is replaced whole', () => {
+    const secret = 'prefix-opaque"x' + BS + 'n' + longSk;
+    const result = redactSecrets(`error "${secret}" end`, [secret]);
+    assert.equal(result, `error "${REDACTED}" end`);
+    assert.equal(result.includes('prefix-opaque'), false);
+  });
+
+  it('a registered marker-substring secret leaves markers intact in decoded literals', () => {
+    // The exact pass turns the raw `a\nred` into `a\n[redacted]`; decoding that
+    // literal must not match `red` inside the marker again.
+    const text = `{"secret":"fixture-secret","note":"a${BS}nred"}`;
+    const result = redactSecrets(text, ['red', 'fixture-secret']);
+    assert.deepEqual(JSON.parse(result), { secret: REDACTED, note: `a\n${REDACTED}` });
+  });
+
+  it('a token inside doubly-serialized JSON is redacted', () => {
+    const inner = JSON.stringify({ t: 'a\n' + longSk });
+    const text = JSON.stringify({ x: inner });
+    const result = redactSecrets(text, []);
+    assert.equal(result.includes(longSk.slice(0, 12)), false);
+    assert.deepEqual(JSON.parse(JSON.parse(result).x), { t: 'a\n' + REDACTED });
+  });
+});
+
 describe('AC41 writer sweep', () => {
   it('uses the three synthetic fixtures in a body of at least 2 KB', () => {
     assert.equal(AC41_FIXTURES.length, 3);
