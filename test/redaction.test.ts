@@ -340,11 +340,6 @@ describe('redaction', () => {
   });
 });
 
-// AC41 (HP-H3-12). Each subtest runs one real writer with the synthetic
-// failure body and inspects what that writer actually persisted or printed.
-// "redaction proof" rows fail if the named writer boundary stops redacting;
-// "non-propagation control" rows assert the writer's fixed artifact and do
-// not claim a redactor ran. Later slices add the remaining writers here.
 describe('redaction of serialized JSON string literals (TC-1)', () => {
   const BS = '\\';
   const longSk = 'sk-' + 'ant-' + 'q'.repeat(40);
@@ -447,8 +442,44 @@ describe('redaction of serialized JSON string literals (TC-1)', () => {
     assert.equal(result.includes(longSk.slice(0, 12)), false);
     assert.deepEqual(JSON.parse(JSON.parse(result).x), { t: 'a\n' + REDACTED });
   });
+
+  it('an escaped token character in doubly-serialized JSON is redacted whole', () => {
+    const inner = `{"t":"sk-${'a'.repeat(20)}${BS}u0041${'z'.repeat(30)}"}`;
+    const result = redactSecrets(JSON.stringify({ x: inner }), []);
+    assert.equal(result.includes('sk-' + 'a'.repeat(20)), false);
+    assert.equal(result.includes('z'.repeat(30)), false);
+    assert.deepEqual(JSON.parse(JSON.parse(result).x), { t: REDACTED });
+  });
+
+  it('a slash-escaped Bearer credential in doubly-serialized JSON is redacted whole', () => {
+    const credential = `${'A'.repeat(20)}/${'B'.repeat(20)}`;
+    const inner = `{"authorization":"Bearer ${'A'.repeat(20)}${BS}/${'B'.repeat(20)}"}`;
+    const result = redactSecrets(JSON.stringify({ x: inner }), []);
+    assert.equal(result.includes(credential), false);
+    assert.equal(result.includes('B'.repeat(20)), false);
+    assert.deepEqual(JSON.parse(JSON.parse(result).x), { authorization: REDACTED });
+  });
+
+  it('a registered escaped literal secret is replaced before literal redaction', () => {
+    const secret = `head-opaque "a${BS}n${longSk}" tail-opaque`;
+    const result = redactSecrets(`error ${secret} end`, [secret]);
+    assert.equal(result, `error ${REDACTED} end`);
+  });
+
+  it('a registered credential blob is replaced after outer JSON decoding', () => {
+    const opaque = 'opaque-grant-' + 'g'.repeat(24);
+    const blob = JSON.stringify({ claudeAiOauth: { accessToken: longSk, refreshToken: opaque } });
+    const result = redactSecrets(JSON.stringify({ stderr: `claude: ${blob}` }), [blob]);
+    assert.equal(result.includes(opaque), false);
+    assert.deepEqual(JSON.parse(result), { stderr: `claude: ${REDACTED}` });
+  });
 });
 
+// AC41 (HP-H3-12). Each subtest runs one real writer with the synthetic
+// failure body and inspects what that writer actually persisted or printed.
+// "redaction proof" rows fail if the named writer boundary stops redacting;
+// "non-propagation control" rows assert the writer's fixed artifact and do
+// not claim a redactor ran. Later slices add the remaining writers here.
 describe('AC41 writer sweep', () => {
   it('uses the three synthetic fixtures in a body of at least 2 KB', () => {
     assert.equal(AC41_FIXTURES.length, 3);

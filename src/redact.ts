@@ -60,13 +60,14 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   // credential blob is never split by the literal pass below.
   const exact = known ? text.replace(known, REDACTED) : text;
   // A JSON escape (\n, \t, \u0001, ...) hides a token boundary from the raw
-  // patterns, so string literals are also redacted in their decoded form.
+  // patterns, so literals are redacted after decoding. Nested serialized JSON
+  // is decoded before its token patterns run, matching the outer pass order.
   // Markers already inserted are skipped, so a registered secret that is a
   // substring of the marker cannot corrupt it.
-  const redactDecoded = (value: string): string => redactTokenPatterns(known
+  const redactKnown = (value: string): string => known
     ? value.split(REDACTED).map((part) => part.replace(known, REDACTED)).join(REDACTED)
-    : value);
-  return redactTokenPatterns(redactJsonStringLiterals(exact, redactDecoded, 0));
+    : value;
+  return redactTokenPatterns(redactJsonStringLiterals(exact, redactKnown, 0));
 }
 
 function redactTokenPatterns(text: string): string {
@@ -127,6 +128,7 @@ function redactJsonStringLiteral(span: string, redact: (value: string) => string
   if (depth + 1 < MAX_LITERAL_DEPTH && redacted.includes('"')) {
     redacted = redactJsonStringLiterals(redacted, redact, depth + 1);
   }
+  redacted = redactTokenPatterns(redacted);
   return redacted === decoded ? undefined : JSON.stringify(redacted);
 }
 
