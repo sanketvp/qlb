@@ -1163,10 +1163,9 @@ export async function reconcileCodexRecoveryLocked(
   });
   const accountSet = (journal: CodexSwitchJournal, involved: string[] | '*' = []): Set<string> | '*' =>
     involved === '*' ? '*' : new Set([journal.from, journal.to, ...involved]);
-  /** Slot B's document, or undefined when `tolerate` and its Keychain item is missing or unreadable. */
-  const readTargetSlot = (accountId: string, tolerate: boolean): CodexAuthDocument | undefined => {
-    try { return slots.readSlot(accountId, { fresh: true }).document; }
-    catch (error) { if (tolerate) return undefined; throw error; }
+  /** Slot B's document, or undefined when its Keychain item is missing or unreadable (target-changed only). */
+  const readTargetSlot = (accountId: string): CodexAuthDocument | undefined => {
+    try { return slots.readSlot(accountId, { fresh: true }).document; } catch { return undefined; }
   };
   /**
    * Without attribution, a slot's SQLite head may only resolve recovery when its Keychain copy
@@ -1220,7 +1219,26 @@ export async function reconcileCodexRecoveryLocked(
     // attribute: the verdict fences, or is pending, without it.
     // A target-changed attempt can resolve without attribution (§3.1), so an unreadable slot B
     // only makes attribution unavailable: B then has no established head.
-    const target = attribute && live && targetRow ? readTargetSlot(journal.to, classified === 'target-changed') : undefined;
+    let target: CodexAuthDocument | undefined;
+    if (attribute && live && targetRow) {
+      if (classified === 'target-changed') {
+        target = readTargetSlot(journal.to);
+      } else {
+        // C6-20d: otherwise a missing or corrupt B is a DB/Keychain disagreement, i.e. a slot-split;
+        // any other Keychain error propagates, as on the watch tick (C6-21-R1).
+        const validated = readValidatedTargetSlot(slots, journal.to, targetRow.fingerprint ?? '');
+        if (validated.state === 'unavailable') {
+          const involved = [journal.from, journal.to];
+          if (liveIdentity && deps.store.getCodexSlot(liveIdentity)) involved.push(liveIdentity);
+          assertHeld(); held.assertHeld();
+          if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, 'slot-split', involved, options)) {
+            throw new Error('Codex switch journal changed before recovery slot-split mark');
+          }
+          return fenced('slot-split', unionRecoveryAccounts([journal.from, journal.to], journal.unresolved?.involvedAccounts ?? [], involved));
+        }
+        target = validated.document;
+      }
+    }
     if (attribute && live && targetRow && !target) {
       slotHeads.set(journal.to, null);
       verifySlotHeads(slotHeads);
@@ -1355,7 +1373,7 @@ export async function reconcileCodexRecoveryLocked(
   // An unreadable slot B makes attribution unavailable: B has no established head, and a fence
   // that needs attribution to resolve is kept as stored, with no write.
   const target = externalTargetValidation?.state === 'available' ? externalTargetValidation.document
-    : external ? undefined : attribute ? readTargetSlot(fence.to, true) : undefined;
+    : external ? undefined : attribute ? readTargetSlot(fence.to) : undefined;
   if (attribute && !target) {
     if (classified !== 'target-changed') return holdTargetSlotSplit();
     slotHeads.set(fence.to, null);
