@@ -743,7 +743,8 @@ Flags: `[--json]`.
 
 Usage: `qlb claude journal resolve --forward|--back`.
 
-Resolves an unfinished Claude switch journal (`claude-switch.json`) whose
+Resolves an unfinished Claude switch journal
+(`~/.qlb/journal/switch-anthropic.json`) whose
 owner process has died, on the operator's explicit request. Automatic
 reconciliation only ever rolls a switch back. This command is the only way to
 complete one forward.
@@ -784,12 +785,12 @@ Exit codes:
 | `journal-absent`, `journal-malformed` | both | There is no journal, or it can't be read. |
 | `journal-identity-invalid` | both | The journal names slots the slot inventory does not match. |
 | `journal-finished` | both | The journal is already closed or committed. |
-| `owner-alive` | both | The switch that wrote the journal is still running. |
-| `lock-timeout` | both | A lock wasn't acquired in time. |
+| `owner-alive` | both | The switch that wrote the journal is still running, or its owner lock is less than 5 minutes old; retry later. |
+| `lock-timeout` | both | A lock wasn't acquired in time, or a held lock was lost. |
 | `staged-unreadable` | back | The staged rollback copy of the outgoing credential is missing or can't be read. |
 | `live-unreadable` | both | Claude Code's live credential can't be read. |
 | `live-not-outgoing` | back | The live credential is neither the switch's written bytes, the staged copy, nor the outgoing account. |
-| `credentials-not-written` | forward | The switch never finished writing the target credential, so only `--back` applies. |
+| `credentials-not-written` | forward | The journal does not record that the target credential write finished (the target may already be live), so only `--back` applies. |
 | `target-unreadable` | forward | The target slot's credential can't be read. |
 | `target-lineage-missing` | forward | The live credential no longer matches the target slot's credential, for example because Claude Code renewed it. |
 | `target-invalid` | forward | The target slot has no usable `oauthAccount`. |
@@ -804,7 +805,8 @@ but before the journal was closed, both directions can refuse:
 - `--back` refuses `live-not-outgoing`, because the live credential is now a
   renewed one;
 - `--forward` refuses `target-lineage-missing`, because the live credential
-  no longer matches the target slot's copy.
+  no longer matches the target slot's copy, or `credentials-not-written` if
+  the switch died before recording that write.
 
 While the journal stays in place:
 
