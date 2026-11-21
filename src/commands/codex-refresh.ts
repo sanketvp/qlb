@@ -136,7 +136,8 @@ async function execute(args: string[], ctx: CommandContext): Promise<number> {
   const store = openStore(ctx.config.dbPath);
   try {
     const slots = new CodexSlots({ keychain: platformKeychain });
-    return runCodexRefreshCommand(args, {
+    // Await here: `finally` closes the store, and the locked consume below still uses it.
+    return await runCodexRefreshCommand(args, {
       getConfig: store.getConfig.bind(store),
       isActive: (accountId) => activeCodexSlot(store) === accountId,
       write: ctx.stdout,
