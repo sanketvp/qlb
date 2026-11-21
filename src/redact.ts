@@ -81,10 +81,11 @@ const MAX_LITERAL_DEPTH = 2;
 
 /**
  * Yields every complete JSON string literal span with one linear scan (no
- * regex, so no backtracking) and replaces the spans whose decoded value
- * changes under `redact`. Unterminated text and non-JSON spans are untouched.
+ * regex, so no backtracking). A span is replaced when known-secret
+ * replacement, nested literal scanning, or token patterns change its decoded
+ * value. Unterminated text and non-JSON spans are untouched.
  */
-function redactJsonStringLiterals(text: string, redact: (value: string) => string, depth: number): string {
+function redactJsonStringLiterals(text: string, redactKnown: (value: string) => string, depth: number): string {
   let out = '';
   let copied = 0;
   let backslash = text.indexOf('\\');
@@ -106,7 +107,7 @@ function redactJsonStringLiterals(text: string, redact: (value: string) => strin
     }
     if (end === -1) break;
     // A literal with no escape decodes to itself; the raw pass sees it exactly.
-    const replaced = escaped ? redactJsonStringLiteral(text.slice(cursor, end + 1), redact, depth) : undefined;
+    const replaced = escaped ? redactJsonStringLiteral(text.slice(cursor, end + 1), redactKnown, depth) : undefined;
     if (replaced !== undefined) {
       out += text.slice(copied, cursor) + replaced;
       copied = end + 1;
@@ -116,7 +117,7 @@ function redactJsonStringLiterals(text: string, redact: (value: string) => strin
   return copied === 0 ? text : out + text.slice(copied);
 }
 
-function redactJsonStringLiteral(span: string, redact: (value: string) => string, depth: number): string | undefined {
+function redactJsonStringLiteral(span: string, redactKnown: (value: string) => string, depth: number): string | undefined {
   let decoded: unknown;
   try {
     decoded = JSON.parse(span);
@@ -124,9 +125,9 @@ function redactJsonStringLiteral(span: string, redact: (value: string) => string
     return undefined;
   }
   if (typeof decoded !== 'string') return undefined;
-  let redacted = redact(decoded);
+  let redacted = redactKnown(decoded);
   if (depth + 1 < MAX_LITERAL_DEPTH && redacted.includes('"')) {
-    redacted = redactJsonStringLiterals(redacted, redact, depth + 1);
+    redacted = redactJsonStringLiterals(redacted, redactKnown, depth + 1);
   }
   redacted = redactTokenPatterns(redacted);
   return redacted === decoded ? undefined : JSON.stringify(redacted);
