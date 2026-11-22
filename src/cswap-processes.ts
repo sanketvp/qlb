@@ -79,7 +79,7 @@ type PythonLaunch =
   | { kind: 'not-cswap' };
 
 /**
- * Scan CPython's interpreter options the way its short-option parser does.
+ * Scan CPython interpreter options relevant to C-swap detection.
  * https://docs.python.org/3/using/cmdline.html#interface-options
  *
  * In a cluster, c ends the scan (the rest is code), m takes the rest of the
