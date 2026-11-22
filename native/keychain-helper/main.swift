@@ -35,11 +35,19 @@ private func readPayload() -> Data {
 
 private var selectedKeychain: SecKeychain?
 
-/** Opens `--keychain <path>`, if one was given. */
+/**
+ Opens an existing `--keychain <path>`, if one was given.
+ `SecKeychainOpen` can return a reference for a missing keychain, so verify its status
+ before any operation can fall back to the login keychain.
+ */
 private func selectKeychain(_ path: String?) {
     guard let path else { return }
     var keychain: SecKeychain?
     guard SecKeychainOpen(path, &keychain) == errSecSuccess, let keychain else {
+        fail("could not open requested keychain")
+    }
+    var status: SecKeychainStatus = 0
+    guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else {
         fail("could not open requested keychain")
     }
     selectedKeychain = keychain

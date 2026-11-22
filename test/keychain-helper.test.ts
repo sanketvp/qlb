@@ -892,6 +892,53 @@ sleep 8`);
     }
   });
 
+  it('fails closed for missing requested Keychains without creating login items', {
+    // Opt-in only: cleanup covers a regression that writes to the login Keychain.
+    skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
+  }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-missing-'));
+    const missing = join(dir, 'missing.keychain-db');
+    const relative = 'relative.keychain-db';
+    const binary = join(dir, 'qlb-keychain-helper');
+    const account = 'qlb';
+    const services = [
+      `qlb-test-missing-set-${randomBytes(8).toString('hex')}`,
+      `qlb-test-missing-cas-${randomBytes(8).toString('hex')}`,
+    ];
+    const helper = (args: string[], input: string) =>
+      spawnSync(binary, ['--keychain', missing, ...args], { input, encoding: 'utf8', timeout: 5_000 });
+    const relativeHelper = (args: string[]) =>
+      spawnSync(binary, ['--keychain', relative, ...args], { cwd: dir, encoding: 'utf8', timeout: 5_000 });
+    const loginItemExists = (service: string) =>
+      spawnSync('/usr/bin/security', ['find-generic-password', '-a', account, '-s', service], {
+        encoding: 'utf8', stdio: 'ignore', timeout: 5_000,
+      }).status === 0;
+    try {
+      runFile('/usr/bin/swiftc', ['-o', binary, 'native/keychain-helper/main.swift'], { stdio: 'ignore' });
+      writeFileSync(join(dir, relative), 'not a keychain');
+
+      const relativeCanary = relativeHelper(['probe-read', services[0]!, account]);
+      assert.equal(relativeCanary.status, 1);
+      assert.equal(relativeCanary.stderr, 'qlb-keychain-helper: could not open requested keychain\n');
+
+      const plain = helper(['set', services[0]!, account], randomBytes(16).toString('hex'));
+      assert.equal(plain.status, 1);
+      assert.equal(plain.stderr, 'qlb-keychain-helper: could not open requested keychain\n');
+      const cas = helper(['set', '--if-sha256', '0'.repeat(64), services[1]!, account], randomBytes(16).toString('hex'));
+      assert.equal(cas.status, 1);
+      assert.equal(cas.stderr, 'qlb-keychain-helper: could not open requested keychain\n');
+      assert.equal(existsSync(missing), false);
+      for (const service of services) assert.equal(loginItemExists(service), false);
+    } finally {
+      for (const service of services) {
+        spawnSync('/usr/bin/security', ['delete-generic-password', '-a', account, '-s', service], {
+          stdio: 'ignore', timeout: 5_000,
+        });
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('builds twice with one stable identity in a disposable Keychain', {
     skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
   }, () => {
