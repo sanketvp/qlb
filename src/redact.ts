@@ -328,7 +328,9 @@ function redactValue(
     }
     return out;
   } catch {
-    // A proxy may reject descriptor inspection. Do not fall back to property reads.
+    // A proxy may reject descriptor inspection. Do not fall back to property reads,
+    // and drop the half-built clone so a later reference to the value is redacted too.
+    memo.delete(value);
     return REDACTED;
   } finally {
     ancestors.delete(value);
@@ -361,40 +363,99 @@ function escapeControls(value: string): string {
   });
 }
 
-function errorProperty(error: Error, key: 'message' | 'name'): string {
+const UNREADABLE = '[unreadable]';
+const MAX_PROTOTYPE_STEPS = 32;
+const ERROR_PROTOTYPE: object = Error.prototype;
+const apply = Reflect.apply;
+
+interface DomExceptionGetters {
+  message: () => unknown;
+  name: () => unknown;
+}
+
+function captureDomExceptionGetters(): DomExceptionGetters | undefined {
+  if (typeof DOMException !== 'function') return undefined;
+  const message = Object.getOwnPropertyDescriptor(DOMException.prototype, 'message')?.get;
+  const name = Object.getOwnPropertyDescriptor(DOMException.prototype, 'name')?.get;
+  return message && name ? { message, name } : undefined;
+}
+
+// Captured at module load so a later replacement of the prototype getters is never run.
+const DOM_EXCEPTION_GETTERS = captureDomExceptionGetters();
+
+/**
+ * Reads a genuine DOMException's message and name through the original
+ * getters. Their brand check rejects anything else, proxies included,
+ * without running a trap.
+ */
+function domExceptionText(value: object): { message: string; name: string } | undefined {
+  if (!DOM_EXCEPTION_GETTERS) return undefined;
   try {
-    let target: object | null = error;
-    while (target !== null) {
-      const descriptor = Object.getOwnPropertyDescriptor(target, key);
-      if (descriptor) {
-        if (!('value' in descriptor)) return '[unreadable]';
-        const { value } = descriptor;
-        if (typeof value === 'string') return value;
-        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return String(value);
-        return '[unreadable]';
-      }
+    return {
+      message: String(apply(DOM_EXCEPTION_GETTERS.message, value, [])),
+      name: String(apply(DOM_EXCEPTION_GETTERS.name, value, [])),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Walks at most MAX_PROTOTYPE_STEPS prototypes in place of `instanceof Error`.
+ * Returns the chain from the value up to Error.prototype, null when the chain
+ * ends without reaching it, or undefined when the value is opaque: a cycle, a
+ * throwing trap, or a chain longer than the bound.
+ */
+function errorChain(value: object): object[] | null | undefined {
+  const chain: object[] = [];
+  let target: object | null = value;
+  try {
+    for (let step = 0; step < MAX_PROTOTYPE_STEPS; step += 1) {
+      if (target === null) return null;
+      if (chain.includes(target)) return undefined;
+      chain.push(target);
+      if (target === ERROR_PROTOTYPE) return chain;
       target = Object.getPrototypeOf(target);
     }
   } catch {
-    // Proxies can reject descriptor or prototype inspection.
+    // Proxies can reject prototype inspection.
   }
-  return '[unreadable]';
+  return undefined;
+}
+
+function errorProperty(chain: readonly object[], key: 'message' | 'name'): string {
+  try {
+    for (const target of chain) {
+      const descriptor = Object.getOwnPropertyDescriptor(target, key);
+      if (!descriptor) continue;
+      if (!('value' in descriptor)) return UNREADABLE;
+      const { value } = descriptor;
+      if (typeof value === 'string') return value;
+      if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return String(value);
+      return UNREADABLE;
+    }
+  } catch {
+    // Proxies can reject descriptor inspection.
+  }
+  return UNREADABLE;
+}
+
+function describeError(error: unknown, secrets: readonly string[]): string {
+  if (typeof error === 'string') return redactSecrets(error, secrets);
+  if (error === null || (typeof error !== 'object' && typeof error !== 'function')) return redactJson(error, secrets);
+  const domException = domExceptionText(error);
+  if (domException) return redactSecrets(domException.message || domException.name, secrets);
+  const chain = errorChain(error);
+  if (chain === undefined) return UNREADABLE;
+  if (chain === null) return redactJson(error, secrets);
+  return redactSecrets(errorProperty(chain, 'message') || errorProperty(chain, 'name'), secrets);
 }
 
 /** Returns a safe, single-line error description for persisted error columns and stderr. */
 export function redactError(error: unknown, secrets: readonly string[]): string {
   try {
-    const value = error instanceof Error
-      ? (() => {
-          const message = errorProperty(error, 'message');
-          const name = errorProperty(error, 'name');
-          return redactSecrets(message || name, secrets);
-        })()
-      : typeof error === 'string'
-        ? redactSecrets(error, secrets)
-        : redactJson(error, secrets);
-    return escapeControls(value);
+    return escapeControls(describeError(error, secrets));
   } catch {
-    return '[unreadable]';
+    return UNREADABLE;
   }
 }

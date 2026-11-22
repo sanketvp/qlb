@@ -765,3 +765,68 @@ describe('AC41 writer sweep', () => {
     assert.deepEqual([...covered].sort((left, right) => left - right), Array.from({ length: 23 }, (_, index) => index + 1));
   });
 });
+
+describe('proxy-safe error classification (TC-14, A12b)', () => {
+  it('a proxy with a cyclic prototype is walked a bounded number of times', () => {
+    let steps = 0;
+    // The escape hatch keeps the unbounded walk on main from hanging the suite.
+    const cyclic: object = new Proxy({}, {
+      getPrototypeOf() {
+        steps += 1;
+        if (steps > 1000) throw new Error('unbounded prototype walk');
+        return cyclic;
+      },
+    });
+    assert.equal(redactError(cyclic, []), '[unreadable]');
+    assert.ok(steps <= 32, `prototype walk took ${steps} steps`);
+
+    steps = 0;
+    const handler: ProxyHandler<object> = {
+      getPrototypeOf() {
+        steps += 1;
+        if (steps > 1000) throw new Error('unbounded prototype walk');
+        return new Proxy({}, handler);
+      },
+    };
+    assert.equal(redactError(new Proxy({}, handler), []), '[unreadable]');
+    assert.ok(steps <= 32, `endless prototype chain took ${steps} steps`);
+  });
+
+  it('a replaced DOMException message getter is never run', () => {
+    const original = Object.getOwnPropertyDescriptor(DOMException.prototype, 'message')!;
+    let ran = false;
+    Object.defineProperty(DOMException.prototype, 'message', {
+      configurable: true,
+      get() { ran = true; return 'replaced'; },
+    });
+    try {
+      assert.equal(redactError(new DOMException('request timed out', 'TimeoutError'), []), 'request timed out');
+      assert.equal(ran, false);
+    } finally {
+      Object.defineProperty(DOMException.prototype, 'message', original);
+    }
+  });
+
+  it('a DOMException with an empty message falls back to its name', () => {
+    assert.equal(redactError(new DOMException('', 'TimeoutError'), []), 'TimeoutError');
+  });
+
+  it('a DOMException with a token-shaped message is redacted', () => {
+    const token = 'sk-' + 'ant-' + 'q'.repeat(40);
+    const result = redactError(new DOMException(`aborted with ${token}`, 'AbortError'), []);
+    assert.equal(result.includes(token), false);
+    assert.equal(result, 'aborted with [redacted]');
+  });
+
+  it('{a: p, b: p} with a rejecting proxy array redacts both to [redacted]', () => {
+    // The length reported here passes the safe-integer check but makes
+    // `out.length = length` throw after the memo entry was created.
+    const rejecting = new Proxy<unknown[]>([], {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') return { value: 2 ** 40, writable: true, enumerable: false, configurable: false };
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    assert.deepEqual(JSON.parse(redactJson({ a: rejecting, b: rejecting }, [])), { a: '[redacted]', b: '[redacted]' });
+  });
+});
