@@ -8,7 +8,7 @@ Guide for coding agents working in this repo. Start with `README.md` (what QLB i
   - `npm run build`: cleans the registry output, compiles `src/` to `dist/`, writes the build stamp.
   - `npm run typecheck:pi`: typechecks this package, then `extensions/qlb-pi` against the installed Pi.
   - `npm test`: rebuilds, compiles `tsconfig.test.json` to `dist-test/`, and runs every `dist-test/test/*.test.js` with `QLB_TEST_MODE=1` and a temporary `QLB_HOME`.
-  - `npm run build:helper`: builds the signed macOS Keychain helper in `native/keychain-helper/` (needed for `release install`, not for tests; its default run requires exact owner approval).
+  - `npm run build:helper`: builds the signed macOS Keychain helper in `native/keychain-helper/` (needed for `release install`, not for tests; requires exact owner approval).
 - One file: `export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"`, `npm run build && node scripts/clean-registry-output.cjs dist-test/src && npx tsc -p tsconfig.test.json`, then `node --test dist-test/test/<name>.test.js`.
 - `QLB_TEST_MODE=1` swaps in the in-process credential backend (`src/credential-backends.ts`) and points `qlbHomeDir()` (`src/home.ts`) at `QLB_HOME`. Tests must never touch the live `~/.qlb`, `~/.pi/agent` or the Keychain.
 - CI (`.github/workflows/ci.yml`) pins the Pi it installs (`PI_VERSION`) and requires `skipped 0` for `dist-test/test/qlb-pi-*.test.js` and `dist-test/test/keychain-client.test.js`. Keep those files runnable on that Pi.
@@ -35,7 +35,7 @@ These change the owner's live machine. Never run them from an agent session unle
 - `qlb migrate stage|rehearse|commit|rollback|resume` and `qlb pi migrate|rollback`;
 - LaunchAgent edits, and anything that writes `~/.qlb/qlb.db` or a Keychain item.
 
-From an agent session, run `qlb` or `node dist/cli.js` only with `QLB_TEST_MODE=1` and a temporary `QLB_HOME`, unless the owner has approved that exact live-state run. That approval is required for every live-state command, including `qlb doctor`, `qlb report cutover`, migrations with temporary input paths, and default `npm run build:helper`. Agents never run `qlb gate` or `qlb token`: they print a live credential, and S30 (`docs/CREDENTIAL-SAFETY.md`) reserves them for the Pi extension.
+From an agent session, run `qlb` or `node dist/cli.js` only with `QLB_TEST_MODE=1` and a temporary `QLB_HOME`, unless the owner has approved that exact live-state run. That approval is required for every live-state command, including `qlb doctor`, `qlb report cutover`, migrations with temporary input paths, and `npm run build:helper`. Agents never run `qlb gate` or `qlb token`: they print a live credential, and S30 (`docs/CREDENTIAL-SAFETY.md`) reserves them for the Pi extension.
 
 ## Changes and pull requests
 
