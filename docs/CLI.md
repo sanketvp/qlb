@@ -116,6 +116,8 @@ Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EX
 
 Run QLB's Anthropic autoswitch loop. `--once` performs one live tick; `--dry-run` makes a decision without mutating state or switching credentials. The normal loop refuses to run while an active lifecycle drill is in progress.
 
+A dry run never creates a store. When the resolved store path (`QLB_DB_PATH`, `--db-path`, `config.json`, or the default `~/.qlb/qlb.db`) does not exist, `qlb auto --dry-run` prints `qlb auto: refused: no-store` to stderr, prints nothing to stdout (with or without `--json`), and exits `3` without opening SQLite or making a usage request. A store path that exists but cannot be read, or a file that is not a valid store, still exits `1`.
+
 On the verified Gate 5 host, `pi-pool` is `QLB_OWNED` and this loop is the Pi auto-switcher. It runs under the per-user LaunchAgent `com.modus.qlb-auto` (`~/Library/LaunchAgents/com.modus.qlb-auto.plist`). `qlb auto install-agent` writes that plist (mode `0600`) and does not call `launchctl`. The plist runs the release CLI:
 
 ```text
