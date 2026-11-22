@@ -125,6 +125,25 @@ describe('qlb-auto refresh lineage', () => {
     }
   });
 
+  it('writes no post row when an automatic consume adopts a stashed successor without a refresh request', async () => {
+    const h = harness();
+    try {
+      let sent = 0;
+      const successor = document(NOW + 3_600_000, 'fixture-access-a5', 'fixture-refresh-a5');
+      const result = await consumeCodexSlot({
+        accountId: A, snapshot: h.a0, trigger: 'scheduled',
+        slots: { ...h.slots, findStashedSuccessor: async () => ({ document: successor, stashId: 'fixture-stash' }) } as never,
+        store: { dbPath: h.store.dbPath }, now: () => NOW, holders: async () => [], by: 'qlb-auto',
+        transport: async () => { sent += 1; throw new Error('adoption must not send a refresh request'); },
+      });
+      assert.equal(result.status, 'fresh');
+      assert.equal(sent, 0);
+      assert.deepEqual(h.lineage(), [{ cause: 'stash-adopt', by: 'qlb-auto' }]);
+    } finally {
+      h.close();
+    }
+  });
+
   it('returns the same lineage chains whichever caller wrote the row', async () => {
     const chains: unknown[] = [];
     for (const by of ['qlb-auto', undefined] as const) {
