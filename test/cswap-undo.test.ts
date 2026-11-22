@@ -10,6 +10,7 @@ import { credentialWithRefresh } from './support/claude-fixtures';
 
 import { defaultHeldLocks, isQlbProcessCommand, restoreCswap, runUndoCswapCommand, type TerminalHandBack } from '../src/commands/undo-cswap';
 import { undoIncompleteCheck } from '../src/checks/undo-incomplete';
+import { lifecyclePhase } from '../src/lifecycle-read';
 import { runAutoCommand } from '../src/commands/auto';
 import { defaultConfig } from '../src/config';
 import { doctorQlb } from '../src/diagnostics';
@@ -1411,7 +1412,7 @@ describe('qlb undo cswap doctor diagnostic', () => {
     } finally { close(f); }
   });
 
-  it('reports a restore-pending rollback with the resume command', () => {
+  it('undo:incomplete reports restore-pending from the stored lifecycle note', () => {
     const f = fixture();
     try {
       beginUndo(f);
@@ -1420,7 +1421,10 @@ describe('qlb undo cswap doctor diagnostic', () => {
         assert.equal(transition(store, 'undoing', 123).ok, true);
         assert.equal(transition(store, 'rolled-back', 124, CSWAP_RESTORE_PENDING).ok, true);
       } finally { store.close(); }
-      assert.deepEqual(undoIncompleteCheck(f.dbPath, { available: true, phase: 'rolled-back', restorePending: true }), {
+      // The production phase read decodes the stored note; nothing is hand-built.
+      const read = lifecyclePhase(f.dbPath);
+      assert.deepEqual(read, { available: true, phase: 'rolled-back', restorePending: true });
+      assert.deepEqual(undoIncompleteCheck(f.dbPath, read), {
         name: 'undo:incomplete',
         level: 'FAIL',
         message: 'cswap-restore-pending: run qlb undo cswap --resume',
