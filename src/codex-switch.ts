@@ -1228,8 +1228,8 @@ export async function reconcileCodexRecoveryLocked(
         // any other Keychain error propagates, as on the watch tick (C6-21-R1).
         const validated = readValidatedTargetSlot(slots, journal.to, targetRow.fingerprint ?? '');
         if (validated.state === 'unavailable') {
-          const involved = [journal.from, journal.to];
-          if (liveIdentity && deps.store.getCodexSlot(liveIdentity)) involved.push(liveIdentity);
+          const involved = liveIdentity === null ? '*'
+            : [...new Set([journal.from, journal.to, ...(deps.store.getCodexSlot(liveIdentity) ? [liveIdentity] : [])])].sort();
           assertHeld(); held.assertHeld();
           if (!markCodexSwitchJournalUnresolved(held, journal.attemptId, 'slot-split', involved, options)) {
             throw new Error('Codex switch journal changed before recovery slot-split mark');

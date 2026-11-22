@@ -3357,6 +3357,22 @@ describe('reconcileCodexRecovery — C6-20', () => {
     } finally { close(h); }
   });
 
+  it('journal recovery with an unreadable B fences every account when the live login has no identity (C6-20d)', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = install(h);
+      const noIdentity = freshenDocument(1_700_100_000_000, 'no-identity');
+      codexWrites(h, { ...noIdentity, tokens: { ...noIdentity.tokens, id_token: freshenJwt({}) } });
+      breakSlot(h, 'b:account');
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'), accounts: '*' });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: '*' });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
   it('journal recovery with an unreadable B after a recorded adoption fences slot-split (C6-20d)', async () => {
     for (const [name, damage] of Object.entries(damageB)) {
       const h = switchHarness();
