@@ -1,6 +1,7 @@
 # AGENTS.md — QLB
 
 Guide for coding agents working in this repo. Start with `README.md` (what QLB is and how it is run), `docs/ARCHITECTURE.md` (the pipeline and credential ownership) and `docs/CREDENTIAL-SAFETY.md` (the rules credential code must keep). `CONTRIBUTING.md` holds the development setup.
+Check every proposed change against `STRATEGY.md`, QLB's product vision and strategy.
 
 ## Build and test
 
