@@ -91,6 +91,8 @@ describe('TB-A2: Pi provider rollback drill', () => {
 
   it('(c1) xai, first rollback with no usable source: no-restore-source, claim kept, intent journaled; recovery hands back', async () => {
     await cutOver(fx, 'xai');
+    const service = qlbKeychainService('xai', 'default');
+    const qlbItem = platformKeychain.getSync(service, QLB_KEYCHAIN_ACCOUNT);
     dropQlbRestoreSources(fx, 'xai');
 
     const refused = refusal(() => fx.migration('xai').rollback());
@@ -100,7 +102,14 @@ describe('TB-A2: Pi provider rollback drill', () => {
     assertPlaceholder('xai');
     const after = statusJson(fx.migration('xai'));
     assert.equal(detail(after).intent, 'rollback', 'S1 journaled the intent before refusing');
-    assert.notEqual((await gate(fx, 'xai')).code, 0, 'the gate cannot serve xai now: Pi on xai is down');
+
+    platformKeychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, qlbItem);
+    expireQlbGrant('xai');
+    const served = await gate(fx, 'xai');
+    assert.equal(served.code, 1);
+    assert.deepEqual(served.stderr, ['credential-unavailable']);
+    assert.deepEqual(fx.tokenCalls, [], 'no refresh request is sent');
+    dropQlbRestoreSources(fx, 'xai');
 
     // Runbook recovery: a native Pi /login, then resume.
     const relogin = nativeGrant('xai', 'relogin');
@@ -135,10 +144,9 @@ describe('TB-A2: Pi provider rollback drill', () => {
     assert.equal(after.intent, 'rollback');
     assert.ok(after.rollbackDecision, 'S2 journaled its decision');
 
-    // Even with QLB's item back, the markers stop the gate from refreshing
-    // (single-consume refuses generic-ownership-marker; the gate reports its
-    // fixed code credential-unavailable). TB-A1a shows the same near-expiry
-    // grant refreshes when no marker is present.
+    // S2's generation fence and the rollback markers prevent a refresh even
+    // with QLB's item restored. TB-A1a shows the same near-expiry grant
+    // refreshes when no marker or fence is present.
     platformKeychain.setSync(service, QLB_KEYCHAIN_ACCOUNT, qlbItem);
     expireQlbGrant('xai');
     const served = await gate(fx, 'xai');
@@ -255,6 +263,7 @@ describe('TB-A2: Pi provider rollback drill', () => {
     migration.rollback();
     assert.throws(() => platformKeychain.getSync(service, QLB_KEYCHAIN_ACCOUNT), 'pre-commit rollback deleted it');
     assert.equal(existsSync(piAuthBackupPath(fx.authJsonPath, 'xai')), false);
+    assertAnthropicUntouched();
   });
 
   it('builds every runbook rollback end state from the shared scenarios', async () => {
@@ -262,7 +271,28 @@ describe('TB-A2: Pi provider rollback drill', () => {
       fx.close();
       fx = createDrillFixture();
       const status = await scenario.run(fx);
-      assert.equal(typeof status.state, 'string', scenario.name);
+      const stateDetail = detail(status);
+      switch (scenario.branch) {
+        case 'post-commit-single-grant':
+          assert.equal(status.state, 'NATIVE', scenario.name);
+          assert.equal(status.resumeAction, 'nothing to roll back', scenario.name);
+          assert.equal(typeof (stateDetail.lastRollback as { cleanedAt?: unknown })?.cleanedAt, 'number', scenario.name);
+          assert.equal(stateDetail.handback, undefined, scenario.name);
+          break;
+        case 'post-commit-openrouter':
+          assert.equal(status.state, 'VALIDATED', scenario.name);
+          assert.equal(stateDetail.rolledBackFrom, 'post-commit', scenario.name);
+          assert.equal(status.resumeAction, 'noop', scenario.name);
+          break;
+        case 'pre-commit':
+          assert.equal(status.state, 'NATIVE', scenario.name);
+          assert.equal(stateDetail.rolledBackFrom, 'pre-commit', scenario.name);
+          break;
+        case 'refusal':
+          assert.equal(stateDetail.intent, 'rollback', scenario.name);
+          assert.ok(stateDetail.rollbackDecision, scenario.name);
+          break;
+      }
       assertAnthropicUntouched();
     }
   });

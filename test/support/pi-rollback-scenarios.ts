@@ -3,6 +3,7 @@
 // the real `status()` objects each rollback branch returns.
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -88,7 +89,9 @@ export function expireQlbGrant(provider: OAuthProvider): void {
  * OAuth token endpoints. Call `close()` in `afterEach`.
  */
 export function createDrillFixture(): DrillFixture {
-  if (process.env.QLB_TEST_MODE !== '1') throw new Error('the drill must run with QLB_TEST_MODE=1');
+  if (process.env.QLB_TEST_MODE !== '1' || !process.env.QLB_HOME) {
+    throw new Error('the drill must run with QLB_TEST_MODE=1 and QLB_HOME set');
+  }
   const root = mkdtempSync(join(tmpdir(), 'qlb-tb-drill-'));
   const agentDir = join(root, '.pi', 'agent');
   mkdirSync(agentDir, { recursive: true, mode: 0o700 });
@@ -230,7 +233,8 @@ export const ROLLBACK_SCENARIOS: readonly RollbackScenario[] = [
       const migration = fx.migration('xai', {
         afterStep: (point) => { if (point === 'S2') writeAuthEntry(fx, 'xai', PLACEHOLDER); },
       });
-      refusal(() => migration.rollback());
+      const rejected = refusal(() => migration.rollback());
+      assert.equal(rejected.message, 'native-entry-missing');
       return statusJson(fx.migration('xai'));
     },
   },
