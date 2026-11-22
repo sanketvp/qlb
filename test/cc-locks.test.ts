@@ -226,7 +226,7 @@ describe('vendored Python probe on an injected PATH', () => {
         '[ "$#" -eq 3 ] && [ "$1" = python ] && [ "$2" = find ] && [ "$3" = ">=3.12" ] || exit 2',
         `echo ${JSON.stringify(python313)}`,
       ].join('\n'));
-      assert.deepEqual(findVendoredPython(bin, FAST_PROBE_MS), { python: python313 });
+      assert.deepEqual(findVendoredPython(bin), { python: python313 });
     });
   });
 
