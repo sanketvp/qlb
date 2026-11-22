@@ -103,6 +103,7 @@ function scanPythonLaunch(args: string, strict: boolean): PythonLaunch {
     const token = /^\S+/.exec(rest)?.[0];
     if (token === undefined || token === '-' || !token.startsWith('-')) return { kind: 'script', rest };
     takeToken();
+    // Keep scanning after '--' so SIGTERM targets remain no wider than main.
     if (token.startsWith('--')) {
       if (token === '--check-hash-based-pycs') takeToken();
       continue;
