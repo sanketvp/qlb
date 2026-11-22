@@ -5,7 +5,7 @@ Guide for coding agents working in this repo. Start with `README.md` (what QLB i
 ## Build and test
 
 - Node.js 22 or newer. `npm ci`, then:
-  - `npm run build`: cleans the registry output, compiles `src/` to `dist/`, verifies discovered doctor checks against `src/doctor-registry-manifest.ts`, then writes the build stamp. Keep that manifest in sync when adding, renaming, or removing a doctor check.
+  - `npm run build`: cleans the registry output, compiles `src/` to `dist/`, verifies discovered doctor checks against `test/wiring/checks.d`, then writes the build stamp. Keep that manifest in sync when adding, renaming, or removing a doctor check; a non-empty file contains its accepted dynamic-result prefix.
   - `npm run typecheck:pi`: typechecks this package, then `extensions/qlb-pi` against the installed Pi.
   - `npm test`: rebuilds, compiles `tsconfig.test.json` to `dist-test/`, and runs every `dist-test/test/*.test.js` with `QLB_TEST_MODE=1` and a temporary `QLB_HOME`.
   - `npm run build:helper`: builds the signed macOS Keychain helper in `native/keychain-helper/` (needed for `release install`, not for tests; requires exact owner approval).
@@ -17,7 +17,7 @@ Guide for coding agents working in this repo. Start with `README.md` (what QLB i
 
 ## Module map
 
-- `src/cli.ts` → `src/app.ts`: argument parsing and the older commands. `src/registry.ts` discovers the newer commands in `src/commands/` and the doctor checks in `src/checks/` (the build clears their `dist/` output first, so a removed module never lingers); keep those doctor checks synchronized with `src/doctor-registry-manifest.ts`.
+- `src/cli.ts` → `src/app.ts`: argument parsing and the older commands. `src/registry.ts` discovers the newer commands in `src/commands/` and the doctor checks in `src/checks/` (the build clears their `dist/` output first, so a removed module never lingers); keep those doctor checks synchronized with `test/wiring/checks.d`.
 - `src/adapters/`: built-in provider adapters (the `Adapter` interface is in `src/types.ts`; register in `src/adapters/index.ts`).
 - `src/store.ts`: the SQLite store. `src/lifecycle.ts`: the cutover lifecycle row and `PHASE_RULES`, the admission table for every lifecycle-governed command (including `qlb gate`).
 - `src/migration.ts`: the generic `qlb migrate` state machine (NATIVE → MIRRORED → VALIDATED → QLB_OWNED, plus rollback and resume). `src/pi-migrate.ts`: the separate `qlb pi migrate` path; the two refuse each other.
