@@ -62,3 +62,60 @@ Coding agents may run QLB's read-only commands (status, why, doctor, export) on 
 
 A change aligns when it keeps the operator's work moving on the headroom they already have, decides from fresh provider readings, tells the operator whenever it switches provider or model, keeps every crash point recoverable to a working login, and arrives as one tested, proven, reviewed slice.
 A change should be resisted when it lets a non-provider number declare capacity, adds a ledger or reservation that must settle, introduces a second refresher or an unproven credential writer, switches provider silently, turns an unknown into a permission, leaks a secret into any output, or widens QLB beyond one operator's own accounts.
+
+## Purpose
+
+People who pay for several AI accounts keep hitting one account's limit in the middle of work and have to switch logins by hand. The hard part is knowing which account really has room: every provider reports usage differently, the numbers go stale within minutes, and switching the wrong way can break a login that was working.
+
+## Positioning
+
+qlb switches accounts only on fresh, direct provider readings and never takes over a credential it hasn't proven it can hand back, so switching never rests on a guess and never leaves you without a working login.
+
+## Users
+
+**Primary:** Any developer with two or more AI subscriptions - they're hiring qlb to keep working when one account hits its limit, without tracking usage or switching logins by hand. qlb works for them out of the box in read-only mode on the logins they already have; the staged takeover of a login is an opt-in step for those who want it.
+
+## Boundaries
+
+- Team or shared account pools.
+- Windows parity with macOS and Linux.
+- Billing or cost accounting.
+- Harness add-ons (like a Claude Code status hook) before operators ask for them.
+
+_Resist a change when:_ it breaks a rule in the Vision section.
+
+## Key metrics
+
+- **Work stopped by quota** - requests per week where no account and no allowed fallback had room; should trend to zero. Measured from `decisions` rows whose `snapshot_json` error is `EXHAUSTED`.
+- **Forced re-logins** - times per week the operator logged in by hand. Measured from `relogin_events` rows (kinds such as `identity-replaced` and `wiped`).
+- **Fresh-reading coverage** - share of routing decisions made on a provider reading at most 5 minutes old. Measured from `decisions.snapshot_json` (`UNAVAILABLE` errors and each bucket's `ageMs`).
+
+## Tracks
+
+### Back-fill Lean proofs
+
+Model the state machines that already ship (cutover and switch journals, leases, lifecycles) in Lean and tie each one to the code with a differential check.
+
+_Why it serves the approach:_ the Vision now requires a proof for every stateful change, and "proven it can hand back" is only true once the existing machines are proven too.
+
+### Codex multi-account switching goes live
+
+Take Codex multi-account switching from shipped-dark to live through its gated stages.
+
+_Why it serves the approach:_ it brings fresh-reading routing and safe custody to the second provider the operator works in every day.
+
+### Visible cross-provider fallback
+
+When no account of the requested provider has room, an opt-in switch to another provider or model that the operator always sees.
+
+_Why it serves the approach:_ work keeps moving without a silent switch or a guess.
+
+### Linux VPS as a first-class home
+
+Credential custody and routing on a Linux VPS to the same standard as macOS.
+
+_Why it serves the approach:_ the Vision names Linux first-class, and the operator's work runs there as well as on the laptop.
+
+## Brand
+
+**One-liner:** Never babysit your AI logins again.
