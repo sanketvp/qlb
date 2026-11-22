@@ -25,7 +25,7 @@ export interface KimiCodingUsageProbeDeps extends KimiCodingUsageProbeOptions {
   access?: string;
   /** Test seam; production uses the platform Keychain. */
   keychain?: KeychainBackend;
-  /** Test seam; production reads the configured Pi auth.json. */
+  /** Required for `pi-auth`; the CLI supplies config.piAuthJsonPath. */
   authJsonPath?: string;
   fetchFn?: FetchFn;
 }

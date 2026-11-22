@@ -36,7 +36,11 @@ describe('usage probe command', () => {
     const errors: string[] = [];
     const code = await usageProbeCommand.execute!(
       ['kimi-coding'],
-      { stdout: () => {}, stderr: (line: string) => errors.push(line) } as never,
+      {
+        stdout: () => {},
+        stderr: (line: string) => errors.push(line),
+        config: { piAuthJsonPath: join(tmpdir(), 'qlb-probe-unused', 'auth.json') },
+      } as never,
     );
 
     assert.equal(code, 1);
@@ -136,7 +140,7 @@ describe('usage probe command', () => {
     const unreadable = join(mkdtempSync(join(tmpdir(), 'qlb-probe-')), 'auth.json');
     writeFileSync(unreadable, '{not json');
 
-    for (const authJsonPath of [placeholder, missing, unreadable, join(tmpdir(), 'qlb-probe-absent', 'auth.json')]) {
+    for (const authJsonPath of [missing, unreadable, join(tmpdir(), 'qlb-probe-absent', 'auth.json')]) {
       const result = await probeKimiCodingUsage({ credentialSource: 'pi-auth', authJsonPath, fetchFn });
       assert.deepEqual(result, { status: null, source: 'unknown', keys: [] });
     }
