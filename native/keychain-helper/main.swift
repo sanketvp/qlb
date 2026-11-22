@@ -38,12 +38,12 @@ private var selectedKeychain: SecKeychain?
 /** Opens `--keychain <path>`, if one was given. */
 private func selectKeychain(_ path: String?) {
     guard let path else { return }
-    let fileManager = FileManager.default
-    guard fileManager.fileExists(atPath: path), fileManager.isReadableFile(atPath: path) else {
-        fail("could not open requested keychain")
-    }
     var keychain: SecKeychain?
     guard SecKeychainOpen(path, &keychain) == errSecSuccess, let keychain else {
+        fail("could not open requested keychain")
+    }
+    var status: SecKeychainStatus = 0
+    guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else {
         fail("could not open requested keychain")
     }
     selectedKeychain = keychain

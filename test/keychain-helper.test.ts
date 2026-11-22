@@ -892,15 +892,14 @@ sleep 8`);
     }
   });
 
-  it('fails closed for nonempty writes to a missing requested Keychain without creating login items', {
-    // Opt-in only: the only login-keychain access is a metadata-only absence check.
+  it('fails closed for missing requested Keychains without creating login items', {
+    // Opt-in only: cleanup covers a regression that writes to the login Keychain.
     skip: process.env.QLB_REAL_KEYCHAIN_TESTS !== '1' || !existsSync('/usr/bin/swiftc'),
   }, () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlb-keychain-helper-missing-'));
-    const keychain = join(dir, 't.keychain-db');
     const missing = join(dir, 'missing.keychain-db');
+    const relative = 'relative.keychain-db';
     const binary = join(dir, 'qlb-keychain-helper');
-    const password = randomBytes(24).toString('hex');
     const account = 'qlb';
     const services = [
       `qlb-test-missing-set-${randomBytes(8).toString('hex')}`,
@@ -908,14 +907,19 @@ sleep 8`);
     ];
     const helper = (args: string[], input: string) =>
       spawnSync(binary, ['--keychain', missing, ...args], { input, encoding: 'utf8', timeout: 5_000 });
+    const relativeHelper = (args: string[]) =>
+      spawnSync(binary, ['--keychain', relative, ...args], { cwd: dir, encoding: 'utf8', timeout: 5_000 });
     const loginItemExists = (service: string) =>
       spawnSync('/usr/bin/security', ['find-generic-password', '-a', account, '-s', service], {
         encoding: 'utf8', stdio: 'ignore', timeout: 5_000,
       }).status === 0;
     try {
       runFile('/usr/bin/swiftc', ['-o', binary, 'native/keychain-helper/main.swift'], { stdio: 'ignore' });
-      runFile('/usr/bin/security', ['create-keychain', '-p', password, keychain], { stdio: 'ignore' });
-      runFile('/usr/bin/security', ['unlock-keychain', '-p', password, keychain], { stdio: 'ignore' });
+      writeFileSync(join(dir, relative), 'not a keychain');
+
+      const relativeCanary = relativeHelper(['probe-read', services[0]!, account]);
+      assert.equal(relativeCanary.status, 1);
+      assert.equal(relativeCanary.stderr, 'qlb-keychain-helper: could not open requested keychain\n');
 
       const plain = helper(['set', services[0]!, account], randomBytes(16).toString('hex'));
       assert.equal(plain.status, 1);
@@ -926,7 +930,11 @@ sleep 8`);
       assert.equal(existsSync(missing), false);
       for (const service of services) assert.equal(loginItemExists(service), false);
     } finally {
-      try { runFile('/usr/bin/security', ['delete-keychain', keychain], { stdio: 'ignore' }); } catch { /* cleanup */ }
+      for (const service of services) {
+        spawnSync('/usr/bin/security', ['delete-generic-password', '-a', account, '-s', service], {
+          stdio: 'ignore', timeout: 5_000,
+        });
+      }
       rmSync(dir, { recursive: true, force: true });
     }
   });
