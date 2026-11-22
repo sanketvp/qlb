@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
-import { beginCutover } from '../src/lifecycle';
+import { beginCutover, transition } from '../src/lifecycle';
 import { createSingleGrantMigration, createStaticKeyMigration, type Migration } from '../src/migration';
 import { runPiGate } from '../src/pi-gate';
 import { openStore, setStoreForTests, type Store } from '../src/store';
@@ -35,16 +35,23 @@ interface Fixture {
   authJsonPath: string;
   ownerPath: string;
   dbPath: string;
+  expires: number;
   store: Store;
 }
 
 let fixture: Fixture;
 let realFetch: typeof fetch;
 let tokenCalls: string[];
+let previousQlbHome: string | undefined;
 
 function anthropicEntryText(ownerPath: string): string {
   const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { providers?: Record<string, unknown> };
   return JSON.stringify(owner.providers?.anthropic);
+}
+
+function anthropicAuthEntryText(authJsonPath: string): string {
+  const auth = JSON.parse(readFileSync(authJsonPath, 'utf8')) as Record<string, unknown>;
+  return JSON.stringify(auth.anthropic);
 }
 
 function nativeGrant(provider: 'xai' | 'kimi-coding', expires: number) {
@@ -60,15 +67,19 @@ function migrationFor(provider: Provider): Migration {
 async function cutOver(provider: Provider): Promise<void> {
   const migration = migrationFor(provider);
   const anthropic = anthropicEntryText(fixture.ownerPath);
+  const anthropicAuth = anthropicAuthEntryText(fixture.authJsonPath);
   assert.equal(migration.stage().state, 'MIRRORED', `${provider} stage`);
   assert.equal(anthropicEntryText(fixture.ownerPath), anthropic, `${provider} stage left Anthropic intact`);
+  assert.equal(anthropicAuthEntryText(fixture.authJsonPath), anthropicAuth, `${provider} stage left Pi Anthropic intact`);
   assert.equal((await migration.rehearse(async () => ({ ok: true }))).state, 'VALIDATED', `${provider} rehearse`);
   assert.equal(anthropicEntryText(fixture.ownerPath), anthropic, `${provider} rehearse left Anthropic intact`);
+  assert.equal(anthropicAuthEntryText(fixture.authJsonPath), anthropicAuth, `${provider} rehearse left Pi Anthropic intact`);
   assert.equal(migration.commit().state, 'QLB_OWNED', `${provider} commit`);
   assert.equal(anthropicEntryText(fixture.ownerPath), anthropic, `${provider} commit left Anthropic intact`);
+  assert.equal(anthropicAuthEntryText(fixture.authJsonPath), anthropicAuth, `${provider} commit left Pi Anthropic intact`);
 }
 
-async function gate(provider: Provider, now?: () => number): Promise<{ code: number; delivered: Record<string, unknown>[]; stderr: string[] }> {
+async function gate(provider: Provider): Promise<{ code: number; delivered: Record<string, unknown>[]; stderr: string[] }> {
   const delivered: Record<string, unknown>[] = [];
   const stderr: string[] = [];
   const code = await runPiGate(provider, {
@@ -79,7 +90,6 @@ async function gate(provider: Provider, now?: () => number): Promise<{ code: num
     guard: () => true,
     piAgentDir: fixture.agentDir,
     cswapProcesses: () => [],
-    ...(now ? { now } : {}),
   });
   return { code, delivered, stderr };
 }
@@ -92,6 +102,8 @@ function lastServedAt(provider: Provider): number | undefined {
 beforeEach(() => {
   assert.equal(process.env.QLB_TEST_MODE, '1', 'the drill must run on the QLB_TEST_MODE in-process backend');
   const root = mkdtempSync(join(tmpdir(), 'qlb-tb-a1a-'));
+  previousQlbHome = process.env.QLB_HOME;
+  process.env.QLB_HOME = root;
   const agentDir = join(root, '.pi', 'agent');
   mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   const authJsonPath = join(agentDir, 'auth.json');
@@ -106,9 +118,10 @@ beforeEach(() => {
   const dbPath = join(root, 'qlb.db');
   const store = openStore(dbPath);
   beginCutover(store);
+  assert.equal(transition(store, 'cutover').ok, true);
   // The gate's refresh path uses the process-wide store; make it this DB.
   setStoreForTests(store);
-  fixture = { root, agentDir, authJsonPath, ownerPath, dbPath, store };
+  fixture = { root, agentDir, authJsonPath, ownerPath, dbPath, expires: hour, store };
 
   for (const provider of PROVIDERS) {
     try { platformKeychain.deleteSync(qlbKeychainService(provider, 'default'), QLB_KEYCHAIN_ACCOUNT); } catch { /* absent */ }
@@ -133,6 +146,8 @@ afterEach(() => {
   globalThis.fetch = realFetch;
   setStoreForTests(null);
   fixture.store.close();
+  if (previousQlbHome === undefined) delete process.env.QLB_HOME;
+  else process.env.QLB_HOME = previousQlbHome;
 });
 
 describe('TB-A1a: Pi provider cutover drill, migrate → gate', () => {
@@ -167,7 +182,7 @@ describe('TB-A1a: Pi provider cutover drill, migrate → gate', () => {
       } else {
         assert.deepEqual(Object.keys(delivered).sort(), ['accountId', 'expiresAt', 'source', 'token']);
         assert.equal(delivered.token, `${provider}-native-access`);
-        assert.equal(typeof delivered.expiresAt, 'number');
+        assert.equal(delivered.expiresAt, fixture.expires);
       }
       assert.equal(delivered.accountId, 'default');
       assert.equal(delivered.source, 'keychain');
@@ -189,7 +204,7 @@ describe('TB-A1a: Pi provider cutover drill, migrate → gate', () => {
       assert.deepEqual(tokenCalls, [provider]);
       assert.equal(result.delivered[0]?.token, `${provider}-qlb-refreshed-access`);
       assert.ok((result.delivered[0]?.expiresAt as number) - Date.now() > 60_000);
-      assert.equal(fixture.store.listLineageTransitions(provider, 'default').length >= 1, true, `${provider} lineage row`);
+      assert.equal(fixture.store.listLineageTransitions(provider, 'default').length, 1, `${provider} lineage row`);
       const auth = JSON.parse(readFileSync(fixture.authJsonPath, 'utf8')) as Record<string, { access: string }>;
       assert.equal(auth[provider]?.access, 'qlb-managed', 'refresh never writes Pi auth.json');
       assert.equal(anthropicEntryText(fixture.ownerPath), JSON.stringify(ANTHROPIC_ENTRY));
@@ -204,6 +219,8 @@ describe('TB-A1a: Pi provider cutover drill, migrate → gate', () => {
     for (const provider of PROVIDERS) {
       const result = await gate(provider);
       assert.equal(result.code, 0, `${provider}: ${result.stderr.join('\n')}`);
+      assert.equal(result.delivered[0]?.token, provider === 'openrouter' ? 'openrouter-native-key' : `${provider}-native-access`);
     }
+    assert.deepEqual(tokenCalls, [], 'fresh grants are served without refreshes');
   });
 });
