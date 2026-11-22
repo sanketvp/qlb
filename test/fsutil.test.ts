@@ -5,6 +5,7 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
+  lutimesSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -322,7 +323,7 @@ describe('fsutil atomic publish primitives', () => {
     const old = new Date(Date.now() - 61_000);
     utimesSync(oldTemp, old, old);
 
-    assert.equal(fsutil.sweepStrayTemps(dir), 1);
+    assert.equal(fsutil.sweepStrayTemps(dir, { isProcessAlive: () => false }), 1);
     assert.deepEqual(readdirSync(dir).sort(), ['.qlb-link.31415.cccccccccccccccc.tmp', '.qlb-other.31415.bbbbbbbbbbbbbbbb.tmp', 'protected.json']);
     assert.equal(lstatSync(tempSymlink).isSymbolicLink(), true);
     assert.equal(readFileSync(protectedTarget, 'utf8'), 'keep');
@@ -361,8 +362,10 @@ describe('fsutil atomic publish primitives', () => {
       utimesSync(path, old, old);
     }
 
-    assert.equal(fsutil.sweepStrayTemps(dir), 0);
+    const probed: number[] = [];
+    assert.equal(fsutil.sweepStrayTemps(dir, { isProcessAlive: (pid) => { probed.push(pid); return false; } }), 0);
     assert.deepEqual(readdirSync(dir).sort(), lookAlikes.sort());
+    assert.deepEqual(probed, []);
   }));
 
   it('keeps an old temp whose owner pid is live beyond the grace period', () => withFixture((dir) => {
@@ -391,4 +394,75 @@ describe('fsutil atomic publish primitives', () => {
     assert.equal(fsutil.sweepStrayTemps(dir, { isProcessAlive: () => false }), 1);
     assert.deepEqual(readdirSync(dir), []);
   }));
+
+  const DAY_MS = 24 * 60 * 60_000;
+
+  function plantTemp(dir: string, name: string, ageMs: number): string {
+    const path = join(dir, name);
+    writeFileSync(path, 'temp');
+    const when = new Date(Date.now() - ageMs);
+    utimesSync(path, when, when);
+    return path;
+  }
+
+  function countingProbe(alive: boolean | 'throw') {
+    const probed: number[] = [];
+    return {
+      probed,
+      isProcessAlive: (pid: number) => {
+        probed.push(pid);
+        if (alive === 'throw') throw new Error('probe failed');
+        return alive;
+      },
+    };
+  }
+
+  it('sweeps a legacy pid-less temp older than 24 hours by age alone, never probing a pid', () => withFixture((dir) => {
+    const legacy = plantTemp(dir, '.qlb-config.json.aaaaaaaaaaaaaaaa.tmp', DAY_MS + 60_000);
+    // STRAY_TEMP rejects a leading-zero pid, so this is a legacy stem, never a pid.
+    const digitStem = plantTemp(dir, '.qlb-config.json.031415.bbbbbbbbbbbbbbbb.tmp', DAY_MS + 60_000);
+    const probe = countingProbe(true);
+
+    assert.deepEqual(fsutil.listStrayTemps(dir, probe).sort(), [legacy, digitStem].sort());
+    assert.equal(fsutil.sweepStrayTemps(dir, probe), 2);
+    assert.deepEqual(readdirSync(dir), []);
+    assert.deepEqual(probe.probed, []);
+  }));
+
+  it('keeps a legacy pid-less temp older than 60 seconds but younger than 24 hours', () => withFixture((dir) => {
+    plantTemp(dir, '.qlb-config.json.aaaaaaaaaaaaaaaa.tmp', DAY_MS - 60_000);
+    plantTemp(dir, '.qlb-config.json.031415.bbbbbbbbbbbbbbbb.tmp', 61_000);
+    const probe = countingProbe(false);
+
+    assert.deepEqual(fsutil.listStrayTemps(dir, probe), []);
+    assert.equal(fsutil.sweepStrayTemps(dir, probe), 0);
+    assert.equal(readdirSync(dir).length, 2);
+    assert.deepEqual(probe.probed, []);
+  }));
+
+  it('keeps a legacy-named symlink older than 24 hours', () => withFixture((dir) => {
+    const target = join(dir, 'protected.json');
+    writeFileSync(target, 'keep');
+    const link = join(dir, '.qlb-link.aaaaaaaaaaaaaaaa.tmp');
+    symlinkSync(target, link);
+    const when = new Date(Date.now() - DAY_MS - 60_000);
+    lutimesSync(link, when, when);
+
+    assert.equal(fsutil.sweepStrayTemps(dir, countingProbe(false)), 0);
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(readFileSync(target, 'utf8'), 'keep');
+  }));
+
+  for (const [alive, kept] of [[true, true], [false, false], ['throw', true]] as const) {
+    it(`checks an ambiguous legacy/current name by pid even past 24 hours (probe ${alive} -> ${kept ? 'kept' : 'swept'})`, () => withFixture((dir) => {
+      // A legacy stem "x.123" is byte-identical to a live pid-123 writer's temp.
+      const temp = plantTemp(dir, '.qlb-x.123.aaaaaaaaaaaaaaaa.tmp', DAY_MS + 60_000);
+      const probe = countingProbe(alive);
+
+      assert.equal(fsutil.sweepStrayTemps(dir, probe), kept ? 0 : 1);
+      assert.deepEqual(readdirSync(dir), kept ? ['.qlb-x.123.aaaaaaaaaaaaaaaa.tmp'] : []);
+      assert.deepEqual(probe.probed, [123]);
+      if (kept) assert.equal(readFileSync(temp, 'utf8'), 'temp');
+    }));
+  }
 });
