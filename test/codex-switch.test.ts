@@ -119,7 +119,7 @@ function freshenHarness(expiryOffset: number) {
   };
   const run = (overrides: Partial<CodexSwitchDeps> = {}) => freshenCodexTarget(h.deps({
     dbPath: h.store.dbPath, slots, list: async () => [], transport, journalDir, ...overrides,
-  }), { target, now });
+  }), { target, now, trigger: 'manual' });
   return {
     ...h, now, target, journalDir, slots, run, posts: () => posts, writes: () => writes, current: () => current,
     onTransport: (handler: () => void) => { onTransport = handler; },

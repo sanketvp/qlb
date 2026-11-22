@@ -168,6 +168,8 @@ export interface CodexConsumeOptions {
   assertHeld?: () => void;
   /** C6-12 recovery fence read under the shared switch lock by the caller. */
   inFlightSlots?: ReadonlySet<string> | '*';
+  /** Who started this refresh, as recorded in lineage: qlb on its own (`qlb-auto`) or the owner (`qlb-cli`, the default). */
+  by?: 'qlb-auto' | 'qlb-cli';
 }
 
 interface CurrentSlot {
@@ -458,8 +460,8 @@ async function persistTransition(
     );
     if (Number(update.changes) !== 1) throw new Error('codex slot metadata CAS lost');
     db.prepare(`INSERT INTO lineage_log (ts, provider, account_id, from_fp, to_fp, cause, by, evidence)
-      VALUES (?, ?, ?, ?, ?, ?, 'qlb-cli', 'post')`)
-      .run(now, PROVIDER, options.accountId, current.fingerprint, successorFp, cause);
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'post')`)
+      .run(now, PROVIDER, options.accountId, current.fingerprint, successorFp, cause, options.by ?? 'qlb-cli');
     if (c9) {
       const receipt = db.prepare(`INSERT INTO config (key, value) VALUES ('codex.l13.aForcedRefresh', 'ok')
         ON CONFLICT(key) DO NOTHING`).run();
