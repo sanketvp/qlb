@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 import { CONFIG_ENV_VARS, defaultConfig } from '../src/config';
 import { createCommandRunner, doctorQlb, inspectProviders, registeredDoctorChecks } from '../src/diagnostics';
+import { doctorRegistryManifestProblems } from '../src/doctor-registry-manifest';
 import { discoverChecks } from '../src/registry';
 import { MACOS_SECURITY_TIMEOUT_MS, MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService, type KeychainBackend } from '../src/keychain';
 import { listStashes, recordStash } from '../src/unclaimed-index';
@@ -689,6 +690,14 @@ describe('qlb doctor', () => {
     assert.equal(report[0]?.name, 'doctor:registry');
     assert.equal(report[0]?.level, 'FAIL');
     assert.match(report[0]?.message ?? '', /no check definitions/);
+  });
+
+  it('build manifest rejects ordinary and quiet conditional doctor omissions', () => {
+    const definitions = discoverChecks();
+    for (const name of ['sqlite', 'recovery']) {
+      const problems = doctorRegistryManifestProblems(definitions.filter((definition) => definition.name !== name));
+      assert.deepEqual(problems, [`missing ${name}`]);
+    }
   });
 
   it('keeps runtime rows and appends one registry FAIL when doctor:registry is not defined', () => {
