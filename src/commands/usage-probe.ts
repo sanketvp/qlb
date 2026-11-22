@@ -2,13 +2,14 @@ import type { CommandDefinition } from '../registry';
 import { probeCodexUsage, type CodexUsageProbeResult } from '../usage/openai-codex';
 import {
   probeKimiCodingUsage,
-  type KimiCodingUsageProbeOptions,
+  type KimiCodingUsageProbeDeps,
   type KimiCodingUsageProbeResult,
 } from '../usage/kimi-coding';
 
 export interface UsageProbeCommandDeps {
   probe?: () => Promise<CodexUsageProbeResult>;
-  kimiProbe?: (options?: KimiCodingUsageProbeOptions) => Promise<KimiCodingUsageProbeResult>;
+  kimiProbe?: (options?: KimiCodingUsageProbeDeps) => Promise<KimiCodingUsageProbeResult>;
+  piAuthJsonPath?: string;
   write?: (line: string) => void;
   error?: (line: string) => void;
 }
@@ -37,10 +38,11 @@ export async function runUsageProbe(args: string[], deps: UsageProbeCommandDeps 
   }
   // The probe option doubles as the output label: `credentialSource` appears only for pi-auth.
   const options = parsed.piAuth ? { credentialSource: 'pi-auth' as const } : undefined;
+  const kimiOptions = parsed.piAuth ? { ...options, authJsonPath: deps.piAuthJsonPath } : undefined;
 
   try {
     const result = parsed.provider === 'kimi-coding'
-      ? await (deps.kimiProbe ?? probeKimiCodingUsage)(options)
+      ? await (deps.kimiProbe ?? probeKimiCodingUsage)(kimiOptions)
       : await (deps.probe ?? probeCodexUsage)();
     write(JSON.stringify({ status: result.status, source: result.source, ...options, keys: result.keys }));
     // The default probe keeps its historical exit 0; P5-live fails when no request was answered.
@@ -54,7 +56,11 @@ export async function runUsageProbe(args: string[], deps: UsageProbeCommandDeps 
 
 const usageProbeCommand: CommandDefinition = {
   name: 'usage probe',
-  execute: (args, ctx) => runUsageProbe(args, { write: ctx.stdout, error: ctx.stderr }),
+  execute: (args, ctx) => runUsageProbe(args, {
+    write: ctx.stdout,
+    error: ctx.stderr,
+    piAuthJsonPath: ctx.config.piAuthJsonPath,
+  }),
 };
 
 export default usageProbeCommand;

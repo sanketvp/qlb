@@ -1,6 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { qlbHomeDir } from '../home';
+import type { KeychainBackend } from '../keychain';
 import { isPiPlaceholder } from '../pi-migrate';
 import { resolve } from '../token/kimi-coding';
 
@@ -24,9 +23,9 @@ export interface KimiCodingUsageProbeOptions {
 export interface KimiCodingUsageProbeDeps extends KimiCodingUsageProbeOptions {
   /** Test seam: a fixed access token, used instead of either credential source. */
   access?: string;
-  /** Test seam; production resolves the QLB-owned, non-refreshing credential. */
-  qlbAccess?: () => string;
-  /** Test seam; production reads Pi's default `~/.pi/agent/auth.json`. */
+  /** Test seam; production uses the platform Keychain. */
+  keychain?: KeychainBackend;
+  /** Test seam; production reads the configured Pi auth.json. */
   authJsonPath?: string;
   fetchFn?: FetchFn;
 }
@@ -70,9 +69,10 @@ function piAuthAccess(path: string): string {
 function selectAccess(deps: KimiCodingUsageProbeDeps): string {
   if (deps.access !== undefined) return deps.access;
   if (deps.credentialSource === 'pi-auth') {
-    return piAuthAccess(deps.authJsonPath ?? join(qlbHomeDir(), '.pi', 'agent', 'auth.json'));
+    if (!deps.authJsonPath) throw new Error('Pi auth.json path is required');
+    return piAuthAccess(deps.authJsonPath);
   }
-  return (deps.qlbAccess ?? (() => resolve().token))();
+  return resolve({ keychain: deps.keychain }).token;
 }
 
 /** L18 probe: metadata only, never a response body or credential. */

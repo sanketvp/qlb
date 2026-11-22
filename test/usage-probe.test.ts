@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import usageProbeCommand, { runUsageProbe } from '../src/commands/usage-probe';
+import { MockKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../src/keychain';
 import { probeKimiCodingUsage } from '../src/usage/kimi-coding';
 
 const PI_TOKEN = 'pi-auth-fixture-access-token';
@@ -20,6 +21,10 @@ function recordingFetch(sent: string[]) {
     sent.push(String((init?.headers as Record<string, string>).Authorization));
     return new Response('{"usage":1,"limits":2}', { status: 200 });
   };
+}
+
+function managedKimiProbe(keychain: MockKeychain, fetchFn: ReturnType<typeof recordingFetch>) {
+  return (options = {}) => probeKimiCodingUsage({ ...options, keychain, fetchFn });
 }
 
 describe('usage probe command', () => {
@@ -76,23 +81,57 @@ describe('usage probe command', () => {
     assert.equal(errors.length, 2);
   });
 
-  it('--source pi-auth sends Pi\'s kimi-coding access token, and the default sends QLB\'s', async () => {
+  it('--source pi-auth reads the configured Pi credential while the default reads QLB\'s managed credential', async () => {
     const authJsonPath = piAuthFile({ type: 'oauth', access: PI_TOKEN, refresh: 'pi-refresh', expires: Date.now() + 3_600_000 });
     const sent: string[] = [];
     const fetchFn = recordingFetch(sent);
+    const keychain = new MockKeychain();
+    keychain.setSync(
+      qlbKeychainService('kimi-coding', 'default'),
+      QLB_KEYCHAIN_ACCOUNT,
+      JSON.stringify({ access: QLB_TOKEN }),
+    );
+    const output: string[] = [];
+    const deps = {
+      piAuthJsonPath: authJsonPath,
+      kimiProbe: managedKimiProbe(keychain, fetchFn),
+      write: (line: string) => output.push(line),
+      error: (line: string) => output.push(`ERR:${line}`),
+    };
 
-    const pi = await probeKimiCodingUsage({ credentialSource: 'pi-auth', authJsonPath, fetchFn, qlbAccess: () => QLB_TOKEN });
-    const qlb = await probeKimiCodingUsage({ authJsonPath, fetchFn, qlbAccess: () => QLB_TOKEN });
+    const pi = await runUsageProbe(['kimi-coding', '--json', '--source', 'pi-auth'], deps);
+    const qlb = await runUsageProbe(['kimi-coding', '--json'], deps);
 
     assert.deepEqual(sent, [`Bearer ${PI_TOKEN}`, `Bearer ${QLB_TOKEN}`]);
-    assert.deepEqual(pi, { status: 200, source: 'kimi-api', keys: ['usage', 'limits'] });
-    assert.deepEqual(qlb, { status: 200, source: 'kimi-api', keys: ['usage', 'limits'] });
+    assert.deepEqual([pi, qlb], [0, 0]);
+    assert.deepEqual(output, [
+      '{"status":200,"source":"kimi-api","credentialSource":"pi-auth","keys":["usage","limits"]}',
+      '{"status":200,"source":"kimi-api","keys":["usage","limits"]}',
+    ]);
+    assert.equal(output.join('\n').includes(PI_TOKEN), false);
+    assert.equal(output.join('\n').includes(QLB_TOKEN), false);
   });
 
-  it('--source pi-auth refuses the QLB placeholder, a missing entry and an unreadable file without a request', async () => {
+  it('--source pi-auth refuses the QLB placeholder through the CLI without a request', async () => {
     const sent: string[] = [];
     const fetchFn = recordingFetch(sent);
     const placeholder = piAuthFile({ type: 'oauth', access: 'qlb-managed', refresh: '', expires: Date.now() + 1e12 });
+    const output: string[] = [];
+    const keychain = new MockKeychain();
+    const code = await runUsageProbe(['kimi-coding', '--json', '--source', 'pi-auth'], {
+      piAuthJsonPath: placeholder,
+      kimiProbe: managedKimiProbe(keychain, fetchFn),
+      write: (line: string) => output.push(line),
+    });
+
+    assert.equal(code, 1);
+    assert.deepEqual(output, ['{"status":null,"source":"unknown","credentialSource":"pi-auth","keys":[]}']);
+    assert.equal(sent.length, 0);
+  });
+
+  it('--source pi-auth refuses a missing entry or unreadable file without a request', async () => {
+    const sent: string[] = [];
+    const fetchFn = recordingFetch(sent);
     const missing = piAuthFile(undefined);
     const unreadable = join(mkdtempSync(join(tmpdir(), 'qlb-probe-')), 'auth.json');
     writeFileSync(unreadable, '{not json');
@@ -104,7 +143,7 @@ describe('usage probe command', () => {
     assert.equal(sent.length, 0);
   });
 
-  it('prints credentialSource for --source pi-auth, exits 1 on no status, and never prints a token', async () => {
+  it('prints credentialSource for --source pi-auth and exits 1 on no status', async () => {
     const output: string[] = [];
     const deps = { write: (line: string) => output.push(line), error: (line: string) => output.push(`ERR:${line}`) };
     const sources: unknown[] = [];
@@ -129,7 +168,6 @@ describe('usage probe command', () => {
       '{"status":null,"source":"unknown","credentialSource":"pi-auth","keys":[]}',
       '{"status":200,"source":"kimi-api","keys":[]}',
     ]);
-    assert.equal(output.join('\n').includes(PI_TOKEN), false);
   });
 
   it('accepts --source pi-auth only for kimi-coding', async () => {
