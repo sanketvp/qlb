@@ -1155,8 +1155,12 @@ function redactJsonText(value: string): string {
   }
 }
 
+function hasTable(db: DatabaseSync, name: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+}
+
 export function hasUsageDiscrepanciesTable(db: DatabaseSync): boolean {
-  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_discrepancies'").get());
+  return hasTable(db, 'usage_discrepancies');
 }
 
 function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
@@ -1185,10 +1189,6 @@ function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS usage_discrepancies_last_observed_at ON usage_discrepancies(last_observed_at);
   `);
-}
-
-function hasTable(db: DatabaseSync, name: string): boolean {
-  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
 }
 
 function hasCodexStageTables(db: DatabaseSync): boolean {
@@ -1235,12 +1235,13 @@ function ensureCodexStageTables(db: DatabaseSync, now: number): void {
   }
 }
 
-export type CodexStageEventKind =
-  | 'stage-start' | 'stage-close' | 'latch-set' | 'latch-clear' | 'initialize-required' | 'initialize';
-
-const CODEX_STAGE_EVENT_KINDS: ReadonlySet<string> = new Set<CodexStageEventKind>([
+const CODEX_STAGE_EVENT_KIND_LIST = [
   'stage-start', 'stage-close', 'latch-set', 'latch-clear', 'initialize-required', 'initialize',
-]);
+] as const;
+
+export type CodexStageEventKind = typeof CODEX_STAGE_EVENT_KIND_LIST[number];
+
+const CODEX_STAGE_EVENT_KINDS: ReadonlySet<string> = new Set(CODEX_STAGE_EVENT_KIND_LIST);
 
 export interface CodexStageEvent {
   id: number;
@@ -1334,6 +1335,10 @@ function parseCodexStageEvent(row: Record<string, unknown>): CodexStageEvent | n
   if (buildStamp === undefined || evidence === undefined || reason === undefined) return null;
   if (flag !== null && flag !== 0 && flag !== 1) return null;
   if (stage !== null && stage !== 1 && stage !== 2) return null;
+  // A row missing the field its kind is defined by cannot be judged, so it reads as unreadable.
+  if (row.kind === 'latch-set' && evidence === null) return null;
+  if (row.kind === 'latch-clear' && throughId === null) return null;
+  if ((row.kind === 'stage-start' || row.kind === 'stage-close') && stage === null) return null;
   return {
     id,
     kind: row.kind as CodexStageEventKind,
@@ -2034,7 +2039,7 @@ export class Store {
   }
 
   private tableExists(table: string): boolean {
-    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+    return hasTable(this.db, table);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -3391,9 +3396,11 @@ export class Store {
    * latch-set for the same evidence pointer is already recorded.
    */
   appendCodexStageEvent(input: CodexStageEventInput): number | null {
-    const result = this.db.prepare(`INSERT OR IGNORE INTO codex_stage_events
+    // Only the latch-set evidence conflict is ignored; any other constraint failure throws.
+    const result = this.db.prepare(`INSERT INTO codex_stage_events
       (kind, recorded_at, lifecycle_id, build_stamp, flag_enabled, stage, evidence, through_id, reason, detail_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (evidence) WHERE kind = 'latch-set' DO NOTHING`).run(
       input.kind,
       input.now,
       input.lifecycleId,
@@ -3414,8 +3421,8 @@ export class Store {
 
   /** Records a switch's final watch verdict. The first verdict wins; returns false when one exists. */
   insertCodexWatchVerdict(input: { switchId: number; verdict: CodexWatchVerdict; now: number; detail?: unknown }): boolean {
-    const result = this.db.prepare(`INSERT OR IGNORE INTO codex_watch_verdicts (switch_id, verdict, recorded_at, detail_json)
-      VALUES (?, ?, ?, ?)`).run(
+    const result = this.db.prepare(`INSERT INTO codex_watch_verdicts (switch_id, verdict, recorded_at, detail_json)
+      VALUES (?, ?, ?, ?) ON CONFLICT (switch_id) DO NOTHING`).run(
       input.switchId,
       input.verdict,
       input.now,

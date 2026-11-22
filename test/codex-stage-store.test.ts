@@ -180,6 +180,72 @@ describe('codex stage-event and verdict tables', () => {
     }
   });
 
+  for (const [shape, columns, values] of [
+    ['detail that is not JSON', "kind, recorded_at, stage, detail_json", "'stage-start', 2, 1, '{'"],
+    ['a flag that is neither 0 nor 1', "kind, recorded_at, stage, flag_enabled", "'stage-start', 2, 1, 2"],
+    ['a stage that is neither 1 nor 2', "kind, recorded_at, stage", "'stage-start', 2, 3"],
+    ['a recorded_at that is text', "kind, recorded_at, stage", "'stage-start', 'yesterday', 1"],
+    ['a latch-set with no evidence pointer', "kind, recorded_at", "'latch-set', 2"],
+    ['a latch-clear with no through id', "kind, recorded_at, reason", "'latch-clear', 2, 'reviewed'"],
+    ['a stage-start with no stage', "kind, recorded_at", "'stage-start', 2"],
+    ['a stage-close with no stage', "kind, recorded_at", "'stage-close', 2"],
+  ] as const) {
+    it(`reads as unknown, keeping the earlier events, for a row with ${shape}`, () => {
+      const path = dbPath();
+      const store = openStore(path);
+      try {
+        const first = store.appendCodexStageEvent({ ...common, kind: 'stage-start', now: 1, stage: 1 });
+        const raw = new DatabaseSync(path);
+        try {
+          raw.exec(`INSERT INTO codex_stage_events (${columns}) VALUES (${values})`);
+        } finally {
+          raw.close();
+        }
+        const log = store.readCodexStageLog();
+        assert.equal(log.status === 'unknown' && log.reason, 'unreadable-row');
+        assert.deepEqual(log.events.map(({ id }) => id), [first]);
+      } finally {
+        store.close();
+      }
+    });
+  }
+
+  it('redacts secrets from stage-event reasons and details and from verdict details', () => {
+    const canary = 'sk-ant-oat01-R1B-LEAK-CANARY-5c2e8d41';
+    const path = dbPath();
+    const store = openStore(path);
+    try {
+      const stop = store.appendCodexStageEvent({ ...common, kind: 'latch-set', now: 1, evidence: 'switch_log:1', detail: { note: canary } });
+      assert.ok(stop !== null);
+      store.appendCodexStageEvent({ ...common, kind: 'latch-clear', now: 2, throughId: stop, reason: `pasted ${canary} by mistake` });
+      store.insertCodexWatchVerdict({ switchId: 1, verdict: 'confirmed', now: 3, detail: { note: canary } });
+    } finally {
+      store.close();
+    }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      const stored = JSON.stringify([
+        db.prepare('SELECT reason, detail_json FROM codex_stage_events').all(),
+        db.prepare('SELECT detail_json FROM codex_watch_verdicts').all(),
+      ]);
+      assert.equal(stored.includes(canary), false);
+      assert.match(stored, /pasted/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('throws instead of reporting a duplicate when a row cannot be written', () => {
+    const store = openStore(dbPath());
+    try {
+      assert.throws(() => store.appendCodexStageEvent({ ...common, kind: 'latch-set', now: Number.NaN, evidence: 'switch_log:1' }));
+      assert.throws(() => store.insertCodexWatchVerdict({ switchId: 1, verdict: 'confirmed', now: Number.NaN }));
+      assert.deepEqual(store.readCodexStageLog(), { status: 'readable', events: [] });
+    } finally {
+      store.close();
+    }
+  });
+
   it('marks a restored store with Codex switch history as initialize-required', () => {
     const path = dbPath();
     let store = openStore(path);
