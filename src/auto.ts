@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
@@ -275,7 +275,18 @@ function readOnlySlots(db: DatabaseSync): Pick<ClaudeSlots, 'listSlots'> {
   } as Pick<ClaudeSlots, 'listSlots'>;
 }
 
+/** A dry run is read-only: a missing store is refused rather than created or reported as an open failure. */
+function assertStoreExists(dbPath: string): void {
+  try {
+    lstatSync(dbPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new AutoAdmissionRefused('no-store');
+    throw error;
+  }
+}
+
 function productionDryBinding(config: QlbConfig, now: () => number): DryBinding {
+  assertStoreExists(config.dbPath);
   // SQLite may create -wal/-shm sidecars even for a read-only open. A live
   // WAL is readable only with its shared-memory companion; otherwise immutable
   // mode avoids creating the missing sidecar.

@@ -409,7 +409,9 @@ describe('Stage 1 sandbox dress rehearsal (G19)', () => {
         assert.equal(existsSync(join(backup, 'credentials', '.creds-1-a@example.test.enc')), true);
         releaseTick();
         assert.equal(await undo, 0, errors.join('\n'));
-        assert.equal(waits, 1);
+        // Undo must have seen the held lock and slept at least once. Under load,
+        // its next poll can still see the lock just after release and sleep again.
+        assert.ok(waits >= 1, `undo slept ${waits} times`);
         assert.equal(await inFlight, 0);
 
         const a = await keychain.get('claude-swap', 'account-1-a@example.test');

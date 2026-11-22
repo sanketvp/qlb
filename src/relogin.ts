@@ -59,6 +59,14 @@ export function recordRelogin(
   });
 }
 
+/**
+ * S65: hard evidence always counts as a relogin. Only a soft
+ * `unattributed-rotation` row the user has explicitly denied is excused.
+ */
+export function countsAsRelogin(event: Pick<ReloginEvent, 'evidence' | 'userDeniedAt'>): boolean {
+  return !(event.evidence === 'unattributed-rotation' && event.userDeniedAt != null);
+}
+
 /** Read-only window report used by doctor/status/report cutover. */
 export function reloginsInWindow(dbPath: string, window: ReloginWindow): ReloginEvent[];
 export function reloginsInWindow(db: DatabaseSync, window?: ReloginWindow): ReloginEvent[];

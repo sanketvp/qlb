@@ -682,6 +682,37 @@ describe('qlb doctor', () => {
     assert.match(registry?.message ?? '', /ENOENT/);
   });
 
+  it('fails the registry closed when no check definitions load', () => {
+    const report = registeredDoctorChecks([], () => []);
+
+    assert.equal(report.length, 1);
+    assert.equal(report[0]?.name, 'doctor:registry');
+    assert.equal(report[0]?.level, 'FAIL');
+    assert.match(report[0]?.message ?? '', /no check definitions/);
+  });
+
+  it('keeps runtime rows and appends one registry FAIL when doctor:registry is not defined', () => {
+    const runtime = [
+      { name: 'sqlite', level: 'PASS' as const, message: 'fixture sqlite' },
+      { name: 'not:registered', level: 'WARN' as const, message: 'fixture unregistered' },
+    ];
+    const withoutRegistry = discoverChecks().filter((check) => check.name !== 'doctor:registry');
+    const empty = registeredDoctorChecks(runtime, () => []);
+    const partial = registeredDoctorChecks(runtime, () => withoutRegistry);
+
+    assert.deepEqual(empty.slice(0, -1), runtime);
+    for (const report of [empty, partial]) {
+      for (const row of runtime) assert.ok(report.includes(row), `runtime row kept: ${row.name}`);
+      assert.equal(report.filter((check) => check.name === 'doctor:registry').length, 1);
+      const registry = report.at(-1);
+      assert.equal(registry?.name, 'doctor:registry');
+      assert.equal(registry?.level, 'FAIL');
+      assert.match(registry?.message ?? '', /doctor:registry/);
+      assert.match(registry?.message ?? '', /unregistered not:registered/);
+    }
+    assert.match(empty.at(-1)?.message ?? '', /unregistered sqlite/);
+  });
+
   it('qlb doctor appends exactly one health_log row per run with the S64 overall and the blocking rows', async () => {
     const home = mkdtempSync(join(tmpdir(), 'qlb-doctor-health-log-'));
     const config = defaultConfig(home);

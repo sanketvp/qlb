@@ -637,6 +637,114 @@ test('relogin evidence fails only for Anthropic and Codex events', async () => {
   } finally { subject.close(); }
 });
 
+function insertRelogin(subject: ReturnType<typeof fixture>, evidence: string, denied: boolean): void {
+  const db = new DatabaseSync(subject.dbPath);
+  try {
+    db.prepare(`INSERT INTO relogin_events (ts, provider, kind, detail, evidence, user_denied_at)
+      VALUES (?, 'anthropic', 'external-login', 'sha256:1111111111111111', ?, ?)`).run(NOW - 9 * DAY, evidence, denied ? NOW - 9 * DAY + 1 : null);
+  } finally { db.close(); }
+}
+
+function configRow(subject: ReturnType<typeof fixture>, key: string): string | undefined {
+  const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+  try {
+    return (db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+  } finally { db.close(); }
+}
+
+function lifecycleRow(subject: ReturnType<typeof fixture>): { window_end: number; extended_at: number | null } {
+  const db = new DatabaseSync(subject.dbPath, { readOnly: true });
+  try {
+    return { ...(db.prepare('SELECT window_end, extended_at FROM lifecycle').get() as { window_end: number; extended_at: number | null }) };
+  } finally { db.close(); }
+}
+
+async function ac18(evidence: string, denied: boolean): Promise<string> {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    insertRelogin(subject, evidence, denied);
+    await run(subject);
+    return JSON.parse(subject.output[0]!).rows.find((value: { name: string }) => value.name === 'AC18:relogins').status;
+  } finally { subject.close(); }
+}
+
+test('AC18 counts a denied hard relogin', async () => {
+  assert.equal(await ac18('login-expiry-jump', true), 'FAIL');
+  assert.equal(await ac18('auth-time', true), 'FAIL');
+});
+
+test('AC18 excuses a denied soft relogin', async () => {
+  assert.equal(await ac18('unattributed-rotation', true), 'PASS');
+});
+
+test('AC18 counts an undenied soft relogin', async () => {
+  assert.equal(await ac18('unattributed-rotation', false), 'FAIL');
+});
+
+test('report cutover with only a denied soft relogin can pass and write its receipt', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    insertRelogin(subject, 'unattributed-rotation', true);
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC18:relogins').message,
+      `no counted Anthropic or Codex relogin events; excused by user denial: #1@${NOW - 9 * DAY}`);
+    assert.equal(configRow(subject, 'report.receiptAt'), String(NOW));
+  } finally { subject.close(); }
+});
+
+test('report cutover names counted relogins when AC18 has no rows', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    assert.equal(await run(subject), 0);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC18:relogins').message,
+      'no counted Anthropic or Codex relogin events');
+  } finally { subject.close(); }
+});
+
+test('report cutover with a denied hard relogin fails AC18, writes no receipt and clears an earlier one', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true });
+    const db = new DatabaseSync(subject.dbPath);
+    db.prepare("INSERT INTO config (key, value) VALUES ('report.receiptAt', '123')").run();
+    db.close();
+    insertRelogin(subject, 'login-expiry-jump', true);
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'AC18:relogins').code, 'relogin-in-window');
+    assert.equal(configRow(subject, 'report.receiptAt'), '');
+  } finally { subject.close(); }
+});
+
+test('an ended, unextended window with nine qualifying switches and only a denied soft relogin reports EXTEND and records extended_at', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true, switches: 9 });
+    insertRelogin(subject, 'unattributed-rotation', true);
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'EXTEND');
+    assert.equal(lifecycleRow(subject).extended_at, NOW);
+  } finally { subject.close(); }
+});
+
+test('the same window with a denied hard relogin fails and leaves extended_at unchanged', async () => {
+  const subject = fixture();
+  try {
+    seed(subject, { piDeferred: true, drill: true, switches: 9 });
+    insertRelogin(subject, 'login-expiry-jump', true);
+    assert.equal(await run(subject), 1);
+    const report = JSON.parse(subject.output[0]!);
+    assert.equal(report.rows.find((value: { name: string }) => value.name === 'anthropic:automatic-switches').status, 'FAIL');
+    assert.deepEqual(lifecycleRow(subject), { window_end: NOW - 8 * DAY, extended_at: null });
+  } finally { subject.close(); }
+});
+
 test('text output includes lifecycle dates and report codes', async () => {
   const subject = fixture();
   try {

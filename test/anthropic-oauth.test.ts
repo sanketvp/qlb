@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -30,22 +31,73 @@ import {
 } from '../src/anthropic-oauth';
 
 const C_SWAP_SOURCE = resolve(__dirname, '../../test/oracle/claude-swap-v0.28.0/src');
-const C_SWAP_OAUTH_PROGRAM = [
-  'import importlib.util, sys, types',
-  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
-  'sys.path.insert(0, source)',
-  'package = types.ModuleType("claude_swap")',
-  'package.__path__ = [source + "/claude_swap"]',
-  'sys.modules["claude_swap"] = package',
-  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
-  'oauth = importlib.util.module_from_spec(spec)',
-  'sys.modules[spec.name] = oauth',
-  'spec.loader.exec_module(oauth)',
-  'print(oauth.credential_fingerprint(sys.stdin.read()))',
-].join('\n');
 
-const C_SWAP_USAGE_PROGRAM = [
-  'import importlib.util, json, sys, types',
+// claude-swap's own fixtures use `Z` timestamps, which only Python >= 3.11
+// `datetime.fromisoformat` accepts, so that is the oracle's contract runtime.
+const MIN_ORACLE_PYTHON: readonly [number, number] = [3, 11];
+const VERSION_PROBE = 'import sys; print("%d.%d.%d" % sys.version_info[:3])';
+
+type OracleSelection = { python: string; version: string } | { skip: string };
+
+function pythonVersion(python: string, env: NodeJS.ProcessEnv): string | null {
+  try {
+    const out = execFileSync(python, ['-I', '-c', VERSION_PROBE], {
+      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+    }).trim();
+    return /^\d+\.\d+\.\d+$/.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+function isSupportedOracleVersion(version: string): boolean {
+  const [major, minor] = version.split('.').map(Number);
+  return major > MIN_ORACLE_PYTHON[0] || (major === MIN_ORACLE_PYTHON[0] && minor >= MIN_ORACLE_PYTHON[1]);
+}
+
+/** `python3` if it is >= 3.11, else `uv python find >=3.11`, else a skip reason. */
+function selectOraclePython(env: NodeJS.ProcessEnv = process.env): OracleSelection {
+  const rejected: string[] = [];
+  const accept = (python: string): OracleSelection | null => {
+    const version = pythonVersion(python, env);
+    if (version && isSupportedOracleVersion(version)) return { python, version };
+    rejected.push(`${python} (${version ?? 'not runnable'})`);
+    return null;
+  };
+  const fromPath = accept('python3');
+  if (fromPath) return fromPath;
+  const range = `>=${MIN_ORACLE_PYTHON.join('.')}`;
+  let uvPython = '';
+  try {
+    uvPython = execFileSync('uv', ['python', 'find', range], {
+      encoding: 'utf8', env: { ...env, UV_PYTHON_DOWNLOADS: 'never' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+    }).trim();
+  } catch {
+    // No uv, or no matching interpreter.
+  }
+  if (uvPython) {
+    const fromUv = accept(uvPython);
+    if (fromUv) return fromUv;
+  } else {
+    rejected.push(`uv python find ${range} (no match)`);
+  }
+  return { skip: `C-swap oracle needs Python ${range}; tried ${rejected.join(', ')}` };
+}
+
+const ORACLE = selectOraclePython();
+const ORACLE_SKIP = 'skip' in ORACLE ? ORACLE.skip : false;
+
+// Shared prelude: refuse an old interpreter, block every network path, and
+// load the vendored oauth.py as claude_swap.oauth.
+const ORACLE_PRELUDE = [
+  'import importlib.util, json, socket, sys, types, urllib.request',
+  `if sys.version_info < (${MIN_ORACLE_PYTHON.join(', ')}):`,
+  `  raise SystemExit("C-swap oracle needs Python >= ${MIN_ORACLE_PYTHON.join('.')}, got " + sys.version)`,
+  'def _no_network(*args, **kwargs):',
+  '  raise RuntimeError("oracle network access is blocked")',
+  'socket.create_connection = _no_network',
+  'socket.socket.connect = _no_network',
+  'urllib.request.urlopen = _no_network',
   `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
   'sys.path.insert(0, source)',
   'package = types.ModuleType("claude_swap")',
@@ -55,62 +107,50 @@ const C_SWAP_USAGE_PROGRAM = [
   'oauth = importlib.util.module_from_spec(spec)',
   'sys.modules[spec.name] = oauth',
   'spec.loader.exec_module(oauth)',
-  'try:',
-  '  print(json.dumps({"result": oauth.build_usage_result(json.loads(sys.stdin.read()))}))',
-  'except Exception as exc:',
-  '  print(json.dumps({"error": type(exc).__name__}))',
-].join('\n');
+];
+
+function runOracle(body: string[], input = ''): string {
+  if ('skip' in ORACLE) throw new Error(ORACLE.skip);
+  return execFileSync(
+    ORACLE.python,
+    ['-I', '-B', '-c', [...ORACLE_PRELUDE, ...body].join('\n')],
+    { encoding: 'utf8', input, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
+  );
+}
 
 function runUsageOracle(input: unknown): { result?: Record<string, unknown>; error?: string } {
-  return JSON.parse(execFileSync(
-    'python3',
-    ['-I', '-B', '-c', C_SWAP_USAGE_PROGRAM],
-    { encoding: 'utf8', input: JSON.stringify(input) },
-  )) as { result?: Record<string, unknown>; error?: string };
+  return JSON.parse(runOracle([
+    'try:',
+    '  print(json.dumps({"result": oauth.build_usage_result(json.loads(sys.stdin.read()))}))',
+    'except Exception as exc:',
+    '  print(json.dumps({"error": type(exc).__name__}))',
+  ], JSON.stringify(input))) as { result?: Record<string, unknown>; error?: string };
 }
 
-const C_SWAP_REFRESH_PROGRAM = [
-  'import importlib.util, json, sys, types',
-  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
-  'sys.path.insert(0, source)',
-  'package = types.ModuleType("claude_swap")',
-  'package.__path__ = [source + "/claude_swap"]',
-  'sys.modules["claude_swap"] = package',
-  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
-  'oauth = importlib.util.module_from_spec(spec)',
-  'sys.modules[spec.name] = oauth',
-  'spec.loader.exec_module(oauth)',
-  'print(json.dumps({"error": oauth.try_refresh_oauth_credentials(sys.stdin.read()).error}))',
-].join('\n');
+type OraclePost = { url: string; method: string; body: Record<string, unknown>; timeout: number };
 
-function refreshOracleError(credentials: string): string | null {
-  return (JSON.parse(execFileSync(
-    'python3',
-    ['-I', '-B', '-c', C_SWAP_REFRESH_PROGRAM],
-    { encoding: 'utf8', input: credentials },
-  )) as { error: string | null }).error;
+// urlopen is stubbed to record the POST and answer a fake success; the
+// prelude has already blocked real sockets.
+function runRefreshOracle(credentials: string): { error: string | null; posts: OraclePost[] } {
+  return JSON.parse(runOracle([
+    'posts = []',
+    'class _FakeResponse:',
+    '  def __enter__(self): return self',
+    '  def __exit__(self, *exc): return False',
+    '  def read(self): return b\'{"access_token": "fake-oracle-access", "expires_in": 3600}\'',
+    'def _record_urlopen(req, timeout=None):',
+    '  posts.append({"url": req.full_url, "method": req.get_method(), "body": json.loads(req.data.decode()), "timeout": timeout})',
+    '  return _FakeResponse()',
+    'urllib.request.urlopen = _record_urlopen',
+    'outcome = oauth.try_refresh_oauth_credentials(sys.stdin.read())',
+    'print(json.dumps({"error": outcome.error, "posts": posts}))',
+  ], credentials)) as { error: string | null; posts: OraclePost[] };
 }
-
-const C_SWAP_EXPIRY_PROGRAM = [
-  'import importlib.util, json, sys, types',
-  `source = ${JSON.stringify(C_SWAP_SOURCE)}`,
-  'sys.path.insert(0, source)',
-  'package = types.ModuleType("claude_swap")',
-  'package.__path__ = [source + "/claude_swap"]',
-  'sys.modules["claude_swap"] = package',
-  'spec = importlib.util.spec_from_file_location("claude_swap.oauth", source + "/claude_swap/oauth.py")',
-  'oauth = importlib.util.module_from_spec(spec)',
-  'sys.modules[spec.name] = oauth',
-  'spec.loader.exec_module(oauth)',
-  'print(json.dumps({"expired": oauth.is_oauth_token_expired(True)}))',
-].join('\n');
 
 function oracleTreatsTrueAsExpired(): boolean {
-  return (JSON.parse(execFileSync(
-    'python3',
-    ['-I', '-B', '-c', C_SWAP_EXPIRY_PROGRAM],
-    { encoding: 'utf8' },
-  )) as { expired: boolean }).expired;
+  return (JSON.parse(runOracle(['print(json.dumps({"expired": oauth.is_oauth_token_expired(True)}))'])) as {
+    expired: boolean;
+  }).expired;
 }
 
 const GRANT_KEY = 'grant' + '_type';
@@ -128,13 +168,33 @@ const FAKE_CREDENTIALS = JSON.stringify({
 });
 
 describe('Anthropic OAuth pure port', () => {
-  it('matches the C-swap v0.28 credential fingerprint from the vendored oracle', () => {
+  it('selects python3 only when it is >= 3.11, else the interpreter uv finds', () => {
+    const bin = mkdtempSync(join(tmpdir(), 'qlb-oracle-python-'));
+    const script = (name: string, body: string): string => {
+      const path = join(bin, name);
+      writeFileSync(path, `#!/bin/sh\n${body}\n`);
+      chmodSync(path, 0o755);
+      return path;
+    };
+    try {
+      const fakePath = { PATH: bin };
+      script('python3', 'echo 3.9.6');
+      const noOracle = selectOraclePython(fakePath);
+      assert.ok('skip' in noOracle, 'a 3.9 python3 and no uv must skip');
+      assert.match(noOracle.skip, /needs Python >=3\.11; tried python3 \(3\.9\.6\), uv python find >=3\.11 \(no match\)/);
+      const fixture = script('fixture-python3.12', 'echo 3.12.7');
+      script('uv', `[ "$1 $2 $3" = "python find >=3.11" ] && echo ${fixture} || exit 2`);
+      assert.deepEqual(selectOraclePython(fakePath), { python: fixture, version: '3.12.7' });
+      script('python3', 'echo 3.11.0');
+      assert.deepEqual(selectOraclePython(fakePath), { python: 'python3', version: '3.11.0' });
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it('matches the C-swap v0.28 credential fingerprint from the vendored oracle', { skip: ORACLE_SKIP }, () => {
     assert.equal(existsSync(C_SWAP_SOURCE), true, `vendored oracle missing: ${C_SWAP_SOURCE}`);
-    const expected = execFileSync(
-      'python3',
-      ['-I', '-B', '-c', C_SWAP_OAUTH_PROGRAM],
-      { encoding: 'utf8', input: FAKE_CREDENTIALS, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } },
-    ).trim();
+    const expected = runOracle(['print(oauth.credential_fingerprint(sys.stdin.read()))'], FAKE_CREDENTIALS).trim();
     assert.equal(credentialFingerprint(FAKE_CREDENTIALS), expected);
   });
 
@@ -207,7 +267,7 @@ describe('Anthropic OAuth pure port', () => {
     );
   });
 
-  it('applies exact five-minute and ten-minute expiry boundaries', () => {
+  it('applies exact five-minute and ten-minute expiry boundaries', { skip: ORACLE_SKIP }, () => {
     const nowMs = 1_700_000_000_000;
     assert.equal(OAUTH_EXPIRY_BUFFER_MS, 5 * 60 * 1000);
     assert.equal(FRESHEN_BUFFER_MS, 10 * 60 * 1000);
@@ -287,7 +347,22 @@ describe('Anthropic OAuth pure port', () => {
     }
   });
 
-  it('describes refresh and usage requests without performing network I/O', () => {
+  // S18 divergence, pinned against the oracle: oauth.py:165-185 POSTs any
+  // truthy refreshToken, so a numeric one reaches the token endpoint there.
+  it('pins the S18 numeric refresh-token divergence against the oracle', { skip: ORACLE_SKIP }, () => {
+    const numericToken = JSON.stringify({ claudeAiOauth: { refreshToken: 1 } });
+    const oracle = runRefreshOracle(numericToken);
+    assert.equal(oracle.error, null);
+    assert.deepEqual(oracle.posts, [{
+      url: ANTHROPIC_OAUTH_TOKEN_URL,
+      method: 'POST',
+      body: { [GRANT_KEY]: 'refresh_token', refresh_token: 1, client_id: ANTHROPIC_OAUTH_CLIENT_ID },
+      timeout: 10,
+    }]);
+    assert.deepEqual(buildRefreshRequest(numericToken), { kind: 'transient' });
+  });
+
+  it('describes refresh and usage requests without performing network I/O', { skip: ORACLE_SKIP }, () => {
     const refreshResult = buildRefreshRequest(FAKE_CREDENTIALS);
     assert.equal(refreshResult.kind, 'request');
     if (refreshResult.kind !== 'request') throw new Error('fake credential must produce a refresh request');
@@ -302,12 +377,10 @@ describe('Anthropic OAuth pure port', () => {
     // try_refresh_oauth_credentials treats a complete credential missing the
     // token as permanent, but a malformed/non-object blob as a torn read.
     const noToken = JSON.stringify({ claudeAiOauth: {} });
-    assert.equal(refreshOracleError(noToken), 'no_refresh_token');
-    assert.equal(buildRefreshRequest(noToken).kind, 'no_refresh_token');
-    assert.equal(refreshOracleError('not json'), 'transient');
-    assert.equal(buildRefreshRequest('not json').kind, 'transient');
-    assert.equal(refreshOracleError('[]'), 'transient');
-    assert.equal(buildRefreshRequest('[]').kind, 'transient');
+    for (const [credentials, expected] of [[noToken, 'no_refresh_token'], ['not json', 'transient'], ['[]', 'transient']]) {
+      assert.deepEqual(runRefreshOracle(credentials), { error: expected, posts: [] });
+      assert.equal(buildRefreshRequest(credentials).kind, expected);
+    }
     // S18 classifies non-string tokens as unreadable rather than POSTing them.
     assert.equal(buildRefreshRequest(JSON.stringify({ claudeAiOauth: { refreshToken: true } })).kind, 'transient');
     const timedRequest = buildRefreshRequest(FAKE_CREDENTIALS, 6_000);
@@ -352,7 +425,7 @@ describe('Anthropic OAuth pure port', () => {
     }), { uuid: 'id', email: 'token@example.test', organizationUuid: 'org-id' });
   });
 
-  it('parses C-swap-shaped 5h, 7d, and per-model 7d usage buckets', () => {
+  it('parses C-swap-shaped 5h, 7d, and per-model 7d usage buckets', { skip: ORACLE_SKIP }, () => {
     assert.equal(FIVE_HOUR_LABEL, '5h');
     const input = {
       five_hour: { utilization: 12.5, resets_at: '2099-01-01T00:00:00+00:00' },
@@ -405,7 +478,7 @@ describe('Anthropic OAuth pure port', () => {
     });
   });
 
-  it('keeps valid usage windows when another oracle window has non-numeric utilization', () => {
+  it('keeps valid usage windows when another oracle window has non-numeric utilization', { skip: ORACLE_SKIP }, () => {
     for (const utilization of [null, '12']) {
       const input = { five_hour: { utilization }, seven_day: { utilization: 34 } };
       const oracle = runUsageOracle(input);
@@ -415,7 +488,7 @@ describe('Anthropic OAuth pure port', () => {
     }
   });
 
-  it('rejects reset timestamps whenever the oracle format_reset rejects the response', () => {
+  it('rejects reset timestamps whenever the oracle format_reset rejects the response', { skip: ORACLE_SKIP }, () => {
     for (const input of [
       { five_hour: { utilization: 1, resets_at: 'later' } },
       { five_hour: { utilization: 1, resets_at: '2099-01-01' } },

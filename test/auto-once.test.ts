@@ -8,11 +8,11 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { AutoAdmissionRefused, runAuto } from '../src/auto';
-import { runAutoCommand } from '../src/commands/auto';
+import autoCommand, { runAutoCommand } from '../src/commands/auto';
 import { claudePaths } from '../src/cc-paths';
 import { claudeSwitchJournalPath, createClaudeSwitchJournal, type ClaudeSwitchJournal } from '../src/cc-switch-journal';
 import type { ClaudeSwitchDeps } from '../src/cc-switch';
-import { defaultConfig } from '../src/config';
+import { defaultConfig, resolveConfig } from '../src/config';
 import { MockKeychain } from '../src/keychain';
 import { reconcileClaudeSwitch } from '../src/journal';
 import { runExecutingCommand } from '../src/app';
@@ -989,6 +989,83 @@ describe('qlb auto --once (G12)', () => {
     } finally {
       close(ctx.home);
       close(ctx.env.QLB_HOME!);
+    }
+  });
+});
+
+describe('qlb auto --dry-run with no store (TC-4, H2)', () => {
+  function listTree(root: string): string[] {
+    return readdirSync(root, { recursive: true, withFileTypes: true })
+      .map((entry) => join(entry.parentPath, entry.name).slice(root.length))
+      .sort();
+  }
+
+  async function dryRun(home: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
+    const env = testEnv(home, extraEnv);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const ctx: CommandContext = {
+      stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line), env,
+      config: resolveConfig({ env, home, argv: [], warn: () => {} }), loadConfig: () => { throw new Error('not used'); }, home,
+      registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+    };
+    const realFetch = globalThis.fetch;
+    let fetched = 0;
+    globalThis.fetch = (async () => { fetched += 1; throw new Error('a dry run with no store must not fetch'); }) as typeof fetch;
+    try {
+      const code = await runExecutingCommand({ command: autoCommand, args }, ctx);
+      assert.equal(fetched, 0);
+      return { code, stdout, stderr };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it('the real dry-run command on a home with no qlb.db refuses no-store and creates no file', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-auto-no-store-'));
+    try {
+      const before = listTree(home);
+      for (const args of [['--dry-run'], ['--once', '--dry-run'], ['--dry-run', '--json']]) {
+        const result = await dryRun(home, args);
+        assert.equal(result.code, 3, args.join(' '));
+        assert.deepEqual(result.stderr, ['qlb auto: refused: no-store'], args.join(' '));
+        assert.deepEqual(result.stdout, [], args.join(' '));
+      }
+      assert.deepEqual(listTree(home), before);
+      assert.equal(existsSync(join(home, '.qlb', 'qlb.db')), false);
+    } finally {
+      close(home);
+    }
+  });
+
+  it('a dry run with an explicit missing db path refuses no-store', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-auto-no-store-path-'));
+    try {
+      mkdirSync(join(home, '.qlb'), { recursive: true });
+      writeFileSync(join(home, '.qlb', 'qlb.db'), '');
+      const mistyped = join(home, 'elsewhere', 'qbl.db');
+      const before = listTree(home);
+      const result = await dryRun(home, ['--dry-run'], { QLB_DB_PATH: mistyped });
+      assert.equal(result.code, 3);
+      assert.deepEqual(result.stderr, ['qlb auto: refused: no-store']);
+      assert.deepEqual(result.stdout, []);
+      assert.deepEqual(listTree(home), before);
+    } finally {
+      close(home);
+    }
+  });
+
+  it('a dry run on an invalid store file still exits 1', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'qlb-auto-invalid-store-'));
+    try {
+      mkdirSync(join(home, '.qlb'), { recursive: true });
+      writeFileSync(join(home, '.qlb', 'qlb.db'), 'this is not a sqlite database, it is padding '.repeat(200));
+      const result = await dryRun(home, ['--dry-run']);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr.some((line) => line.includes('no-store')), false);
+      assert.deepEqual(result.stdout, []);
+    } finally {
+      close(home);
     }
   });
 });

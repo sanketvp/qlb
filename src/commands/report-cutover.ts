@@ -5,7 +5,7 @@ import { doctorQlb, type DoctorReport } from '../diagnostics';
 import { configValue, drillRowsPresent, extendWindow, phase, PI_PROVIDERS, type LifecycleRow } from '../lifecycle';
 import { redactJson } from '../redact';
 import { hasRecentPiService, receiptHealthHistory } from '../receipt-gates';
-import { reloginsInWindow } from '../relogin';
+import { countsAsRelogin, reloginsInWindow } from '../relogin';
 import { openStore, type Store } from '../store';
 import type { CommandContext, CommandDefinition } from '../registry';
 
@@ -63,10 +63,12 @@ function reportRows(db: DatabaseSync, lifecycle: LifecycleRow, now: number): Cut
     ? row('correctness', 'AC21:dead-slots', 'PASS', 'no health log row records a dead slot')
     : row('correctness', 'AC21:dead-slots', 'FAIL', `dead slot in window: ${dead.map((value) => `${value.slot}@${value.ts}`).join(', ')}`, 'dead-slot-in-window'));
 
-  const relogins = reloginsInWindow(db, { start, end })
+  const reloginEvents = reloginsInWindow(db, { start, end })
     .filter((value) => value.provider === 'anthropic' || value.provider === 'openai-codex');
+  const relogins = reloginEvents.filter(countsAsRelogin);
+  const excusedRelogins = reloginEvents.filter((value) => !countsAsRelogin(value));
   rows.push(relogins.length === 0
-    ? row('correctness', 'AC18:relogins', 'PASS', 'no Anthropic or Codex relogin events')
+    ? row('correctness', 'AC18:relogins', 'PASS', `no counted Anthropic or Codex relogin events${excusedRelogins.length === 0 ? '' : `; excused by user denial: ${excusedRelogins.map((value) => `#${value.id}@${value.ts}`).join(', ')}`}`)
     : row('correctness', 'AC18:relogins', 'FAIL', `relogin events: ${relogins.map((value) => `#${value.id}@${value.ts} ${value.provider}:${value.kind}${value.detail ? `:${value.detail}` : ''}${value.evidence ? ` [${value.evidence}]` : ''}`).join(', ')}`, 'relogin-in-window'));
 
   const automatic = db.prepare(`SELECT count(*) AS count FROM switch_log WHERE provider = 'anthropic' AND outcome = 'ok'

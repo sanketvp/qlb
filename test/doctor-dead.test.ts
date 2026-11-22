@@ -374,6 +374,40 @@ describe('A7 doctor health primitives', () => {
     assert.equal(active.level, 'FAIL');
   });
 
+  describe('S65 relogin rule (TC-13)', () => {
+    function relogin(evidence: string, denied: boolean): string {
+      const dbPath = fixture();
+      const now = Date.now();
+      write(dbPath, `INSERT INTO relogin_events (ts, provider, kind, detail, evidence, user_denied_at)
+        VALUES (?, 'anthropic', 'external-login', 'sha256:1111111111111111', ?, ?)`, now - 1_000, evidence, denied ? now - 500 : null);
+      return dbPath;
+    }
+
+    it('relogin:7d counts a denied hard relogin', () => {
+      assert.equal(relogin7dCheck(relogin('login-expiry-jump', true), 'cutover').level, 'FAIL');
+      assert.equal(relogin7dCheck(relogin('auth-time', true), 'cutover').level, 'FAIL');
+    });
+
+    it('relogin:7d excuses a denied soft relogin', () => {
+      const dbPath = fixture();
+      write(dbPath, `INSERT INTO relogin_events (ts, provider, kind, detail, evidence, user_denied_at)
+        VALUES (9_000, 'anthropic', 'external-login', 'sha256:1111111111111111', 'unattributed-rotation', 9_500)`);
+      const result = relogin7dCheck(dbPath, 'cutover', 10_000);
+      assert.equal(result.level, 'PASS');
+      assert.equal(result.message, 'no counted relogin events in the last 7 days; excused by user denial: #1@9000');
+    });
+
+    it('relogin:7d names counted relogins when its window is empty', () => {
+      const result = relogin7dCheck(fixture(), 'cutover', 10_000);
+      assert.equal(result.level, 'PASS');
+      assert.equal(result.message, 'no counted relogin events in the last 7 days');
+    });
+
+    it('relogin:7d counts an undenied soft relogin', () => {
+      assert.equal(relogin7dCheck(relogin('unattributed-rotation', false), 'cutover').level, 'FAIL');
+    });
+  });
+
   it('treats a healed relogin inside the window as unhealthy', () => {
     const dbPath = fixture();
     const store = openStore(dbPath);

@@ -3,13 +3,14 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
 import { credential as claudeCredential } from './support/claude-fixtures';
 
 import { defaultConfig } from '../src/config';
 import { claudePaths } from '../src/cc-paths';
-import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository } from '../src/cc-slots';
+import { ClaudeSlots, InMemoryClaudeSlotRepository, SqliteClaudeSlotRepository, type ClaudeSlotRepository } from '../src/cc-slots';
 import {
   claudeSwitchJournalPath,
   createClaudeSwitchJournal,
@@ -18,6 +19,7 @@ import {
   readClaudeSwitchJournal,
   readStagedRollback,
   updateClaudeSwitchJournal,
+  validateClaudeSwitchJournalIdentity,
   writeStagedRollback,
   type ClaudeSwitchJournal,
 } from '../src/cc-switch-journal';
@@ -39,14 +41,14 @@ const credential = (tag: string) => claudeCredential(tag, { accessToken: `fixtur
 
 type Subject = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture() {
+async function fixture(repository: ClaudeSlotRepository = new InMemoryClaudeSlotRepository()) {
   const root = mkdtempSync(join(tmpdir(), 'qlb-journal-reconcile-'));
   const home = join(root, 'home');
   const env = { QLB_TEST_MODE: '1', QLB_HOME: join(root, 'qlb-home'), HOME: home };
   const paths = claudePaths({ home, env });
   mkdirSync(paths.configHome, { recursive: true });
   const backend = new MockKeychain();
-  const slots = new ClaudeSlots({ backend, repository: new InMemoryClaudeSlotRepository(), stashDir: join(root, 'unclaimed'), now: () => NOW });
+  const slots = new ClaudeSlots({ backend, repository, stashDir: join(root, 'unclaimed'), now: () => NOW });
   const outgoing = credential('a');
   const target = credential('b');
   const configText = `${JSON.stringify({ oauthAccount: { accountUuid: 'a' }, retained: 'yes' })}\n`;
@@ -289,6 +291,39 @@ describe('Claude switch journal reconciliation (G10)', () => {
 
     assert.equal((await resolveClaudeSwitchJournal(subject.deps, 'back')).outcome, 'resolved');
     assert.deepEqual(subject.rows.map((row) => [row.fromAccount, row.toAccount, row.trigger]), [['a', 'b', 'parked']]);
+  });
+
+  it('a journal naming a really archived slot passes identity validation', async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'qlb-journal-archived-')), 'qlb.sqlite');
+    openStore(dbPath).close();
+    const repository = SqliteClaudeSlotRepository.open(dbPath);
+    try {
+      const subject = await fixture(repository);
+      const db = new DatabaseSync(dbPath);
+      try {
+        // No production writer archives a slot yet (S66), so set the column on the real row.
+        db.prepare('UPDATE claude_slots SET archived_at = ? WHERE account_id = ?').run(NOW, 'b');
+      } finally { db.close(); }
+      assert.equal(subject.slots.listSlots().find((slot) => slot.accountId === 'b')?.archivedAt, NOW);
+      const entry = await install(subject, journal(subject, { trigger: 'parked' }));
+
+      assert.equal(validateClaudeSwitchJournalIdentity(entry, subject.slots.listSlots()), true);
+
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const command = createClaudeJournalResolveCommand({
+        openStore: () => ({ close: () => {} }) as never,
+        assertAdmitted: () => ({ ok: true }),
+        makeSwitchDeps: async () => ({ deps: subject.deps }),
+      });
+      const ctx = { ...({} as CommandContext), stderr: (line: string) => stderr.push(line), stdout: (line: string) => stdout.push(line), env: subject.env, home: subject.home,
+        config: { ...defaultConfig(subject.root), dbPath } };
+
+      assert.equal(await command.execute!(['--back'], ctx), 0, stderr.join('\n'));
+      assert.match(stdout.join('\n'), /^Claude journal resolved back/);
+      assert.deepEqual(subject.rows.map((row) => [row.fromAccount, row.toAccount, row.trigger, row.outcome]), [['a', 'b', 'parked', 'rolled-back']]);
+      assert.equal(journalExists(subject), false);
+    } finally { repository.close(); }
   });
 
   it('propagates slot inventory failures rather than treating them as invalid journals', async () => {
