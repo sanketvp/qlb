@@ -187,7 +187,13 @@ export function deriveLatch(log: StageLog): LatchView {
   return current;
 }
 
-export type ClearRefusal = 'not-latched' | 'newer-stop' | 'open-watch' | 'fence-set' | 'empty-reason';
+export type ClearRefusal = 'not-latched' | 'latch-unknown' | 'newer-stop' | 'open-watch' | 'fence-set' | 'empty-reason';
+
+export type ClearDecision =
+  | { ok: true }
+  | { ok: false; refusal: Exclude<ClearRefusal, 'newer-stop' | 'latch-unknown'> }
+  | { ok: false; refusal: 'latch-unknown'; reason: Extract<LatchView, { state: 'unknown' }>['reason'] }
+  | { ok: false; refusal: 'newer-stop'; newestStopId: number };
 
 export function decideLatchClear(input: {
   latch: LatchView;
@@ -195,8 +201,10 @@ export function decideLatchClear(input: {
   openWatch: boolean;
   fenceSet: boolean;
   reason: string;
-}): { ok: true } | { ok: false; refusal: Exclude<ClearRefusal, 'newer-stop'> } | { ok: false; refusal: 'newer-stop'; newestStopId: number } {
+}): ClearDecision {
   if (input.reason.trim() === '') return { ok: false, refusal: 'empty-reason' };
+  // Every write path treats an unknown latch as latched, so the clear says why it cannot judge it.
+  if (input.latch.state === 'unknown') return { ok: false, refusal: 'latch-unknown', reason: input.latch.reason };
   if (input.latch.state !== 'latched') return { ok: false, refusal: 'not-latched' };
   if (input.throughId !== input.latch.newestStopId) {
     return { ok: false, refusal: 'newer-stop', newestStopId: input.latch.newestStopId };
@@ -214,7 +222,7 @@ export type CodexAction =
   | { kind: 'refresh' }
   | { kind: 'import' | 'adopt' | 'stash' };
 
-export type AdmissionRefusal = 'codex-stop-latched' | 'codex-switch-dark' | 'codex-stage-not-automatic';
+export type AdmissionRefusal = 'codex-stop-latched' | 'codex-switch-disabled' | 'codex-auto-outside-stage-2';
 
 /**
  * Whether an automatic switch is in scope: a Stage 2 run is open, or Stage 2
@@ -241,11 +249,11 @@ export function admitCodexAction(input: {
   const latch = deriveLatch(input.log);
   if (latch.state === 'latched' || latch.state === 'unknown') return { admitted: false, refusal: 'codex-stop-latched' };
   if (action.kind === 'refresh') return { admitted: true };
-  if (!input.flagEnabled) return { admitted: false, refusal: 'codex-switch-dark' };
+  if (!input.flagEnabled) return { admitted: false, refusal: 'codex-switch-disabled' };
   if (action.trigger === 'manual') return { admitted: true };
   return input.log.status === 'readable' && automaticSwitchingAllowed(input.log.events)
     ? { admitted: true }
-    : { admitted: false, refusal: 'codex-stage-not-automatic' };
+    : { admitted: false, refusal: 'codex-auto-outside-stage-2' };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,21 +302,21 @@ function lastIndex<T>(items: T[], match: (item: T) => boolean): number {
   return -1;
 }
 
-function emptyResult(stage: 1 | 2, status: StageResult['status'], startId: number | null, frozen: boolean): StageResult {
-  return { stage, status, startId, frozen, confirmed: [], days: [], refreshes: [], stops: [] };
+function notStarted(stage: 1 | 2): StageResult {
+  return { stage, status: 'not-started', startId: null, frozen: false, confirmed: [], days: [], refreshes: [], stops: [] };
 }
 
 function evaluateStage(input: StageInput, stage: 1 | 2): StageResult {
   const { events } = input;
   const startIndex = lastIndex(events, (row) => row.kind === 'stage-start' && row.stage === stage);
-  if (startIndex < 0) return emptyResult(stage, 'not-started', null, false);
+  if (startIndex < 0) return notStarted(stage);
   const start = events[startIndex];
   const later = events.slice(startIndex + 1);
 
   // A later start of the same or an earlier stage replaces this run.
   const nextStart = later.find((row) => row.kind === 'stage-start');
   if (nextStart && nextStart.stage !== null && nextStart.stage <= stage) {
-    return emptyResult(stage, 'not-started', null, false);
+    return notStarted(stage);
   }
   const close = later.find((row) => row.kind === 'stage-close' && row.stage === stage);
   const frozenBy = [nextStart, close]
@@ -325,10 +333,9 @@ function evaluateStage(input: StageInput, stage: 1 | 2): StageResult {
   const firstStop = allStops[0];
 
   // The run ends at the earliest of the next start, its own close, or its first stop.
+  // A run that ended before any stop keeps its frozen status, with the evidence it was frozen on.
   const frozenAt = frozenBy?.recordedAt ?? Number.POSITIVE_INFINITY;
-  if (frozenBy && (!firstStop || frozenAt <= firstStop.ts) && frozenBy.frozenStatus !== null) {
-    return emptyResult(stage, frozenBy.frozenStatus, start.id, true);
-  }
+  const frozenStatus = frozenBy && (!firstStop || frozenAt <= firstStop.ts) ? frozenBy.frozenStatus : null;
   const end = Math.min(frozenAt, firstStop ? firstStop.ts + 1 : Number.POSITIVE_INFINITY);
   const stops = allStops.filter((finding) => finding.ts < end);
 
@@ -342,25 +349,27 @@ function evaluateStage(input: StageInput, stage: 1 | 2): StageResult {
 
   let refreshes: number[] = [];
   if (stage === 2) {
-    const firstSwitchAt = Math.min(...runSwitches.map((row) => row.committedAt ?? row.ts));
-    // A pre-switch refresh is credited to the run of the switch it preceded,
-    // even when it was logged before the evidence window opened.
-    const precededRunSwitch = (row: StageLineageRow): boolean => runSwitches.some((switchRow) =>
-      switchRow.toAccount === row.accountId && row.ts >= start.recordedAt && row.ts <= (switchRow.committedAt ?? switchRow.ts));
+    const first = runSwitches.reduce<StageSwitchRow | undefined>((earliest, row) =>
+      earliest === undefined || (row.committedAt ?? row.ts) < (earliest.committedAt ?? earliest.ts) ? row : earliest, undefined);
+    const firstSwitchAt = first ? first.committedAt ?? first.ts : Number.POSITIVE_INFINITY;
+    // The window opens at the first switch, so only that switch's own pre-switch
+    // refresh can land before it; credit it to the run.
+    const firstPreSwitch = (row: StageLineageRow): boolean =>
+      first !== undefined && row.accountId === first.toAccount && row.ts >= start.recordedAt && row.ts <= firstSwitchAt;
     refreshes = input.lineage
       .filter((row) => row.by === 'qlb-auto' && row.cause === 'post')
-      .filter((row) => (row.ts >= firstSwitchAt && row.ts < end) || precededRunSwitch(row))
+      .filter((row) => (row.ts >= firstSwitchAt && row.ts < end) || firstPreSwitch(row))
       .map((row) => row.id);
   }
 
   const bar = PASS_BARS[stage];
-  const status: StageStatus = stops.length > 0
+  const status: StageStatus = frozenStatus ?? (stops.length > 0
     ? 'stop'
     : confirmedRows.length >= bar.switches && days.length >= bar.days && refreshes.length >= bar.refreshes
       ? 'pass'
-      : 'not-yet';
+      : 'not-yet');
   return {
-    stage, status, startId: start.id, frozen: false,
+    stage, status, startId: start.id, frozen: frozenStatus !== null,
     confirmed: confirmedRows.map((row) => row.id), days, refreshes, stops,
   };
 }
