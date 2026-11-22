@@ -37,10 +37,10 @@ const expected = definitionsIn(manifestDir).map(signature);
 const actual = discoverChecks().map(signature);
 const problems = [
   ...unmatched(expected, actual).map((entry) =>
-    `missing ${describe(entry)}; restore its module under src/checks/, or remove its test/wiring/checks.d entry only if intentional`,
+    `missing ${describe(entry)}; restore its module or prefix under src/checks/, or change or remove its test/wiring/checks.d entry only if intentional`,
   ),
   ...unmatched(actual, expected).map((entry) =>
-    `unexpected ${describe(entry)}; add it to test/wiring/checks.d if intentional`,
+    `unexpected ${describe(entry)}; if intentional, record it in test/wiring/checks.d with its prefix as the file content (empty for none)`,
   ),
 ].sort();
 if (problems.length > 0) {
