@@ -216,6 +216,19 @@ Per-provider statuses:
 
 Flags: `[--provider kimi-coding|openai-codex] [--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
 
+## `qlb usage probe`
+
+Make a direct, metadata-only usage request for one provider. This is a diagnostic probe, not a refresh: it does not persist readings or apply refresh backoff, and its JSON output contains `status`, `source`, and `keys` (plus `credentialSource` for Pi-auth mode). For Kimi, `keys` are the response's top-level keys.
+
+```console
+$ qlb usage probe kimi-coding --json --source pi-auth
+{"status":200,"source":"kimi-api","credentialSource":"pi-auth","keys":["usage","limits"]}
+```
+
+`qlb usage probe kimi-coding --json` uses QLB's managed Kimi credential. Add `--source pi-auth` to instead use the `kimi-coding` entry from the configured `piAuthJsonPath` (including `--pi-auth-json-path`, `QLB_PI_AUTH_JSON_PATH`, or the config file). This mode is read-only: it never modifies Pi's `auth.json`. If that entry is missing, unreadable, the QLB placeholder, or has no non-empty `access` token, it makes no request, prints `status: null`, and exits `1`. It is accepted only for `kimi-coding`; `openai-codex` accepts only `qlb usage probe openai-codex --json`.
+
+The probe deliberately never prints a credential, request headers, or a response body. Any completed provider response, including an HTTP error response, exits `0`, so callers must inspect `status`. Pi-auth mode exits `1` when credential selection or the request fails and its result has `status: null`; the default preserves its historical exit `0` in that case.
+
 ## `qlb native-resync`
 
 Compare a QLB-owned credential with the provider's current native credential and resync QLB's Keychain copy if they differ. This is the manual trigger for the same fingerprint-compare-and-resync the proxy runs automatically on an auth failure — mechanism and the differ-vs-identical semantics are described in [CREDENTIAL-SAFETY.md](CREDENTIAL-SAFETY.md#native-credential-drift-the-shadow-retain-tradeoff). It is one Keychain overwrite at most, never a re-migration, and exits `0` either way:
