@@ -9,7 +9,7 @@ const TOKEN_PATTERNS: readonly RegExp[] = [
   /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])/g,
   /(?<![A-Za-z0-9])xai-[A-Za-z0-9]{32,}(?![A-Za-z0-9])/g,
   /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?![A-Za-z0-9_-])/g,
-  /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}={0,}(?![A-Za-z0-9\-._~+/=])/gi,
+  /(?<![A-Za-z0-9\-._~+/=])Bearer[ \t]+[A-Za-z0-9\-._~+/]{16,}(?:=+|(?![A-Za-z0-9\-._~+/=]))/gi,
 ];
 
 const SENSITIVE_KEY = new Set([
@@ -55,12 +55,82 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
   const values = [...new Set(secrets.filter(Boolean))];
   const replacements = [...new Set(values.flatMap((secret) => [fingerprint(secret), secret]))]
     .sort((a, b) => b.length - a.length);
-  let out = replacements.length > 0
-    ? text.replace(new RegExp(replacements.map(escapeRegExp).join('|'), 'g'), REDACTED)
-    : text;
+  const known = replacements.length > 0 ? new RegExp(replacements.map(escapeRegExp).join('|'), 'g') : undefined;
+  // Whole registered secrets win before anything is decoded, so a registered
+  // credential blob is never split by the literal pass below.
+  const exact = known ? text.replace(known, REDACTED) : text;
+  // A JSON escape (\n, \t, \u0001, ...) hides a token boundary from the raw
+  // patterns, so literals are redacted after decoding. Nested serialized JSON
+  // is decoded before its token patterns run, matching the outer pass order.
+  // Markers already inserted are skipped, so a registered secret that is a
+  // substring of the marker cannot corrupt it.
+  const redactKnown = (value: string): string => known
+    ? value.split(REDACTED).map((part) => part.replace(known, REDACTED)).join(REDACTED)
+    : value;
+  return redactTokenPatterns(redactJsonStringLiterals(exact, redactKnown, 0));
+}
 
+function redactTokenPatterns(text: string): string {
+  let out = text;
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
+}
+
+// A decoded literal that itself holds serialized JSON is scanned once more.
+const MAX_LITERAL_DEPTH = 2;
+
+/**
+ * Yields every complete JSON string literal span with one linear scan (no
+ * regex, so no backtracking). A span is replaced when known-secret
+ * replacement, nested literal scanning, or token patterns change its decoded
+ * value. Unterminated text and non-JSON spans are untouched.
+ */
+function redactJsonStringLiterals(text: string, redactKnown: (value: string) => string, depth: number): string {
+  let out = '';
+  let copied = 0;
+  let backslash = text.indexOf('\\');
+  let cursor = text.indexOf('"');
+  while (cursor !== -1) {
+    // Jump between quotes and backslashes with native searches; a backslash
+    // escapes the next character, so the literal ends at the first quote that
+    // no backslash consumed.
+    let scan = cursor + 1;
+    let escaped = false;
+    let end = text.indexOf('"', scan);
+    while (end !== -1 && backslash !== -1 && backslash < end) {
+      if (backslash >= scan) {
+        escaped = true;
+        scan = backslash + 2;
+        if (scan > end) end = text.indexOf('"', scan);
+      }
+      backslash = text.indexOf('\\', Math.max(scan, backslash + 1));
+    }
+    if (end === -1) break;
+    // A literal with no escape decodes to itself; the raw pass sees it exactly.
+    const replaced = escaped ? redactJsonStringLiteral(text.slice(cursor, end + 1), redactKnown, depth) : undefined;
+    if (replaced !== undefined) {
+      out += text.slice(copied, cursor) + replaced;
+      copied = end + 1;
+    }
+    cursor = text.indexOf('"', end + 1);
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+
+function redactJsonStringLiteral(span: string, redactKnown: (value: string) => string, depth: number): string | undefined {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(span);
+  } catch {
+    return undefined;
+  }
+  if (typeof decoded !== 'string') return undefined;
+  let redacted = redactKnown(decoded);
+  if (depth + 1 < MAX_LITERAL_DEPTH && redacted.includes('"')) {
+    redacted = redactJsonStringLiterals(redacted, redactKnown, depth + 1);
+  }
+  redacted = redactTokenPatterns(redacted);
+  return redacted === decoded ? undefined : JSON.stringify(redacted);
 }
 
 const SENSITIVE_KEY_NAME = [...SENSITIVE_KEY]
