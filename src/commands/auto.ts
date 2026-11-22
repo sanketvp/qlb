@@ -341,7 +341,7 @@ export async function runAutoCommand(
 ): Promise<number> {
   // Parse before subcommand dispatch, admission, or lock acquisition: a
   // fault flag is never silently accepted by a different auto operation.
-  const parsedInjection = parseInjectFlag(args, ctx.env);
+  const parsedInjection = parseInjectFlag(args, ctx.env, ['usage-5xx', 'breaker-rows']);
   if ('usage' in parsedInjection) {
     ctx.stderr(parsedInjection.usage);
     return 2;
