@@ -302,6 +302,7 @@ test('A14c: the strict signal classifier never signals a command main would not'
     'python3 -1m claude_swap',
     'python3 -- -m claude_swap',
     'python3 -- cswap',
+    'python3 -- -x/cswap foo',
     'python3 - cswap',
     'python3 -Q new -m claude_swap',
     'python3 -Qm claude_swap',
