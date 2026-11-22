@@ -27,11 +27,31 @@ private func fail(_ message: String, _ status: OSStatus? = nil, code: Int32 = 1)
 
 private func readPayload() -> Data {
     let value = FileHandle.standardInput.readDataToEndOfFile()
+    // Zero bytes means a writer that sent nothing, never a value to store (K-nokill-r3).
+    guard !value.isEmpty else { fail("empty payload") }
     guard value.count <= maxPayloadBytes else { fail("payload exceeds 64 KiB") }
     return value
 }
 
 private var selectedKeychain: SecKeychain?
+
+/**
+ Opens an existing `--keychain <path>`, if one was given.
+ `SecKeychainOpen` can return a reference for a missing keychain, so verify its status
+ before any operation can fall back to the login keychain.
+ */
+private func selectKeychain(_ path: String?) {
+    guard let path else { return }
+    var keychain: SecKeychain?
+    guard SecKeychainOpen(path, &keychain) == errSecSuccess, let keychain else {
+        fail("could not open requested keychain")
+    }
+    var status: SecKeychainStatus = 0
+    guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else {
+        fail("could not open requested keychain")
+    }
+    selectedKeychain = keychain
+}
 
 private func query(_ service: String, _ account: String) -> [CFString: Any] {
     var attributes: [CFString: Any] = [
@@ -294,24 +314,25 @@ private func matrix(_ prefix: String, previousHelper: String? = nil) {
 }
 
 var args = Array(CommandLine.arguments.dropFirst())
+var keychainPath: String?
 if args.first == "--keychain" {
     guard args.count >= 3 else { fail("--keychain requires a path") }
-    var keychain: SecKeychain?
-    guard SecKeychainOpen(args[1], &keychain) == errSecSuccess, let keychain else {
-        fail("could not open requested keychain")
-    }
-    selectedKeychain = keychain
+    keychainPath = args[1]
     args.removeFirst(2)
 }
+// `set` reads stdin, so it opens the keychain itself, after validating the payload.
+if args.first != "set" { selectKeychain(keychainPath) }
 
 switch (args.count, args.first) {
 case (3, "set"):
     var payload = readPayload()
     defer { payload.resetBytes(in: 0..<payload.count) }
+    selectKeychain(keychainPath)
     set(args[1], args[2], payload)
 case (5, "set") where args[1] == "--if-sha256":
     var payload = readPayload()
     defer { payload.resetBytes(in: 0..<payload.count) }
+    selectKeychain(keychainPath)
     setIfSha256(args[3], args[4], args[2], payload)
 case (3, "probe-read"):
     probeRead(args[1], args[2])

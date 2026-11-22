@@ -10,6 +10,10 @@ import { qlbUnavailable, type PiProvider } from '../extensions/qlb-pi/active-acc
 import { CONSUME_ERRORS } from '../extensions/qlb-pi/consume';
 import { createAnthropicSource } from '../extensions/qlb-pi/providers/anthropic';
 import { createOpenAICodexSource, gateCause } from '../extensions/qlb-pi/providers/openai-codex';
+import { runExecutingCommand } from '../src/app';
+import { beginCutover, transition } from '../src/lifecycle';
+import { discoverCommands, resolveCommand, type CommandContext } from '../src/registry';
+import { openStore } from '../src/store';
 
 const ROOT = join(__dirname, '..', '..');
 const PI_GLOBAL_ROOT = process.env.QLB_TEST_PI_ROOT ?? resolvePiPackageRoot() ?? '/nonexistent-pi';
@@ -124,6 +128,43 @@ function causeCode(error: unknown): string {
 }
 
 describe('qlb-pi gate refusal causes', () => {
+  it('the real qlb gate lifecycle refusal line parses to its cause in Pi (TC-15)', async () => {
+    // Pi's gate parsers strip `qlb gate: refused: ` and accept only a bare
+    // allowlisted code, so the dispatcher must not append operator guidance.
+    // Both stores refuse at dispatch, before any credential is read.
+    for (const { phase, cause } of [
+      { phase: 'undoing', cause: 'undo-in-progress' },
+      { phase: 'pre-cutover', cause: 'phase=pre-cutover' },
+    ] as const) {
+      const home = mkdtempSync(join(tmpdir(), 'qlb-gate-refusal-'));
+      const dbPath = join(home, '.qlb', 'qlb.db');
+      const store = openStore(dbPath);
+      try {
+        if (phase === 'undoing') {
+          beginCutover(store, 1);
+          assert.equal(transition(store, 'cutover', 2).ok, true);
+          assert.equal(transition(store, 'undoing', 3).ok, true);
+        }
+      } finally { store.close(); }
+      const match = resolveCommand(['gate', 'anthropic', '--json'], discoverCommands());
+      assert.ok(match);
+      assert.equal(match.command.name, 'gate');
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const ctx: CommandContext = {
+        stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+        env: { QLB_TEST_MODE: '1', QLB_HOME: home, HOME: home },
+        config: { dbPath } as CommandContext['config'], loadConfig: () => { throw new Error('not used'); }, home,
+        registerSecret: () => undefined, deliverSecret: () => undefined, knownSecrets: () => [],
+      };
+
+      assert.equal(await runExecutingCommand(match, ctx), 3, phase);
+      assert.deepEqual(stdout, [], phase);
+      assert.deepEqual(stderr, [`qlb gate: refused: ${cause}`], phase);
+      assert.equal(gateCause(stderr.join('\n')), cause, phase);
+    }
+  });
+
   it('maps an exit-3 guard refusal through both provider readers to token-call-refused', async () => {
     const anthropic = createAnthropicSource({
       runGate: async () => ({ code: 3, stdout: '', stderr: 'token-call-refused' }),

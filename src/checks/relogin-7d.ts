@@ -1,5 +1,5 @@
 import { check, guardCheck } from './_check';
-import { reloginsInWindow } from '../relogin';
+import { countsAsRelogin, reloginsInWindow } from '../relogin';
 import type { HealthCheck } from './claude-slots';
 import { isLifecycleState, LIFECYCLE_STATES } from './lifecycle-phase';
 
@@ -10,7 +10,7 @@ const APPLICABLE_PHASES = new Set<string>(LIFECYCLE_STATES.filter((phase) => (
 )));
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** S26/AC17: any non-denied relogin in the current seven-day window is unhealthy. */
+/** S26/AC17: any relogin that counts under S65 in the current seven-day window is unhealthy. */
 export function relogin7dCheck(
   dbPath: string,
   phase: string,
@@ -30,15 +30,16 @@ export function relogin7dCheck(
     if (!APPLICABLE_PHASES.has(phase)) {
       return { name: 'relogin:7d', level: 'N/A', message: `not applicable in phase=${phase}` };
     }
-    const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now })
-      .filter((event) => event.userDeniedAt == null);
-    return events.length === 0
-      ? { name: 'relogin:7d', level: 'PASS', message: 'no relogin events in the last 7 days' }
+    const events = reloginsInWindow(dbPath, { start: now - windowMs, end: now });
+    const counted = events.filter(countsAsRelogin);
+    const excused = events.filter((event) => !countsAsRelogin(event));
+    return counted.length === 0
+      ? { name: 'relogin:7d', level: 'PASS', message: `no counted relogin events in the last 7 days${excused.length === 0 ? '' : `; excused by user denial: ${excused.map((event) => `#${event.id}@${event.ts}`).join(', ')}`}` }
       : {
         name: 'relogin:7d',
         level: 'FAIL',
-        message: `${events.length} relogin event(s) in the last 7 days`,
-        detail: events.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
+        message: `${counted.length} relogin event(s) in the last 7 days`,
+        detail: counted.map(({ id, ts, provider, accountId, kind }) => ({ id, ts, provider, accountId, kind })),
       };
   });
 }

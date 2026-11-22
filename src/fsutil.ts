@@ -31,6 +31,13 @@ const MAX_SYMLINKS = 40;
 const STRAY_TEMP = /^\.qlb-([\s\S]{0,40})\.([1-9]\d*)\.([a-f0-9]{16})\.tmp$/;
 // QLB addition: retain recent temps so a concurrent writer can finish.
 const STRAY_TEMP_MIN_AGE_MS = 60_000;
+// Builds before A8b (#37) named temps without an owner PID. Only names that
+// STRAY_TEMP rejects are treated as legacy: a legacy stem ending in `.digits`
+// is byte-identical to a current temp, so it keeps the PID rule. Legacy temps
+// have no PID to probe and are swept by age alone, after a grace long enough
+// to cover a paused pre-#37 writer.
+const LEGACY_STRAY_TEMP = /^\.qlb-([\s\S]{0,40})\.([a-f0-9]{16})\.tmp$/;
+const LEGACY_STRAY_TEMP_MIN_AGE_MS = 24 * 60 * 60_000;
 
 export type AtomicWriteOptions = {
   mode?: number;
@@ -251,17 +258,22 @@ function processIsAlive(pid: number): boolean {
  * List QLB atomic-write temps older than 60 seconds immediately below `dir`.
  * This is a QLB addition (the upstream helper has no sweep); lstat avoids
  * following symlinks. The owner PID is checked instead of extending the grace
- * period so an indefinitely stalled live writer is never returned.
+ * period so an indefinitely stalled live writer is never returned. Legacy
+ * PID-less temps are listed by age alone once they are older than 24 hours.
  */
 export function listStrayTemps(dir: string, options: ListStrayTempsOptions = {}): string[] {
   const isProcessAlive = options.isProcessAlive ?? processIsAlive;
   const paths: string[] = [];
-  const oldestAllowed = Date.now() - STRAY_TEMP_MIN_AGE_MS;
+  const now = Date.now();
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const match = STRAY_TEMP.exec(entry.name);
-    if (match === null) continue;
-    const ownerPid = Number(match[2]);
-    if (!Number.isSafeInteger(ownerPid)) continue;
+    let ownerPid: number | undefined;
+    if (match !== null) {
+      ownerPid = Number(match[2]);
+      if (!Number.isSafeInteger(ownerPid)) continue;
+    } else if (!LEGACY_STRAY_TEMP.test(entry.name)) {
+      continue;
+    }
     const path = join(dir, entry.name);
     let metadata;
     try {
@@ -270,7 +282,12 @@ export function listStrayTemps(dir: string, options: ListStrayTempsOptions = {})
       if (errno(error) === 'ENOENT') continue;
       throw error;
     }
-    if (!metadata.isFile() || metadata.mtimeMs > oldestAllowed) continue;
+    const minAge = ownerPid === undefined ? LEGACY_STRAY_TEMP_MIN_AGE_MS : STRAY_TEMP_MIN_AGE_MS;
+    if (!metadata.isFile() || metadata.mtimeMs > now - minAge) continue;
+    if (ownerPid === undefined) {
+      paths.push(path);
+      continue;
+    }
     let ownerIsAlive: boolean;
     try {
       ownerIsAlive = isProcessAlive(ownerPid);
