@@ -15,6 +15,6 @@ export function guardCheck(
   try {
     return run();
   } catch (error) {
-    return recover?.(error) ?? { name, level: 'FAIL', message: `check failed: ${redactError(error, [])}` };
+    return recover?.(error) ?? { name, level: 'FAIL', code: 'check-threw', message: `check failed: ${redactError(error, [])}` };
   }
 }

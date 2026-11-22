@@ -19,7 +19,7 @@ export function codexFirstSwitchCheck(
 ): HealthCheck {
   return guardCheck('codex:first-switch', () => {
     if (!lifecycle.available) {
-      return { name: 'codex:first-switch', level: 'WARN', message: 'lifecycle phase unavailable' };
+      return { name: 'codex:first-switch', level: 'WARN', code: 'phase-unavailable', message: 'lifecycle phase unavailable' };
     }
 
     switch (lifecycle.phase) {
@@ -65,19 +65,20 @@ export function codexFirstSwitchCheck(
         return {
           name: 'codex:first-switch',
           level: 'WARN',
+          code: 'receipt-invalid',
           message: 'C9 receipt invalid',
         };
       }
 
       if (lifecycleRow?.cutoverAt == null) {
-        return { name: 'codex:first-switch', level: 'WARN', message: 'cutover_at missing' };
+        return { name: 'codex:first-switch', level: 'WARN', code: 'cutover-at-missing', message: 'cutover_at missing' };
       }
 
       const message = 'automatic Codex switching stays off until qlb codex verify-l13 --complete records the C9 receipt (X2 step 4b)';
       if (now - lifecycleRow.cutoverAt <= THREE_DAYS_MS) {
         return { name: 'codex:first-switch', level: 'INFO', message };
       }
-      return { name: 'codex:first-switch', level: 'WARN', message: `${message} — overdue` };
+      return { name: 'codex:first-switch', level: 'WARN', code: 'receipt-overdue', message: `${message} — overdue` };
     } finally {
       db.close();
     }

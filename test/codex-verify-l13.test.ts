@@ -95,7 +95,7 @@ describe('C6b-4 codex:first-switch', () => {
   it('codex:first-switch is WARN 4 days after cutover_at without the receipt', () => {
     const subject = check('cutover', NOW - (4 * DAY_MS));
     try {
-      assert.deepEqual(subject.result, { name: 'codex:first-switch', level: 'WARN', message: `${RECEIPT_MESSAGE} — overdue` });
+      assert.deepEqual(subject.result, { name: 'codex:first-switch', level: 'WARN', code: 'receipt-overdue', message: `${RECEIPT_MESSAGE} — overdue` });
     } finally {
       rmSync(subject.home, { recursive: true, force: true });
     }
@@ -131,7 +131,7 @@ describe('C6b-4 codex:first-switch', () => {
           db.close();
         }
         assert.deepEqual(codexFirstSwitchCheck(subject.dbPath, { available: true, phase: 'cutover' }, NOW), {
-          name: 'codex:first-switch', level: 'WARN', message: 'C9 receipt invalid',
+          name: 'codex:first-switch', level: 'WARN', code: 'receipt-invalid', message: 'C9 receipt invalid',
         });
       } finally {
         rmSync(subject.home, { recursive: true, force: true });
@@ -162,7 +162,7 @@ describe('C6b-4 codex:first-switch', () => {
     assert.deepEqual(codexFirstSwitchCheck('unused.db', {
       available: false, phase: 'unknown', reason: 'fixture unavailable',
     }, NOW), {
-      name: 'codex:first-switch', level: 'WARN', message: 'lifecycle phase unavailable',
+      name: 'codex:first-switch', level: 'WARN', code: 'phase-unavailable', message: 'lifecycle phase unavailable',
     });
   });
 
@@ -188,7 +188,7 @@ describe('C6b-4 codex:first-switch', () => {
       assert.ok(result.status === 0 || result.status === 1, result.stderr);
       const checks = (JSON.parse(result.stdout) as { checks: Array<{ name: string; level: string; message: string }> }).checks;
       assert.deepEqual(checks.find((entry) => entry.name === 'codex:first-switch'), {
-        name: 'codex:first-switch', level: 'WARN', message: 'lifecycle phase unavailable',
+        name: 'codex:first-switch', level: 'WARN', code: 'phase-unavailable', message: 'lifecycle phase unavailable',
       });
     } finally {
       rmSync(home, { recursive: true, force: true });
