@@ -280,6 +280,9 @@ export const runHostCommand: HostCommandRunner = (command, args, options) => {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 5_000,
+    // SIGKILL: an interactive login shell stuck in its rc file ignores SIGTERM, which would hold
+    // doctor past the bound. Only the direct child is killed (no process-group kill).
+    killSignal: 'SIGKILL',
     env: options?.env,
     detached: true,
   };
@@ -666,6 +669,8 @@ export async function doctorQlb(
     hostPlatform?: NodeJS.Platform;
     hostShell?: string;
     hostShellExists?: (path: string) => boolean;
+    /** Tests inject a fixture launchctl; under QLB_TEST_MODE without it, launchctl is not probed. */
+    hostLaunchctl?: string;
     /** Tests may inject recorded Keychain matrix/authorization state without a real store. */
     configReader?: (key: string) => string | null;
     /** Tests inject signing metadata rather than requiring a locally built helper. */
@@ -875,6 +880,7 @@ export async function doctorQlb(
     // An explicit hostShell key (even undefined) overrides the real SHELL, so tests are host-independent.
     shell: 'hostShell' in options ? options.hostShell : process.env.SHELL,
     shellExists: options.hostShellExists ?? existsSync,
+    launchctl: options.hostLaunchctl ?? (process.env.QLB_TEST_MODE === '1' ? null : '/bin/launchctl'),
   }));
 
   // A7 checks are real doctor rows, never registry reconciliation placeholders.
