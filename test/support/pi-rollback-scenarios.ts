@@ -20,7 +20,6 @@ import { runPiGate } from '../../src/pi-gate';
 import { openStore, setStoreForTests, type Store } from '../../src/store';
 import { platformKeychain, QLB_KEYCHAIN_ACCOUNT, qlbKeychainService } from '../../src/keychain';
 import { XAI_REFRESH_URL } from '../../src/oauth/xai-refresh';
-import { KIMI_CODING_OAUTH_HOST } from '../../src/oauth/kimi-coding-refresh';
 
 export type DrillProvider = 'xai' | 'kimi-coding' | 'openrouter';
 export type OAuthProvider = 'xai' | 'kimi-coding';
@@ -29,11 +28,6 @@ export const DRILL_PROVIDERS: readonly DrillProvider[] = ['xai', 'kimi-coding', 
 /** The shape of the live Pi Anthropic entry (R1b); every scenario must leave it unchanged. */
 export const ANTHROPIC_ENTRY = { mode: 'qlb', since: 1_763_000_000_000 };
 export const PLACEHOLDER = { type: 'oauth', access: 'qlb-managed', refresh: '', expires: 4_102_444_800_000 };
-
-const TOKEN_ENDPOINTS: Record<OAuthProvider, string> = {
-  xai: XAI_REFRESH_URL,
-  'kimi-coding': `${KIMI_CODING_OAUTH_HOST}/api/oauth/token`,
-};
 
 export interface DrillFixture {
   agentDir: string;
@@ -85,8 +79,8 @@ export function expireQlbGrant(provider: OAuthProvider): void {
 /**
  * A fresh Pi agent dir with a live-shaped Anthropic claim and native xai/kimi
  * logins, a cutover-phase DB installed as the process-wide store, the
- * QLB_TEST_MODE credential backend cleared, and network stubbed to the two
- * OAuth token endpoints. Call `close()` in `afterEach`.
+ * QLB_TEST_MODE credential backend cleared, and network stubbed to XAI's
+ * OAuth token endpoint. Call `close()` in `afterEach`.
  */
 export function createDrillFixture(): DrillFixture {
   if (process.env.QLB_TEST_MODE !== '1' || !process.env.QLB_HOME) {
@@ -116,12 +110,11 @@ export function createDrillFixture(): DrillFixture {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input instanceof Request ? input.url : input);
-    const provider = (Object.keys(TOKEN_ENDPOINTS) as OAuthProvider[]).find((key) => TOKEN_ENDPOINTS[key] === url);
-    if (!provider) throw new Error(`drill: unexpected network call to ${url}`);
-    tokenCalls.push(provider);
+    if (url !== XAI_REFRESH_URL) throw new Error(`drill: unexpected network call to ${url}`);
+    tokenCalls.push('xai');
     return new Response(JSON.stringify({
-      access_token: `${provider}-qlb-refreshed-access`,
-      refresh_token: `${provider}-qlb-refreshed-refresh`,
+      access_token: 'xai-qlb-refreshed-access',
+      refresh_token: 'xai-qlb-refreshed-refresh',
       expires_in: 3600,
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
