@@ -3313,6 +3313,144 @@ describe('reconcileCodexRecovery — C6-20', () => {
       assert.deepEqual(switchRows(h.db).filter(({ steps_json }) => String(steps_json).includes('"fence"')), []);
     } finally { close(h); }
   });
+
+  // ---- C6-20d: journal recovery with an unreadable slot-B Keychain item ----
+  const damageB = {
+    missing: (h: Harness) => h.keychain.deleteSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT),
+    corrupt: (h: Harness) => breakSlot(h, 'b:account'),
+  };
+
+  it('journal recovery with an unreadable B Keychain item and a live external write fences slot-split and writes nothing else', async () => {
+    for (const [name, damage] of Object.entries(damageB)) {
+      const h = switchHarness();
+      try {
+        const j = install(h);
+        codexWrites(h, observedDocument('a', 'a-external'));
+        damage(h);
+        const before = { active: activeLogin(h), a: h.store.getCodexSlot('a:account')?.fingerprint,
+          b: h.store.getCodexSlot('b:account')?.fingerprint, live: readFileSync(h.authPath, 'utf8') };
+        assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+          accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual(switchRows(h.db), [], name);
+        assert.deepEqual({ active: activeLogin(h), a: h.store.getCodexSlot('a:account')?.fingerprint,
+          b: h.store.getCodexSlot('b:account')?.fingerprint, live: readFileSync(h.authPath, 'utf8') }, before, name);
+        assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM lineage_log WHERE cause = 'adopt'"), 0, name);
+        assert.deepEqual(await refresh(h, 'a:account'), refused('slot-split'), name);
+      } finally { close(h); }
+    }
+  });
+
+  it('journal recovery with an unreadable B also fences the live identity\'s managed slot (C6-20d)', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = install(h);
+      codexWrites(h, observedDocument('c', 'c-live'));
+      breakSlot(h, 'b:account');
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account', 'c:account'] });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('journal recovery with an unreadable B fences every account when the live login has no identity (C6-20d)', async () => {
+    const h = switchHarness();
+    try {
+      importActiveCodexSlot(observedDocument('c', 'c0'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      const j = install(h);
+      const noIdentity = freshenDocument(1_700_100_000_000, 'no-identity');
+      codexWrites(h, { ...noIdentity, tokens: { ...noIdentity.tokens, id_token: freshenJwt({}) } });
+      breakSlot(h, 'b:account');
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'), accounts: '*' });
+      assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: '*' });
+      assert.deepEqual(await refresh(h, 'c:account'), refused('slot-split'));
+      assert.deepEqual(switchRows(h.db), []);
+    } finally { close(h); }
+  });
+
+  it('journal recovery with an unreadable B after a recorded adoption fences slot-split (C6-20d)', async () => {
+    for (const [name, damage] of Object.entries(damageB)) {
+      const h = switchHarness();
+      try {
+        const bPrime = observedDocument('b', 'b-rotated');
+        const j = recoveryJournal(h);
+        j.adoptingTarget = [codexFingerprint(bPrime)];
+        await attributeForPhase({ assertHeld: () => undefined }, 'post', { store: h.store, keychain: h.keychain,
+          slot: { accountId: 'b:account', document: h.b, fingerprint: codexFingerprint(h.b) }, activeSlotId: 'a:account',
+          activeSetBy: 'adopt', live: bPrime, holderObservation: { aliveBefore: true, aliveAfter: false }, now: () => 3 });
+        writeFileSync(h.authPath, JSON.stringify(h.b));
+        install(h, j);
+        damage(h);
+        assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+          accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: 'slot-split', accounts: ['a:account', 'b:account'] }, name);
+        assert.deepEqual(switchRows(h.db), [], name);
+      } finally { close(h); }
+    }
+  });
+
+  it('the journal is kept after a slot-split fence and recovery resolves once B is readable again (C6-20d)', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      const external = observedDocument('a', 'a-external');
+      codexWrites(h, external);
+      const stored = h.keychain.getSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT)!;
+      breakSlot(h, 'b:account');
+      assert.equal((await h.recover()).state, 'fenced');
+      // A second check while B is still unreadable keeps the journal and the same fence.
+      assert.deepEqual(fenced(await h.recover()), { state: 'fenced', reason: 'slot-split', message: recoveryMessage('slot-split'),
+        accounts: ['a:account', 'b:account'] });
+      assert.equal(onDisk(h).state, 'ok');
+      // Re-adding B (its Keychain copy backs its DB head again) lets recovery finish.
+      h.keychain.setSync(qlbKeychainService('openai-codex', 'b:account'), QLB_KEYCHAIN_ACCOUNT, stored);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.equal(onDisk(h).state, 'absent');
+      assert.equal(switchRows(h.db).length, 1);
+      assert.equal((lastRow(h) as { from_account: string }).from_account, j.from);
+    } finally { close(h); }
+  });
+
+  it('a transient Keychain error on B during journal recovery propagates and fences nothing (C6-20d)', async () => {
+    const failures: Record<string, () => Error> = {
+      timeout: () => Object.assign(new Error('security find-generic-password timed out after 10s'), { code: 'ETIMEDOUT' }),
+      'access denied': () => new Error('keychain get failed: User interaction is not allowed.'),
+    };
+    for (const [label, failure] of Object.entries(failures)) {
+      const h = switchHarness();
+      try {
+        const j = install(h);
+        codexWrites(h, observedDocument('a', 'a-external'));
+        const slots = { ...h.slots, readSlot: (id: string, opts?: unknown) => {
+          if (id === 'b:account') throw failure();
+          return (h.slots.readSlot as (id: string, opts?: unknown) => unknown)(id, opts);
+        } };
+        await assert.rejects(h.recover({ slots: slots as never }), (error: Error) => error.message === failure().message, label);
+        assert.deepEqual(unresolvedJournal(h), { attempt: j.attemptId, reason: undefined, accounts: undefined }, label);
+        assert.equal(h.store.getConfig('codex.recoveryFence'), null, label);
+        assert.deepEqual(switchRows(h.db), [], label);
+      } finally { close(h); }
+    }
+  });
+
+  it('a target-changed journal with an unreadable B is unchanged by C6-20d', async () => {
+    const h = switchHarness();
+    try {
+      const j = install(h);
+      importActiveCodexSlot(observedDocument('b', 'b-new'), { store: h.store, keychain: h.keychain, now: () => 2 });
+      h.store.setActiveLogin('openai-codex', 'a:account', 'import', 3);
+      breakSlot(h, 'b:account');
+      codexWrites(h, h.a);
+      assert.deepEqual(await h.recover(), { state: 'clear' });
+      assert.deepEqual(lastRow(h), viaJournal(j, 'failed', 'target-changed'));
+      assert.equal(onDisk(h).state, 'absent');
+    } finally { close(h); }
+  });
 });
 
 describe('Codex watch tick — C6-21', () => {

@@ -19,14 +19,34 @@ export type ParseInjectFlagResult =
   | { rest: string[]; inject: FailStepInjection | UsageInjection | BreakerRowsInjection | null }
   | { usage: string };
 
-const INJECT_USAGE = 'usage: --inject <fail-step <7|8|9>|usage-5xx anthropic|breaker-rows anthropic>';
-const INJECT_ENV_USAGE = `${INJECT_USAGE} requires QLB_FAULT_INJECTION=1`;
+export type InjectionForm = 'fail-step' | 'usage-5xx' | 'breaker-rows';
+
+const FORM_USAGE: Record<InjectionForm, string> = {
+  'fail-step': 'fail-step <7|8|9>',
+  'usage-5xx': 'usage-5xx anthropic',
+  'breaker-rows': 'breaker-rows anthropic',
+};
+const ALL_FORMS: readonly InjectionForm[] = ['fail-step', 'usage-5xx', 'breaker-rows'];
+
+function injectUsage(forms: readonly InjectionForm[]): string {
+  const listed = forms.map((form) => FORM_USAGE[form]);
+  return `usage: --inject ${listed.length === 1 ? listed[0] : `<${listed.join('|')}>`}`;
+}
 
 export function faultInjectionEnabled(env: FaultInjectionEnvironment): boolean {
   return env.QLB_FAULT_INJECTION === '1';
 }
 
-export function parseInjectFlag(args: readonly string[], env: FaultInjectionEnvironment): ParseInjectFlagResult {
+/**
+ * `forms` names the injection forms the calling command accepts. It shapes
+ * only the usage text; every command still rejects the other forms itself.
+ */
+export function parseInjectFlag(
+  args: readonly string[],
+  env: FaultInjectionEnvironment,
+  forms: readonly InjectionForm[] = ALL_FORMS,
+): ParseInjectFlagResult {
+  const usage = injectUsage(forms);
   const flagIndexes = args.reduce<number[]>((indexes, arg, index) => {
     if (arg === '--inject') indexes.push(index);
     return indexes;
@@ -37,10 +57,10 @@ export function parseInjectFlag(args: readonly string[], env: FaultInjectionEnvi
   }
 
   if (!faultInjectionEnabled(env)) {
-    return { usage: INJECT_ENV_USAGE };
+    return { usage: `${usage} requires QLB_FAULT_INJECTION=1` };
   }
   if (flagIndexes.length !== 1 || hasEqualsSpelling) {
-    return { usage: INJECT_USAGE };
+    return { usage };
   }
 
   const flagIndex = flagIndexes[0];
@@ -58,7 +78,7 @@ export function parseInjectFlag(args: readonly string[], env: FaultInjectionEnvi
       inject: { kind, provider: 'anthropic' },
     };
   }
-  return { usage: INJECT_USAGE };
+  return { usage };
 }
 
 export function injectionDetail(inject: FailStepInjection | UsageInjection | BreakerRowsInjection): string {

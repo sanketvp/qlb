@@ -2377,7 +2377,8 @@ export async function runExecutingCommand(
           ? `; ${FINISH_RETIREMENT_FIRST}`
           : operation === 'lifecycle-close' && refusal === CSWAP_RESTORE_PENDING
             ? `; ${FINISH_CSWAP_RESTORE_FIRST}`
-            : refusal === 'undo-in-progress'
+            // Pi parses `gate` stderr as a bare allowlisted code, so gate refusals carry no guidance.
+            : refusal === 'undo-in-progress' && operation !== 'gate'
               ? '; run qlb undo cswap --resume'
               : '';
         redactingContext.stderr(`qlb ${match.command.name}: refused: ${refusal}${guidance}`);

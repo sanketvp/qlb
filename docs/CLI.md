@@ -74,6 +74,7 @@ Beyond the core and per-provider lines, doctor also reports provider-usage compa
 | `usage:provider-discrepancies` | always; `N/A` when the QLB database does not exist yet | Reads the last 30 days of provider-authority records without changing them. `WARN` reports provider/QLB disagreements or malformed direct-provider percentages; when values disagree, the direct-provider value remains canonical. `PASS` means no such records are retained. |
 | `fs:stray-temps` | always | Lists QLB atomic-write temporary files that are over 60 seconds old and whose owner PID is no longer running. It never reads their contents, modifies, or deletes them; `WARN` includes their paths, and also identifies any configured directory it could not inspect. |
 | `claude:active` | always; `N/A` in recognized non-cutover phases and when no Claude slots exist, and `WARN` when lifecycle state is unavailable or unknown | During `cutting-over`, `cutover`, or `retired`, verifies without reading credentials that the active Claude login is set and names a live, unarchived slot. `FAIL` means it is unset, missing, dead, or archived; `WARN` means the active slot requires re-login; `PASS` identifies the active account and when it was set. |
+| `relogin:7d` | `cutting-over`, `cutover`, or `retired`; `N/A` in other recognized lifecycle phases and `WARN` when lifecycle state is unavailable or unknown | Checks every provider's preceding seven days of relogin events using the [S65 eligibility rule](#qlb-report-cutover). Any counted event is `FAIL`; a passing row identifies any excused event by ID and timestamp. This row's `WARN` or `FAIL` blocks S64. |
 | `claude:login-expiry` | always | Reads each live Claude slot through QLB's read-only managed Keychain entry; it never refreshes credentials or writes Keychain state. `FAIL` means a reported login expiry has passed, `WARN` means it is within seven days or the slot credential cannot be read or parsed, and `PASS` means there are no live slots or no reported expiry has passed or is within seven days. This advisory row never blocks S64. |
 | `claude:version-drift` | always | Compares the non-secret Claude Code version recorded by `qlb lifecycle sentinels record` with a read-only `claude --version` result. It reports `INFO` when no version is recorded, `PASS` when the installed version equals the recorded sentinel, `WARN` when the values differ or Claude Code cannot run, and never blocks S64. |
 | `claude:unclaimed` | always; `N/A` before `cutover` and `WARN` when lifecycle state is unavailable or unknown | During `cutover` or `retired`, reads only non-secret Anthropic successor-stash index metadata; it never opens a Keychain item or fallback body. `WARN` identifies stashes older than 30 days and prints their `qlb claude restore-unclaimed <stash> <slot>` recovery commands; `INFO` counts newer stashes. `FAIL` means the index is unavailable or contains malformed metadata, and blocks S64 retirement until repaired. |
@@ -88,7 +89,7 @@ Beyond the core and per-provider lines, doctor also reports provider-usage compa
 | `pi:extension-drift` | always | Compares that same install with the extension inside `~/.qlb/app/current`, not with the git checkout. `PASS` when `pi.deployedAt` is recorded and the installed hash, the recorded `pi.extensionHash`, and the current-release hash are the same (`installed qlb-pi deployment hash matches the current release`). `WARN` when nothing has been deployed (`not deployed`), the deployment record cannot be read, or the current release cannot be planned. `FAIL` when the hash differs (`installed qlb-pi deployment hash differs from the current release`), a legacy `.qlb-pi-` staging directory is still under `extensions`, or the installed tree is unavailable. `qlb release install` followed by `qlb pi deploy` makes this row pass. `pi:extension` passes with it when this repo's `extensions/qlb-pi` matches those same bytes. |
 | `pi:seam:<name>` | Pi and the extension are installed | One line per Pi API the extension depends on (`anthropicMessagesApi`, `registerProvider`, `model_select`, `after_provider_response`); flags a Pi upgrade that removed one. |
 | `pi:typecheck` | `--live` only | Typechecks the extension against the Pi you actually run. |
-| `hermes:checkout` | no Hermes checkout at `~/.hermes/hermes-agent` | `PASS`; all other Hermes checks are skipped. |
+| `hermes:checkout` | no Hermes checkout at `$HERMES_HOME/hermes-agent` (default: `~/.hermes/hermes-agent`) | `PASS`; all other Hermes checks are skipped. |
 | `hermes:integration` | Hermes is installed but there is no trace of QLB in it | `WARN`; the other Hermes checks are skipped. This is the "off" state: the config is absent or, when parsed as YAML, has no `qlb-anthropic` / `qlb-codex` key and no `provider: custom:qlb-anthropic` / `custom:qlb-codex` value (including block, flow, and quoted YAML; comments and strings do not count); no QLB plugin directory or `qlb-proxy-token`, `qlb-hermes-watch`, or `qlb-hermes-models` script; and no proxy (`com.sanket.qlb-proxy` / `QLB_LAUNCHD_LABEL`) or watch (`com.sanket.qlb-hermes-watch` / `QLB_WATCH_LABEL`) plist. An unreadable or invalid config is not off. |
 | `hermes:config` | there is some trace of QLB in Hermes | `FAIL` when the config cannot be read or parsed as YAML; `providers` is not a mapping; either QLB provider entry is absent or is not a mapping; either is missing `api`, `transport`, `key_cmd`, or `session_affinity_header`; or `qlb-codex.api` is not a URL ending in `/v1`. Repeated keys keep the last value and `<<` merge keys are resolved, as in Hermes' own YAML reader. `WARN` when the entries are intact but `model.provider` is not `custom:qlb-anthropic`. |
 | `hermes:plugin` | same | `FAIL` when the QLB Hermes plugin is missing or its last load could not patch Hermes. `WARN` when it has not reported a load yet. |
@@ -105,6 +106,8 @@ That check is broader than the owned Pi pool today. If `pi-pool` is `QLB_OWNED` 
 
 Reports the completed Stage-1 cutover window. It lists correctness, coverage, fire-drill, injected-switch, final-24-hour health-history, doctor S64/automatic-agent, and migrated-Pi recent-service evidence; Pi and Codex rows marked `DEFERRED` are deliberate Stage-1 deferrals and do not prevent an otherwise complete Stage-1 report.
 
+S65 treats a relogin as counted unless it is a user-denied `unattributed-rotation` event; user denial does not excuse hard or other evidence. AC18 applies that rule only to Anthropic and Codex events in the cutover window. When AC18 passes with excused events, its message identifies them by ID and timestamp.
+
 When doctor runs, the command appends its health-log row and atomically writes or clears the Stage-1 receipt (`report.receiptAt`, `report.receiptHealthLogId`, and its deferred marker). A failed health-log append adds a failing report row and emits `no receipt (...)` on stderr. A receipt with deliberate deferrals completes Stage 1 but cannot authorize C-swap retirement; retirement requires a later all-PASS receipt. For that deferred lifecycle only, a real Codex switch recorded after `window_end` can satisfy the deferred Codex coverage on the later report. The command may also perform its one-time S55 coverage extension: when fewer than ten qualifying Anthropic automatic switches are recorded and every correctness row passes, the first report after the initial seven-day window extends `window_end` to `cutover_at + 14 days`. The report prints `EXTEND`; collect the remaining coverage and run it again after the extended window ends.
 
 Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EXTEND`; exit `3` when the report is refused (for example, before `window_end` or after a rollback). Flags: `[--json]`.
@@ -112,6 +115,8 @@ Exit `0` only when every row is `PASS` or `DEFERRED`; exit `1` for `FAIL` or `EX
 ## `qlb auto`
 
 Run QLB's Anthropic autoswitch loop. `--once` performs one live tick; `--dry-run` makes a decision without mutating state or switching credentials. The normal loop refuses to run while an active lifecycle drill is in progress.
+
+A dry run never creates a store. When the resolved store path (`QLB_DB_PATH`, `--db-path`, `config.json`, or the default `~/.qlb/qlb.db`) does not exist, `qlb auto --dry-run` prints `qlb auto: refused: no-store` to stderr, prints nothing to stdout (with or without `--json`), and exits `3` without opening SQLite or making a usage request. A store path that exists but cannot be read, or a file that is not a valid store, still exits `1`.
 
 On the verified Gate 5 host, `pi-pool` is `QLB_OWNED` and this loop is the Pi auto-switcher. It runs under the per-user LaunchAgent `com.modus.qlb-auto` (`~/Library/LaunchAgents/com.modus.qlb-auto.plist`). `qlb auto install-agent` writes that plist (mode `0600`) and does not call `launchctl`. The plist runs the release CLI:
 
@@ -215,6 +220,19 @@ Per-provider statuses:
 `--json` prints `{ probed, results }` where each result is `{ provider, displayName, ok, status, accounts, accountsOk, accountsFailed, error?, errors, snapshots }`. `status` is one of `ok`, `partial`, `no-data`, `no-probe`, `error`. `errors` is `{accountId, error}[]`. Without `--allow-probe` that is `{"probed":false,"results":[]}`. Plugins that omit `probe` on snapshots are treated as fetched.
 
 Flags: `[--provider kimi-coding|openai-codex] [--allow-probe] [--json]`. Exit `0` always on a completed refresh (a failed provider is a result, not a crash). Unknown arguments exit `1`.
+
+## `qlb usage probe`
+
+Make a direct, metadata-only usage request for one provider. This is a diagnostic probe, not a refresh: it does not persist readings or apply refresh backoff, and its JSON output contains `status`, `source`, and `keys` (plus `credentialSource` for Pi-auth mode). For Kimi, `keys` are the response's top-level keys.
+
+```console
+$ qlb usage probe kimi-coding --json --source pi-auth
+{"status":200,"source":"kimi-api","credentialSource":"pi-auth","keys":["usage","limits"]}
+```
+
+`qlb usage probe kimi-coding --json` uses QLB's managed Kimi credential. Add `--source pi-auth` to instead use the `kimi-coding` entry from the configured `piAuthJsonPath` (including `--pi-auth-json-path`, `QLB_PI_AUTH_JSON_PATH`, or the config file). This mode is read-only: it never modifies Pi's `auth.json`. If that entry is missing, unreadable, the QLB placeholder, or has no non-empty `access` token, it makes no request, prints `status: null`, and exits `1`. It is accepted only for `kimi-coding`; `openai-codex` accepts only `qlb usage probe openai-codex --json`.
+
+The probe deliberately never prints a credential, request headers, or a response body. Any completed provider response, including an HTTP error response, exits `0`, so callers must inspect `status`. Pi-auth mode exits `1` when credential selection or the request fails and its result has `status: null`; the default preserves its historical exit `0` in that case.
 
 ## `qlb native-resync`
 
@@ -738,6 +756,88 @@ still clears it and reports `resumed: "cleared-invalid"` with
 `suspendedUntil: null` instead of failing after the write.
 
 Flags: `[--json]`.
+
+## `qlb claude journal resolve`
+
+Usage: `qlb claude journal resolve --forward|--back`.
+
+Resolves an unfinished Claude switch journal
+(`~/.qlb/journal/switch-anthropic.json`) whose
+owner process has died, on the operator's explicit request. Automatic
+reconciliation only ever rolls a switch back. This command is the only way to
+complete one forward.
+
+- `--back` restores the outgoing account. It puts back the pre-switch
+  `oauthAccount` in the Claude config, and restores the live credential only
+  when the live item still holds exactly what the switch wrote. It records a
+  `rolled-back` switch row.
+- `--forward` completes the switch to the target account. It finishes the
+  config step and commits the switch row. It needs the live credential to
+  still match the target slot's credential.
+
+Both directions take the switch lock, Claude Code's credential locks, the
+journal owner lock and the config-path lock, in that order. Both then close
+the journal, delete the staged rollback blob, and remove the journal file.
+
+Admission operation: `claude-journal-resolve`, admitted in the `cutting-over`,
+`cutover` and `retired` phases.
+
+Exit codes:
+
+- `0`: resolved. It prints `Claude journal resolved forward|back`, with the
+  12-character fingerprint prefixes of the credentials involved. When cleanup
+  partly failed, it adds the warning
+  `completed with cleanup warnings: journal|staged|lock-timeout`. The switch
+  itself is still resolved.
+- `1`: an unexpected error, for example an unreadable store, or a config file
+  that can't be parsed during `--back`. It prints
+  `qlb claude journal resolve: failed`.
+- `2`: bad usage (not exactly one of `--forward` or `--back`).
+- `3`: refused, with `qlb claude journal resolve: refused: <reason>`. Nothing
+  is changed. The reasons:
+
+| Reason | Direction | Meaning |
+|---|---|---|
+| `phase=<state>`, `undo-in-progress` | both | The lifecycle phase does not admit the command. |
+| `cutover-begin-in-progress` | both | A `qlb cutover begin` has not finished (its marker is still set). |
+| `cswap-process-alive`, `cswap-process-check-failed` | both | A C-swap process is running, or the process check failed (checked before and again under the locks). |
+| `journal-absent`, `journal-malformed` | both | There is no journal, or it can't be read. |
+| `journal-identity-invalid` | both | The journal names slots the slot inventory does not match. |
+| `journal-finished` | both | The journal is already closed or committed. |
+| `owner-alive` | both | The switch that wrote the journal is still running, or its owner lock is less than 5 minutes old; retry later. |
+| `lock-timeout` | both | A lock wasn't acquired in time, or a held lock was lost. |
+| `staged-unreadable` | back | The staged rollback copy of the outgoing credential is missing or can't be read. |
+| `live-unreadable` | both | Claude Code's live credential can't be read. |
+| `live-not-outgoing` | back | The live credential is neither the switch's written bytes, the staged copy, nor the outgoing account. |
+| `credentials-not-written` | forward | The journal does not record that the target credential write finished (the target may already be live), so only `--back` applies. |
+| `target-unreadable` | forward | The target slot's credential can't be read. |
+| `target-lineage-missing` | forward | The live credential no longer matches the target slot's credential, for example because Claude Code renewed it. |
+| `target-invalid` | forward | The target slot has no usable `oauthAccount`. |
+| `config-invalid` | forward | The Claude config can't be read or parsed. |
+| `config-moved` | forward | The Claude config changed since the switch recorded it. |
+
+### Stuck journal
+
+If Claude Code renews its token after the switch wrote the target credential
+but before the journal was closed, both directions can refuse:
+
+- `--back` refuses `live-not-outgoing`, because the live credential is now a
+  renewed one;
+- `--forward` refuses `target-lineage-missing`, because the live credential
+  no longer matches the target slot's copy, or `credentials-not-written` if
+  the switch died before recording that write.
+
+While the journal stays in place:
+
+- the doctor row `claude:switch-journal` shows FAIL;
+- every Claude switch, manual or made by `qlb auto`, refuses
+  `switch-journal-present`, so automatic switching is paused;
+- Claude Code itself stays signed in to the target account.
+
+There is a known double-renewal hazard in this state: QLB can renew a grant
+that Claude Code also holds. So the owner should resolve the journal promptly.
+Recovery is supervised by the owner. Don't delete or move the journal, the
+staged blob or any credential by hand.
 
 ## `qlb setup`
 
