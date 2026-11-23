@@ -24,7 +24,8 @@ type ModelEvent =
   | { kind: 'stage-start'; stage: 1 | 2 }
   | { kind: 'stage-close'; stage: 1 | 2; passed: boolean }
   | { kind: 'stop' }
-  | { kind: 'clear'; throughId: number };
+  | { kind: 'clear'; throughId: number }
+  | { kind: 'initialize' };
 type ModelLatch = { state: 'unarmed' | 'armed' | 'unknown' } | { state: 'latched'; newestStopId: number };
 type Refusal = string | null;
 type TraceCase = {
@@ -41,14 +42,20 @@ type Case = TraceCase | ClearCase;
 
 const cases = JSON.parse(readFileSync(join(process.cwd(), 'test/fixtures/codex-stop-latch-model-cases.json'), 'utf8')) as Case[];
 
-/** Event row ids are their 1-based positions, as the generator assigns them. */
-function toRow(event: ModelEvent, index: number): StageEventRow {
-  const base = { id: index + 1, recordedAt: index + 1, stage: null, throughId: null, frozenStatus: null };
+/**
+ * Event row ids are their 1-based positions, as the generator assigns them.
+ * recordedAt differs from the id, so code that read a stop's id from either
+ * the time or the position would fail. A failed close is frozen as `failedAs`.
+ */
+function toRow(event: ModelEvent, index: number, failedAs: 'stop' | 'not-yet'): StageEventRow {
+  const base = { id: index + 1, recordedAt: 1_000 + index * 10, stage: null, throughId: null, frozenStatus: null };
   switch (event.kind) {
     case 'stage-start':
       return { ...base, kind: 'stage-start', stage: event.stage };
     case 'stage-close':
-      return { ...base, kind: 'stage-close', stage: event.stage, frozenStatus: event.passed ? 'pass' : 'stop' };
+      return { ...base, kind: 'stage-close', stage: event.stage, frozenStatus: event.passed ? 'pass' : failedAs };
+    case 'initialize':
+      return { ...base, kind: 'initialize' };
     case 'stop':
       return { ...base, kind: 'latch-set' };
     case 'clear':
@@ -88,8 +95,14 @@ function otherRefusal(log: StageLog, flagEnabled: boolean): Refusal {
 test('the committed fixture covers every trace rule and every clear refusal', () => {
   const traces = cases.filter((entry): entry is TraceCase => entry.rule === 'trace');
   const clears = cases.filter((entry): entry is ClearCase => entry.rule === 'clear');
-  assert.equal(traces.length, 585, 'every trace of up to three events');
-  assert.ok(traces.some((entry) => entry.input.unknown));
+  const readable = traces.filter((entry) => !entry.input.unknown);
+  assert.equal(readable.length, 1_111, 'every trace of up to three events, each replayed readable');
+  assert.equal(traces.length - readable.length, 159, 'every seventh trace also replayed unreadable');
+  assert.deepEqual(new Set(readable.flatMap((entry) => entry.input.events.map((event) => event.kind))),
+    new Set(['stage-start', 'stage-close', 'stop', 'clear', 'initialize']));
+  // A clear above the newest stop is replayed, as well as the newest and an older one.
+  assert.ok(readable.some((entry) => entry.input.events.some((event, index) => event.kind === 'clear'
+    && event.throughId > Math.max(0, ...entry.input.events.slice(0, index).map((before, at) => (before.kind === 'stop' ? at + 1 : 0))))));
   assert.deepEqual(new Set(clears.map((entry) => entry.expected?.refusal ?? 'ok')),
     new Set(['ok', 'empty-reason', 'latch-unknown', 'not-latched', 'newer-stop', 'open-watch', 'fence-set']));
 });
@@ -97,20 +110,23 @@ test('the committed fixture covers every trace rule and every clear refusal', ()
 test('every Lean trace gives the same latch and admission in the shipped functions', () => {
   for (const entry of cases) {
     if (entry.rule !== 'trace') continue;
-    const events = entry.input.events.map(toRow);
-    const log: StageLog = entry.input.unknown ? { status: 'unknown', reason: 'unreadable-row' } : { status: 'readable', events };
-    const label = JSON.stringify(entry.input);
-    assert.deepEqual(latchView(deriveLatch(log)), entry.expected.latch, label);
-    assert.deepEqual({
-      manualOn: refusal(log, true, { kind: 'switch', trigger: 'manual' }),
-      autoOn: refusal(log, true, { kind: 'switch', trigger: 'proactive' }),
-      refreshOn: refusal(log, true, { kind: 'refresh' }),
-      otherOn: otherRefusal(log, true),
-      manualOff: refusal(log, false, { kind: 'switch', trigger: 'manual' }),
-      autoOff: refusal(log, false, { kind: 'switch', trigger: 'proactive' }),
-      refreshOff: refusal(log, false, { kind: 'refresh' }),
-      otherOff: otherRefusal(log, false),
-    }, entry.expected.admission, label);
+    // The model's failed close is any frozen result but pass; replay it as both.
+    for (const failedAs of ['stop', 'not-yet'] as const) {
+      const events: StageEventRow[] = entry.input.events.map((event, index) => toRow(event, index, failedAs));
+      const log: StageLog = entry.input.unknown ? { status: 'unknown', reason: 'unreadable-row' } : { status: 'readable', events };
+      const label: string = `${JSON.stringify(entry.input)} failed close as ${failedAs}`;
+      assert.deepEqual(latchView(deriveLatch(log)), entry.expected.latch, label);
+      assert.deepEqual({
+        manualOn: refusal(log, true, { kind: 'switch', trigger: 'manual' }),
+        autoOn: refusal(log, true, { kind: 'switch', trigger: 'proactive' }),
+        refreshOn: refusal(log, true, { kind: 'refresh' }),
+        otherOn: otherRefusal(log, true),
+        manualOff: refusal(log, false, { kind: 'switch', trigger: 'manual' }),
+        autoOff: refusal(log, false, { kind: 'switch', trigger: 'proactive' }),
+        refreshOff: refusal(log, false, { kind: 'refresh' }),
+        otherOff: otherRefusal(log, false),
+      }, entry.expected.admission, label);
+    }
   }
 });
 

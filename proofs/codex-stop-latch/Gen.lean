@@ -5,17 +5,18 @@ open CodexStopLatch
 
 /-
 Fixed cases for test/codex-stop-latch-model.test.ts. Every trace of up to
-three stage events is enumerated; event row ids are their 1-based positions,
-so a stop's id is its own row id, as a latch-set row's is.
+three stage events is enumerated, each readable and every seventh also as an
+unreadable log; event row ids are their 1-based positions, so a stop's id is
+its own row id, as a latch-set row's is.
 -/
 
 /-- Event templates; a clear's target is resolved against the stops before it. -/
 inductive Template where
-  | start1 | start2 | close1 | close2Pass | close2Fail | stop | clearNewest | clearFirst
+  | start1 | start2 | close1 | close2Pass | close2Fail | stop | clearNewest | clearFirst | clearAbove | initialize
   deriving Repr, DecidableEq
 
 private def templates : List Template :=
-  [.start1, .start2, .close1, .close2Pass, .close2Fail, .stop, .clearNewest, .clearFirst]
+  [.start1, .start2, .close1, .close2Pass, .close2Fail, .stop, .clearNewest, .clearFirst, .clearAbove, .initialize]
 
 /-- The newest stop id among the events so far, or 0 when there is none (no row has id 0). -/
 private def newestStop (events : List Event) : Nat :=
@@ -32,6 +33,8 @@ private def resolve (events : List Event) (template : Template) : Event :=
   | .stop => .stop id
   | .clearNewest => .clear (newestStop events)
   | .clearFirst => .clear 1
+  | .clearAbove => .clear (newestStop events + 1)
+  | .initialize => .ignored
 
 private def build (picks : List Template) : List Event :=
   picks.foldl (fun events template => events ++ [resolve events template]) []
@@ -48,6 +51,7 @@ private def eventJson : Event → String
   | .stageClose stage passed => "{\"kind\":\"stage-close\",\"stage\":" ++ toString stage ++ ",\"passed\":" ++ (if passed then "true" else "false") ++ "}"
   | .stop _ => "{\"kind\":\"stop\"}"
   | .clear throughId => "{\"kind\":\"clear\",\"throughId\":" ++ toString throughId ++ "}"
+  | .ignored => "{\"kind\":\"initialize\"}"
 
 private def latchViewJson (unknown : Bool) (latch : Latch) : String :=
   if unknown then "{\"state\":\"unknown\"}"
@@ -71,10 +75,8 @@ private def admissionJson (state : State) (unknown : Bool) : String :=
     entry "manualOff" false (.switch true), entry "autoOff" false (.switch false),
     entry "refreshOff" false .refresh, entry "otherOff" false .other] ++ "}"
 
-private def traceCase (index : Nat) (picks : List Template) : String :=
+private def traceCase (unknown : Bool) (picks : List Template) : String :=
   let events := build picks
-  -- Every seventh trace is also replayed as an unreadable log.
-  let unknown := index % 7 = 3
   let state := run events
   "{\"rule\":\"trace\",\"input\":{\"events\":[" ++ String.intercalate "," (events.map eventJson) ++
     "],\"unknown\":" ++ (if unknown then "true" else "false") ++ "},\"expected\":{\"latch\":" ++
@@ -94,7 +96,7 @@ private def bools : List Bool := [false, true]
 private def clearCases : List String :=
   [Latch.unarmed, .armed, .latched 3].flatMap fun latch =>
   bools.flatMap fun unknown =>
-  [3, 2].flatMap fun throughId =>
+  [3, 2, 4].flatMap fun throughId =>
   bools.flatMap fun openWatch =>
   bools.flatMap fun fenceSet =>
   bools.map fun reasonEmpty =>
@@ -104,7 +106,9 @@ private def clearCases : List String :=
       clearRefusalJson (decideClear latch unknown throughId openWatch fenceSet reasonEmpty) ++ "}"
 
 private def traceCases : List String :=
-  ((picksUpTo 3).zip (List.range (picksUpTo 3).length)).map fun (picks, index) => traceCase index picks
+  -- Every trace is replayed readable; every seventh is also replayed as an unreadable log.
+  ((picksUpTo 3).zip (List.range (picksUpTo 3).length)).flatMap fun (picks, index) =>
+    traceCase false picks :: (if index % 7 = 3 then [traceCase true picks] else [])
 
 private def cases : List String := traceCases ++ clearCases
 

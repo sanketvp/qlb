@@ -20,6 +20,8 @@ inductive Event where
   | stageClose (stage : Nat) (passed : Bool)
   | stop (id : Nat)
   | clear (throughId : Nat)
+  /-- A row the latch and the run ignore: `initialize` (and `initialize-required`, which the store reads as unknown). -/
+  | ignored
   deriving Repr, DecidableEq
 
 structure State where
@@ -36,16 +38,18 @@ def latchStep : Latch → Event → Latch
   | .unarmed, .stageClose _ _ => .armed
   | current, .stageStart _ => current
   | current, .stageClose _ _ => current
+  | current, .ignored => current
   | _, .stop id => .latched id
   | .latched newest, .clear throughId => if throughId = newest then .armed else .latched newest
   | current, .clear _ => current
 
-/-- Models `automaticSwitchingAllowed`: a stop or any clear ends the run. -/
-def autoStep (_allowed : Bool) : Event → Bool
+/-- Models `automaticSwitchingAllowed`: a stop or any clear ends the run; an ignored row changes nothing. -/
+def autoStep (allowed : Bool) : Event → Bool
   | .stageStart stage => stage == 2
   | .stageClose stage passed => stage == 2 && passed
   | .stop _ => false
   | .clear _ => false
+  | .ignored => allowed
 
 def step (state : State) (event : Event) : State :=
   { latch := latchStep state.latch event, autoAllowed := autoStep state.autoAllowed event }

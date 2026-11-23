@@ -28,6 +28,7 @@ theorem only_clear_leaves_latched (newest : Nat) (event : Event)
   | stageStart stage => exact absurd rfl (left newest)
   | stageClose stage passed => exact absurd rfl (left newest)
   | stop id => exact absurd rfl (left id)
+  | ignored => exact absurd rfl (left newest)
   | clear throughId =>
     by_cases same : throughId = newest
     · rw [same]
@@ -63,6 +64,12 @@ theorem admitted_clear_arms (newest throughId : Nat) (openWatch fenceSet : Bool)
 theorem clear_ends_stage_run (state : State) (throughId : Nat) :
     (step state (.clear throughId)).autoAllowed = false := by
   simp [step, autoStep]
+
+/-- An ignored row (`initialize`) never changes the latch or the run. -/
+theorem ignored_changes_nothing (state : State) :
+    step state .ignored = state := by
+  cases state with
+  | mk latch autoAllowed => cases latch <;> simp [step, latchStep, autoStep]
 
 /-- A stop also ends the run, and latches. -/
 theorem stop_latches_and_ends_run (state : State) (id : Nat) :
