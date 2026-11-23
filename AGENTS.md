@@ -32,7 +32,7 @@ Check every proposed change against `STRATEGY.md`, QLB's product vision and stra
 
 These change the owner's live machine. Never run them from an agent session unless the owner has approved that exact run:
 
-- `qlb release install`, `qlb pi deploy`, `qlb switch`, `qlb cutover`, `qlb consume`, `qlb keychain`, `qlb codex stage start|close`;
+- `qlb release install`, `qlb pi deploy`, `qlb switch`, `qlb cutover`, `qlb consume`, `qlb keychain`, `qlb codex stage start|close`, `qlb codex latch clear`;
 - `qlb migrate stage|rehearse|commit|rollback|resume` and `qlb pi migrate|rollback`;
 - LaunchAgent edits, and anything that writes `~/.qlb/qlb.db` or a Keychain item.
 

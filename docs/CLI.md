@@ -318,6 +318,32 @@ codex stage 1 closed: pass (event 9)
 
 Both run under the Codex switch and auth locks and take their timestamp only once they are held, so no switch, refresh or `codex add` is in flight across a marker. Exit `0` on a recorded marker, `3` on a refusal, `2` on a usage error. Flags: `[--json]` (prints the outcome object).
 
+## `qlb codex latch clear`
+
+Clear a Codex stop after reviewing it, or initialize the stage log of a restored database. **Live state:** every form writes `~/.qlb/qlb.db` and may finish a Codex switch recovery; run it only on the owner's machine, never from an agent session.
+
+```console
+$ qlb codex latch clear
+codex latch: latched, newest stop 7
+nothing else blocks a clear through stop 7
+$ qlb codex latch clear --through 7 --reason "reviewed the wiped login; re-logged in"
+codex latch cleared through stop 7 (event 8)
+```
+
+The probe and `--through` first settle what is already decided: Codex switch recovery (which can resolve a recovery fence, or commit an interrupted switch and open its watch), then the due-watch runner (which can record a watch verdict). Every form then runs the stop sweep (which records any stop those produced) and judges the latch under the Codex switch and auth locks.
+
+- With no flags it is a probe: it prints the latch state, the newest stop id and anything else that would block a clear (`nothing to clear` when nothing is latched), and appends no clear row.
+- `--through <stop-id> --reason <text>` appends a latch-clear row through that stop. It is refused when:
+  - `newer-stop: <id>`: `--through` is not the newest stop; the refusal names the newest one;
+  - `open-watch: <until>`: a Codex switch watch is still open; `<until>` is the latest watch's end, and the clear can pass only after it. A recovery fence set at the same time is named after it (`; fence-set: <reason>`), and the watch stays open until that fence resolves or the watch is a minute overdue;
+  - `fence-set: <reason>`: a recovery fence is still set;
+  - `not-latched`: nothing is latched;
+  - `latch-unknown: <why>`: the stage log cannot be read (`initialize-required` means run `--initialize`);
+  - `empty-reason` / `multi-line-reason`: the reason is empty or spans lines.
+- `--initialize --reason <text>` is the only way past `latch-unknown: initialize-required`, which a restored database with Codex history carries. It appends an initialize row. It does not run recovery or the watch runner first, so restored recovery and watch state is not acted on before the owner initializes. It is refused with `not-required` when the log is readable, and with `latch-unknown: <why>` when the log is unreadable for another reason.
+
+A clear does not start a stage: no run is active, and automatic switching stays out of scope, until the next `qlb codex stage start`. It is admitted in `cutting-over`, `cutover` and `retired`; other phases refuse with the lifecycle's own code (`phase=<state>`, or `undo-in-progress` while undoing). It does not need `CODEX_SWITCH_COMMAND_ENABLED`, so a dark build can clear a stop. `codex-lock-busy` means a Codex switch, refresh or `codex add` holds a lock: no clear or initialize row was recorded, though recovery or a watch verdict may have been, so retry. Exit `0` on success or a probe, `3` on a refusal, `2` on a usage error; an error from recovery or the watch runner other than a busy lock is thrown. Flags: `[--json]` (prints the outcome object).
+
 ## `qlb export`
 
 Emit the last persisted usage readings as JSON without loading provider adapters or credential stores, making network requests, or migrating the database. The SQLite database is opened read-only and is never created when absent. This is the cache-only interface for status consumers; unlike `qlb status`, it does not refresh readings.

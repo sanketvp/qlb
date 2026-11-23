@@ -16,7 +16,7 @@ export type LifecycleOperation =
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
   | 'lifecycle-close' | 'lifecycle-drill-done' | 'lifecycle-sentinels-record' | 'claude-journal-resolve'
-  | 'codex-stage-start' | 'codex-stage-close'
+  | 'codex-stage-start' | 'codex-stage-close' | 'codex-latch-clear'
   | `${string}:dry-run`;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -76,20 +76,21 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
     'doctor', 'status', 'import-cswap', 'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve',
     'pi-migrate', 'pi-inventory-record', 'pi-rollback', 'switch:manual', 'gate', 'auto:dry-run', 'cutover-commit',
-    'cutover-abort', 'keychain-authorize-cswap', 'keychain-check-launchd-live', 'lifecycle-sentinels-record',
+    'cutover-abort', 'keychain-authorize-cswap', 'keychain-check-launchd-live', 'lifecycle-sentinels-record', 'codex-latch-clear',
   ),
   cutover: rules(
     'doctor', 'status', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume', 'auto:drill-begin', 'gate',
     'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-inventory-record', 'pi-rollback',
     'verify-l13', 'report-cutover', 'undo-cswap', 'undo-cswap:dry-run-record', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done', 'lifecycle-sentinels-record',
-    'codex-stage-start', 'codex-stage-close',
+    'codex-stage-start', 'codex-stage-close', 'codex-latch-clear',
   ),
   undoing: rules('doctor', 'status', 'lifecycle-sentinels-record', 'undo-cswap:resume', 'pi-rollback'),
   'rolled-back': rules('doctor', 'status', 'lifecycle-sentinels-record', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
   retired: rules(
     'doctor', 'status', 'gate', 'switch:manual', 'switch:auto', 'auto', 'auto:dry-run', 'auto:resume',
     'claude-add', 'codex-add', 'claude-journal-resolve', 'report-cutover', 'retire-cswap:resume', 'pi-inventory-record', 'lifecycle-close', 'lifecycle-sentinels-record',
+    'codex-latch-clear',
   ),
   aborted: rules('doctor', 'status', 'lifecycle-sentinels-record', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),
 };

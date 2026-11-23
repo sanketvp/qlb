@@ -106,7 +106,7 @@ function exitCode(result: CodexSwitchResult, fenced: boolean): 0 | 1 | 3 {
   return 1;
 }
 
-function defaultSwitchDeps(
+export function defaultSwitchDeps(
   ctx: CommandContext,
   store: Store,
   commandDeps: Pick<SwitchOpenAiCodexCommandDeps, 'now' | 'randomUUID'>,
