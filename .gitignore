@@ -1,5 +1,5 @@
 node_modules/
-proofs/codex-poll/.lake/
+proofs/*/.lake/
 dist/
 dist-test/
 native/keychain-helper/build/
