@@ -1703,7 +1703,16 @@ export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Pr
     // decisions use the live clock for each row: lock waits can span a minute.
     // An overdue watch is ended by the tick itself, after one final observation.
     const tickNow = deps.now();
-    const tick = await codexWatchTick(deps, watch);
+    let tick: CodexWatchTickResult;
+    try { tick = await codexWatchTick(deps, watch); }
+    catch (error) {
+      // An overdue watch that cannot be observed ends inconclusive rather than
+      // failing every later pass; lock contention is transient and is retried.
+      if (error instanceof ClaudeCodeLockTimeout || deps.now() < watch.until + CODEX_WATCH_OVERDUE_MS) throw error;
+      deps.store.endCodexWatch({ switchId: watch.switchId, verdict: 'inconclusive', now: deps.now(),
+        detail: { error: error instanceof Error ? error.message : String(error) } });
+      continue;
+    }
     const verdict = codexWatchVerdict(tick, tickNow >= watch.until);
     if (verdict !== null) {
       deps.store.endCodexWatch({ switchId: watch.switchId, verdict, now: deps.now() });

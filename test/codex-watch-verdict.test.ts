@@ -364,6 +364,22 @@ describe('Codex watch verdicts (U5): overdue watches', () => {
       assert.equal(verdictOf(h, watch.switchId), 'inconclusive');
     } finally { close(h); }
   });
+
+  it('overdue with a tick that throws: inconclusive, so the row is not retried on every pass', async () => {
+    const h = harness();
+    try {
+      const watch = await committedWatch(h);
+      const hooks = { afterWatchLock: () => { throw new Error('slot read failed'); } };
+      // Before overdue the error still reaches the caller and the row stays.
+      await assert.rejects(due(h, watch.until, { hooks }), /slot read failed/);
+      assert.equal(watchCount(h), 1);
+      assert.equal(verdictOf(h, watch.switchId), null);
+      await due(h, watch.until + 90_000, { hooks });
+      assert.equal(watchCount(h), 0);
+      assert.equal(verdictOf(h, watch.switchId), 'inconclusive');
+      assert.deepEqual(h.store.listCodexWatchVerdicts()[0]?.detail, { error: 'slot read failed' });
+    } finally { close(h); }
+  });
 });
 
 describe('Codex watch verdicts (U5): one writer', () => {
