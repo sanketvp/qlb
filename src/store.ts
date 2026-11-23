@@ -1155,8 +1155,12 @@ function redactJsonText(value: string): string {
   }
 }
 
+function hasTable(db: DatabaseSync, name: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+}
+
 export function hasUsageDiscrepanciesTable(db: DatabaseSync): boolean {
-  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_discrepancies'").get());
+  return hasTable(db, 'usage_discrepancies');
 }
 
 function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
@@ -1187,11 +1191,218 @@ function ensureUsageDiscrepanciesTable(db: DatabaseSync): void {
   `);
 }
 
+function hasCodexStageTables(db: DatabaseSync): boolean {
+  return hasTable(db, 'codex_stage_events') && hasTable(db, 'codex_watch_verdicts');
+}
+
+/**
+ * Additive Codex go-live tables. The event log is append-only; the stop latch
+ * is derived from it. Event kinds and verdicts carry no CHECK so a row written
+ * by a newer build reads as unreadable (and so latched) instead of failing the
+ * whole open. When the event log is created on a store that already has Codex
+ * switch history (a restored backup), an initialize-required row makes the
+ * latch read unknown until the owner initializes it.
+ */
+function ensureCodexStageTables(db: DatabaseSync, now: number): void {
+  const eventsExisted = hasTable(db, 'codex_stage_events');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS codex_stage_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      lifecycle_id INTEGER,
+      build_stamp TEXT,
+      flag_enabled INTEGER,
+      stage INTEGER,
+      evidence TEXT,
+      through_id INTEGER,
+      reason TEXT,
+      detail_json TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS codex_stage_events_latch_evidence
+      ON codex_stage_events(evidence) WHERE kind = 'latch-set';
+    CREATE TABLE IF NOT EXISTS codex_watch_verdicts (
+      switch_id INTEGER PRIMARY KEY,
+      verdict TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      detail_json TEXT
+    );
+  `);
+  if (eventsExisted) return;
+  const codexHistory = db.prepare("SELECT 1 FROM switch_log WHERE provider = 'openai-codex' LIMIT 1").get();
+  if (codexHistory) {
+    db.prepare("INSERT INTO codex_stage_events (kind, recorded_at) VALUES ('initialize-required', ?)").run(now);
+  }
+}
+
+const CODEX_STAGE_EVENT_KIND_LIST = [
+  'stage-start', 'stage-close', 'latch-set', 'latch-clear', 'initialize-required', 'initialize',
+] as const;
+
+export type CodexStageEventKind = typeof CODEX_STAGE_EVENT_KIND_LIST[number];
+
+const CODEX_STAGE_EVENT_KINDS: ReadonlySet<string> = new Set(CODEX_STAGE_EVENT_KIND_LIST);
+
+export interface CodexStageEvent {
+  id: number;
+  kind: CodexStageEventKind;
+  recordedAt: number;
+  lifecycleId: number | null;
+  buildStamp: string | null;
+  flagEnabled: boolean | null;
+  stage: 1 | 2 | null;
+  /** Latch-set only: the row that caused the stop, e.g. `switch_log:12`. */
+  evidence: string | null;
+  /** Latch-clear only: the newest latch-set id this clear covers. */
+  throughId: number | null;
+  reason: string | null;
+  detail: unknown;
+}
+
+export interface CodexStageEventInput {
+  kind: Exclude<CodexStageEventKind, 'initialize-required'>;
+  now: number;
+  lifecycleId: number | null;
+  buildStamp: string | null;
+  flagEnabled: boolean;
+  stage?: 1 | 2;
+  evidence?: string;
+  throughId?: number;
+  reason?: string;
+  detail?: unknown;
+}
+
+/**
+ * `unknown` is fail-closed: the tables are missing (read-only open of a store
+ * no writer has upgraded), a row is unreadable, or the store was restored with
+ * Codex history and not yet initialized. Every write path treats it as latched.
+ */
+export type CodexStageLog =
+  | { status: 'readable'; events: CodexStageEvent[] }
+  | { status: 'unknown'; reason: 'tables-missing' | 'unreadable-row' | 'initialize-required'; events: CodexStageEvent[] };
+
+export type CodexWatchVerdict =
+  | 'confirmed' | 'reverted' | 'unresolved' | 'inconclusive' | 'late'
+  | 'wiped' | 'unknown-live-identity' | 'superseded' | 'not-admitted';
+
+export interface CodexWatchVerdictRow {
+  switchId: number;
+  /** Read as text: a verdict written by a newer build is passed through for the classifier to judge. */
+  verdict: string;
+  recordedAt: number;
+  detail: unknown;
+}
+
+export interface CodexStopEvidence {
+  switches: Array<{ id: number; ts: number; trigger: string; outcome: string; error: string | null; detail: string | null }>;
+  relogins: Array<{ id: number; ts: number; kind: string; accountId: string | null }>;
+}
+
+function parseDetailJson(text: unknown): { ok: true; value: unknown } | { ok: false } {
+  if (text == null) return { ok: true, value: null };
+  if (typeof text !== 'string') return { ok: false };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function nullableNumber(value: unknown): number | null | undefined {
+  if (value == null) return null;
+  return typeof value === 'number' || typeof value === 'bigint' ? Number(value) : undefined;
+}
+
+function nullableText(value: unknown): string | null | undefined {
+  if (value == null) return null;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function parseCodexStageEvent(row: Record<string, unknown>): CodexStageEvent | null {
+  if (typeof row.kind !== 'string' || !CODEX_STAGE_EVENT_KINDS.has(row.kind)) return null;
+  const id = nullableNumber(row.id);
+  const recordedAt = nullableNumber(row.recorded_at);
+  const lifecycleId = nullableNumber(row.lifecycle_id);
+  const flag = nullableNumber(row.flag_enabled);
+  const stage = nullableNumber(row.stage);
+  const throughId = nullableNumber(row.through_id);
+  const buildStamp = nullableText(row.build_stamp);
+  const evidence = nullableText(row.evidence);
+  const reason = nullableText(row.reason);
+  const detail = parseDetailJson(row.detail_json);
+  if (id == null || recordedAt == null || !detail.ok) return null;
+  if (lifecycleId === undefined || throughId === undefined) return null;
+  if (buildStamp === undefined || evidence === undefined || reason === undefined) return null;
+  if (flag !== null && flag !== 0 && flag !== 1) return null;
+  if (stage !== null && stage !== 1 && stage !== 2) return null;
+  // A row missing the field its kind is defined by cannot be judged, so it reads as unreadable.
+  if (row.kind === 'latch-set' && evidence === null) return null;
+  if (row.kind === 'latch-clear' && throughId === null) return null;
+  if ((row.kind === 'stage-start' || row.kind === 'stage-close') && stage === null) return null;
+  return {
+    id,
+    kind: row.kind as CodexStageEventKind,
+    recordedAt,
+    lifecycleId,
+    buildStamp,
+    flagEnabled: flag === null ? null : flag === 1,
+    stage,
+    evidence,
+    throughId,
+    reason,
+    detail: detail.value,
+  };
+}
+
+/** Reads the Codex stage log from any connection, including a read-only one. */
+export function readCodexStageLogFrom(db: DatabaseSync): CodexStageLog {
+  if (!hasTable(db, 'codex_stage_events')) return { status: 'unknown', reason: 'tables-missing', events: [] };
+  const rows = db.prepare('SELECT * FROM codex_stage_events ORDER BY id').all() as Array<Record<string, unknown>>;
+  const events: CodexStageEvent[] = [];
+  for (const row of rows) {
+    const event = parseCodexStageEvent(row);
+    if (!event) return { status: 'unknown', reason: 'unreadable-row', events };
+    events.push(event);
+  }
+  const lastId = (kind: CodexStageEventKind): number =>
+    events.reduce((last, event) => (event.kind === kind ? event.id : last), 0);
+  return lastId('initialize-required') > lastId('initialize')
+    ? { status: 'unknown', reason: 'initialize-required', events }
+    : { status: 'readable', events };
+}
+
+/** Reads every recorded watch verdict; empty when the table is missing. */
+export function listCodexWatchVerdictsFrom(db: DatabaseSync): CodexWatchVerdictRow[] {
+  if (!hasTable(db, 'codex_watch_verdicts')) return [];
+  const rows = db.prepare('SELECT switch_id, verdict, recorded_at, detail_json FROM codex_watch_verdicts ORDER BY switch_id')
+    .all() as Array<{ switch_id: number; verdict: string; recorded_at: number; detail_json: string | null }>;
+  return rows.map((row) => {
+    const detail = parseDetailJson(row.detail_json);
+    return {
+      switchId: row.switch_id,
+      verdict: row.verdict,
+      recordedAt: row.recorded_at,
+      detail: detail.ok ? detail.value : row.detail_json,
+    };
+  });
+}
+
+/** The Codex switch and re-login rows recorded at or after `sinceTs`, oldest first. */
+export function listCodexStopEvidenceFrom(db: DatabaseSync, sinceTs: number): CodexStopEvidence {
+  const switches = db.prepare(`SELECT id, ts, trigger, outcome, error, detail FROM switch_log
+    WHERE provider = 'openai-codex' AND ts >= ? ORDER BY id`).all(sinceTs) as CodexStopEvidence['switches'];
+  const relogins = db.prepare(`SELECT id, ts, kind, account_id AS accountId FROM relogin_events
+    WHERE provider = 'openai-codex' AND ts >= ? ORDER BY id`).all(sinceTs) as CodexStopEvidence['relogins'];
+  // node:sqlite rows have a null prototype; hand callers plain objects.
+  return { switches: switches.map((row) => ({ ...row })), relogins: relogins.map((row) => ({ ...row })) };
+}
+
 function migrationNeeded(db: DatabaseSync): boolean {
   const version = readUserVersion(db);
   return version < SCHEMA_VERSION
     || (version === SCHEMA_VERSION && schemaNeedsV5Correction(db))
-    || !hasUsageDiscrepanciesTable(db);
+    || !hasUsageDiscrepanciesTable(db)
+    || !hasCodexStageTables(db);
 }
 
 function normalizedSql(sql: string): string {
@@ -1736,6 +1947,7 @@ export class Store {
           this.db.exec(`${LIFECYCLE_ONE_OPEN_INDEX_SQL};`);
         }
         ensureUsageDiscrepanciesTable(this.db);
+        ensureCodexStageTables(this.db, Date.now());
         this.db.exec('PRAGMA user_version = 6');
       }
       this.scrubReloginEvents();
@@ -1827,7 +2039,7 @@ export class Store {
   }
 
   private tableExists(table: string): boolean {
-    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+    return hasTable(this.db, table);
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -3177,6 +3389,54 @@ export class Store {
   /** A terminal watch outcome that does not itself need a switch-log row. */
   deleteCodexWatch(switchId: number): void {
     this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(switchId);
+  }
+
+  /**
+   * Appends one Codex stage event. Returns the new row id, or null when a
+   * latch-set for the same evidence pointer is already recorded.
+   */
+  appendCodexStageEvent(input: CodexStageEventInput): number | null {
+    // Only the latch-set evidence conflict is ignored; any other constraint failure throws.
+    const result = this.db.prepare(`INSERT INTO codex_stage_events
+      (kind, recorded_at, lifecycle_id, build_stamp, flag_enabled, stage, evidence, through_id, reason, detail_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (evidence) WHERE kind = 'latch-set' DO NOTHING`).run(
+      input.kind,
+      input.now,
+      input.lifecycleId,
+      input.buildStamp,
+      input.flagEnabled ? 1 : 0,
+      input.stage ?? null,
+      input.evidence ?? null,
+      input.throughId ?? null,
+      input.reason == null ? null : redactSecrets(input.reason, []),
+      input.detail == null ? null : redactJsonText(JSON.stringify(input.detail)),
+    );
+    return result.changes === 0 ? null : Number(result.lastInsertRowid);
+  }
+
+  readCodexStageLog(): CodexStageLog {
+    return readCodexStageLogFrom(this.db);
+  }
+
+  /** Records a switch's final watch verdict. The first verdict wins; returns false when one exists. */
+  insertCodexWatchVerdict(input: { switchId: number; verdict: CodexWatchVerdict; now: number; detail?: unknown }): boolean {
+    const result = this.db.prepare(`INSERT INTO codex_watch_verdicts (switch_id, verdict, recorded_at, detail_json)
+      VALUES (?, ?, ?, ?) ON CONFLICT (switch_id) DO NOTHING`).run(
+      input.switchId,
+      input.verdict,
+      input.now,
+      input.detail == null ? null : redactJsonText(JSON.stringify(input.detail)),
+    );
+    return result.changes > 0;
+  }
+
+  listCodexWatchVerdicts(): CodexWatchVerdictRow[] {
+    return listCodexWatchVerdictsFrom(this.db);
+  }
+
+  listCodexStopEvidence(sinceTs: number): CodexStopEvidence {
+    return listCodexStopEvidenceFrom(this.db, sinceTs);
   }
 
   /** S56 lookup by the composite identity; never exposes a credential document. */
