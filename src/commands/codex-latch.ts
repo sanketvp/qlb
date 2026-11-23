@@ -90,7 +90,8 @@ export async function codexLatchClear(deps: CodexLatchDeps, request: CodexLatchR
     if (bad) return bad;
   }
   const store = deps.store;
-  const engine: CodexSwitchDeps = { ...deps.switchDeps, store };
+  // The watch runner's sweep stamps its rows the same way the clear's own sweep does.
+  const engine: CodexSwitchDeps = { ...deps.switchDeps, store, flagEnabled: deps.flagEnabled, buildStamp: deps.buildStamp, autoLog: deps.autoLog };
   const journalDir = engine.journalDir;
   // Without the journal directory the fence could not be read, and a clear must not pass a fence it cannot see.
   if (!journalDir) throw new Error('codex latch clear requires the switch journal directory');

@@ -1,4 +1,5 @@
 import type { CodexConsumeStatus } from './codex-consume';
+import type { AdmissionRefusal } from './codex-stage';
 import type { CodexRecoveryVerdict, CodexSwitchPreconditionReason, ObserveLiveCodexResult } from './codex-switch';
 
 /**
@@ -57,11 +58,19 @@ const LIVE_OBSERVATION_REFUSALS: Record<LiveObservationRefusal, true> = {
   'slot-split': true,
 };
 
+/** The stop rules' admission refusals. The switch path never persists them, but a row carrying one is explained. */
+const ADMISSION_REFUSALS: Record<AdmissionRefusal, true> = {
+  'codex-stop-latched': true,
+  'codex-switch-disabled': true,
+  'codex-auto-outside-stage-2': true,
+};
+
 export const CODEX_NAMED_REFUSALS: ReadonlySet<string> = new Set([
   ...Object.keys(PRECONDITION_REASONS),
   ...Object.keys(CONSUME_STATUSES).map((status) => `target-freshen-${status}`),
   ...Object.keys(UNRESOLVED_FENCE_REASONS),
   ...Object.keys(LIVE_OBSERVATION_REFUSALS),
+  ...Object.keys(ADMISSION_REFUSALS),
   // Passed as literals at the persisting refusal sites.
   'switch-busy',
   'target-slot-split',

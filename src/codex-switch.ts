@@ -7,6 +7,8 @@ import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromi
 import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
+import { admitCodexAction, deriveLatch } from './codex-stage';
+import { readBuildStamp, sweepCodexStops, toStageLog, type CodexStopContext } from './codex-stop';
 import {
   codexIdentityParts,
   holderSets,
@@ -70,7 +72,7 @@ export interface CodexSwitchDeps {
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
     | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop'
     | 'listDueCodexWatches' | 'advanceCodexWatch' | 'endCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
-    | 'readCodexWatchDurableResult'> & CodexAttributionStore;
+    | 'readCodexWatchDurableResult'> & CodexStopContext['store'] & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
   now: () => number;
@@ -95,6 +97,16 @@ export interface CodexSwitchDeps {
    * A watch tick passes its switch's trigger, so one binding serves manual and auto watches.
    */
   admitted?: (trigger?: string) => { ok: boolean; reason?: string; code?: string } | Promise<{ ok: boolean; reason?: string; code?: string }>;
+  /**
+   * Go-live stop rules (KTD6, KTD17). `flagEnabled` is `CODEX_SWITCH_COMMAND_ENABLED` as the caller sees it, and
+   * defaults to it; while it is false every trigger is refused. The others stamp the latch-set rows the stop sweep records.
+   */
+  flagEnabled?: boolean;
+  /** Defaults to `readBuildStamp()`. */
+  buildStamp?: string | null;
+  lifecycleId?: () => number | null;
+  /** Defaults to appending to `auto.log` beside the store. */
+  autoLog?: (line: string) => void;
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
     afterPost?: () => void | Promise<void>;
@@ -1107,7 +1119,12 @@ export type CodexSwitchResult = {
   switchId?: number; attemptId?: string;
   watch?: { state: 'pending'; until: number } | { state: 'stopped' | 'unresolved'; reason: string };
   lockLostAfterCommit?: boolean;
+  /** Only on a `codex-stop-latched` refusal: the newest stop and its evidence row, or why the latch cannot be read. */
+  latch?: CodexSwitchLatch;
 };
+export type CodexSwitchLatch =
+  | { state: 'set'; newestStopId: number; evidence: string | null }
+  | { state: 'unknown'; reason: string };
 export interface SwitchCodexInput {
   target: string; trigger: string;
   /** Store uses leftRecoveryAt; the durable journal deliberately says leftRecoveryAtMs. */
@@ -1124,6 +1141,41 @@ function withRecordedFrom(
 
 const switchResult = (from: string | null, reason: string, message?: string): CodexSwitchResult =>
   withRecordedFrom({ outcome: 'refused', reason, ...(message === undefined ? {} : { message }) }, from);
+function stopContext(deps: CodexSwitchDeps, lifecycleId: number | null): CodexStopContext {
+  return { store: deps.store, now: deps.now, buildStamp: deps.buildStamp === undefined ? readBuildStamp() : deps.buildStamp,
+    flagEnabled: deps.flagEnabled ?? CODEX_SWITCH_COMMAND_ENABLED, lifecycleId, autoLog: deps.autoLog };
+}
+/**
+ * The sweep after work that has already committed (a switch row or watch
+ * verdicts), so its stop is recorded now. A failure must not change that
+ * work's result; the latch check before the next switch sweeps again.
+ */
+function sweepAfterCommit(deps: CodexSwitchDeps, lifecycleId?: number | null): void {
+  try { sweepCodexStops(stopContext(deps, lifecycleId === undefined ? deps.lifecycleId?.() ?? null : lifecycleId)); }
+  catch { /* swept again at the next latch check */ }
+}
+/**
+ * KTD6 and KTD17: record any stop not yet recorded, then ask the pure admission
+ * function. Null admits the switch. The refusal is never persisted: a
+ * `switch_log` row would itself be evidence the sweep reads.
+ */
+function stopRulesRefusal(deps: CodexSwitchDeps, input: SwitchCodexInput, from: string | null, lifecycleId: number | null): CodexSwitchResult | null {
+  const context = stopContext(deps, lifecycleId);
+  sweepCodexStops(context);
+  const raw = deps.store.readCodexStageLog();
+  const log = toStageLog(raw);
+  const decision = admitCodexAction({ log, flagEnabled: context.flagEnabled, action: { kind: 'switch', trigger: input.trigger } });
+  if (decision.admitted) return null;
+  const result = switchResult(from, decision.refusal);
+  if (decision.refusal !== 'codex-stop-latched') return result;
+  const latch = deriveLatch(log);
+  if (latch.state === 'unknown') result.latch = { state: 'unknown', reason: latch.reason };
+  else if (latch.state === 'latched') {
+    result.latch = { state: 'set', newestStopId: latch.newestStopId,
+      evidence: raw.events.find((event) => event.id === latch.newestStopId)?.evidence ?? null };
+  }
+  return result;
+}
 function journalDecision(decision: SwitchCodexInput['decision']): CodexSwitchJournal['decision'] {
   return decision ? { leftHeadroom: decision.leftHeadroom ?? null, leftRecoveryAtMs: decision.leftRecoveryAt ?? null,
     leftTrigger: decision.leftTrigger ?? null } : null;
@@ -1669,7 +1721,11 @@ function foregroundWatchResultFromDurable(
 }
 
 /** Run the three short post-commit checks; durable C8 work starts at +2 minutes. */
-async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwitchResult, watch: CodexWatch): Promise<CodexSwitchResult> {
+async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwitchResult, watch: CodexWatch, lifecycleId: number | null): Promise<CodexSwitchResult> {
+  try { return await foregroundCodexWatchChecks(deps, result, watch); } finally { sweepAfterCommit(deps, lifecycleId); }
+}
+
+async function foregroundCodexWatchChecks(deps: CodexSwitchDeps, result: CodexSwitchResult, watch: CodexWatch): Promise<CodexSwitchResult> {
   let previous = 0;
   for (const at of foregroundWatchDelays) {
     await (deps.sleep ?? sleepFor)(at - previous);
@@ -1700,6 +1756,11 @@ async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwi
 
 /** C8 consumer: process only due persisted watches; foreground switching never calls this. */
 export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Promise<void> {
+  // Record a stop from any verdict written here now, even when a later tick throws.
+  try { await runDueCodexWatchTicks(deps, now); } finally { sweepAfterCommit(deps); }
+}
+
+async function runDueCodexWatchTicks(deps: CodexSwitchDeps, now: number): Promise<void> {
   for (const watch of deps.store.listDueCodexWatches(now)) {
     // The due query is intentionally one batch, but time-sensitive X10b
     // decisions use the live clock for each row: lock waits can span a minute.
@@ -1788,6 +1849,11 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
   let recordedFrom = deps.store.getCodexActiveLogin();
   const admitted = await deps.admitted?.(input.trigger) ?? { ok: true };
   if (!admitted.ok) return switchResult(recordedFrom, admitted.reason ?? admitted.code ?? 'not-admitted');
+  // Read once, so no later check opens another connection under the switch lock.
+  const lifecycleId = deps.lifecycleId?.() ?? null;
+  // Before recovery, preflight and the pre-switch refresh: a latched qlb starts none of them (KTD16).
+  const stopRefusal = stopRulesRefusal(deps, input, recordedFrom, lifecycleId);
+  if (stopRefusal) return stopRefusal;
   const recovery = await reconcileCodexRecovery(deps);
   // Recovery may have committed an earlier journal and changed the active
   // source. All results below must report that engine-observed value.
@@ -1804,6 +1870,9 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
   // One budget for the attempt: the first observation plus five restarts (§4.4.1 steps 1 and 4).
   let observeRestarts = 0;
   while (freshenRound < 2) {
+    // A stop committed since the last check, by recovery or by the previous round, refuses before the pre-switch refresh.
+    const beforeFreshen = stopRulesRefusal(deps, input, deps.store.getCodexActiveLogin(), lifecycleId);
+    if (beforeFreshen) return beforeFreshen;
     await deps.hooks?.beforeFreshenLock?.();
     const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now(), trigger: input.trigger });
     if (freshen.kind === 'refused') return switchRefusal(deps, input, freshen.reason);
@@ -1815,6 +1884,9 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
       const result = await withCodexSwitchLocks(deps, async (assertHeld) => {
         const fence = codexRecoveryFenceState(deps.journalDir!, deps.store);
         if (fence.state === 'fenced') return { result: switchResult(deps.store.getCodexActiveLogin(), fence.reason, fence.message) };
+        // A stop committed since the first check (during the pre-switch refresh, say) is caught here, before anything is published.
+        const stopRefusal = stopRulesRefusal(deps, input, deps.store.getCodexActiveLogin(), lifecycleId);
+        if (stopRefusal) return { result: stopRefusal };
         assertHeld();
         const again = checkCodexSwitchPreconditions(deps, input);
         if (again.kind === 'refused') return { result: switchResult(deps.store.getCodexActiveLogin(), again.reason) };
@@ -2011,8 +2083,10 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
       if ('retryFreshen' in result) { freshenRound += 1; continue; }
       if (committedWatch && result.result.outcome === 'ok') {
         foregroundWatchesStarted = true;
-        return await runForegroundCodexWatches(deps, result.result, committedWatch);
+        return await runForegroundCodexWatches(deps, result.result, committedWatch, lifecycleId);
       }
+      // A committed failure or revert is itself stop evidence.
+      if (committed) sweepAfterCommit(deps, lifecycleId);
       return result.result;
     } catch (error) {
       if (journalExists && !released) {
@@ -2029,7 +2103,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
         return switchResult(recordedFrom, 'lock-lost');
       }
       // Only the commit itself maps to commit-failed; a committed attempt keeps its outcome.
-      if (committed) return committed;
+      if (committed) { sweepAfterCommit(deps, lifecycleId); return committed; }
       if (commitFailed) return withRecordedFrom({ outcome: 'failed', reason: 'commit-failed', attemptId: deps.attempt }, recordedFrom);
       throw error;
     } finally { finishCodexSwitchAttempt(deps.attempt); }

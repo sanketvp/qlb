@@ -10,12 +10,14 @@ import {
   switchCodex,
   type CodexOldAccountSession,
   type CodexSwitchDeps,
+  type CodexSwitchLatch,
   type CodexSwitchResult,
 } from '../codex-switch';
 import { list as listCodexSessions, processLstart } from '../codex-sessions';
 import { listCswapProcesses } from '../cswap-processes';
 import { platformKeychain } from '../keychain';
-import { assertAdmitted } from '../lifecycle';
+import { readBuildStamp } from '../codex-stop';
+import { assertAdmitted, phase } from '../lifecycle';
 import { openStore, type Store } from '../store';
 import { resolveCodexAuthPath } from './codex-import-active';
 import type { CommandContext, CommandDefinition } from '../registry';
@@ -73,11 +75,35 @@ function safeMessage(message: string | undefined): string | undefined {
   return safeReason(message.slice(prefix.length, -suffix.length)) === undefined ? undefined : message;
 }
 
+/** A stop's evidence pointer as the sweep writes it (`<table>:<id>`); anything else is not printed. */
+function safePointer(pointer: string | null): string | null {
+  return pointer !== null && /^[a-z_]+:[0-9]+$/.test(pointer) ? pointer : null;
+}
+
+function safeLatch(latch: CodexSwitchLatch | undefined): CodexSwitchLatch | undefined {
+  if (latch === undefined) return undefined;
+  if (latch.state === 'set') return { state: 'set', newestStopId: latch.newestStopId, evidence: safePointer(latch.evidence) };
+  return { state: 'unknown', reason: safeReason(latch.reason) ?? 'unrecognized' };
+}
+
+/** R13: which stop latched qlb, and the way out. */
+function latchLine(latch: CodexSwitchLatch | undefined): string | undefined {
+  const safe = safeLatch(latch);
+  if (safe === undefined) return undefined;
+  if (safe.state === 'set') {
+    return `latched by stop ${safe.newestStopId} (evidence ${safe.evidence ?? 'unrecognized'}); see qlb codex stage report, then qlb codex latch clear --through ${safe.newestStopId} --reason <text>`;
+  }
+  return safe.reason === 'initialize-required'
+    ? 'the latch state is unknown (initialize-required); see qlb codex stage report, then qlb codex latch clear --initialize --reason <text>'
+    : `the latch state is unknown (${safe.reason}); see qlb codex stage report`;
+}
+
 function receipt(
   result: CodexSwitchResult,
   to: string,
   oldAccountPids: number[],
 ): Record<string, unknown> {
+  const latch = safeLatch(result.latch);
   return {
     outcome: result.outcome,
     from: result.from,
@@ -86,6 +112,7 @@ function receipt(
     ...(safeReason(result.reason) === undefined ? {} : { reason: safeReason(result.reason) }),
     ...(safeMessage(result.message) === undefined ? {} : { message: safeMessage(result.message) }),
     watch: result.watch ?? null,
+    ...(latch === undefined ? {} : { latch }),
     lockLostAfterCommit: result.lockLostAfterCommit === true,
     oldAccountPids,
   };
@@ -109,7 +136,7 @@ function exitCode(result: CodexSwitchResult, fenced: boolean): 0 | 1 | 3 {
 export function defaultSwitchDeps(
   ctx: CommandContext,
   store: Store,
-  commandDeps: Pick<SwitchOpenAiCodexCommandDeps, 'now' | 'randomUUID'>,
+  commandDeps: Pick<SwitchOpenAiCodexCommandDeps, 'now' | 'randomUUID' | 'enabled'>,
 ): CodexSwitchDeps {
   const slots = new CodexSlots({ keychain: platformKeychain });
   const now = commandDeps.now ?? Date.now;
@@ -134,6 +161,10 @@ export function defaultSwitchDeps(
       return { ok: admission.ok, reason: admission.code };
     },
     journalOwner: { pid: process.pid, lstart: '' },
+    flagEnabled: commandDeps.enabled ?? CODEX_SWITCH_COMMAND_ENABLED,
+    buildStamp: readBuildStamp(),
+    // Lifecycle id 0 is the synthetic pre-cutover row: no lifecycle.
+    lifecycleId: () => phase(store).id || null,
   };
 }
 
@@ -177,6 +208,8 @@ export function createSwitchOpenAiCodexCommand(deps: SwitchOpenAiCodexCommandDep
         } else {
           const reason = (result.outcome === 'failed' || result.outcome === 'refused') ? safeReason(result.reason) : undefined;
           ctx.stdout(`Codex switch ${from ?? '-'} → ${parsed.target}: ${result.outcome}${reason === undefined ? '' : `: ${reason}`}`);
+          const latched = latchLine(result.latch);
+          if (latched !== undefined) ctx.stdout(latched);
           if (result.outcome === 'reverted-by-codex') {
             ctx.stdout(`Codex reverted the switch at ${new Date((deps.now ?? Date.now)()).toISOString()}; ${oldSessions.length} sessions on old account`);
             for (const session of oldSessions) ctx.stdout((deps.codexOldAccountLine ?? codexOldAccountLine)(from ?? '-', session));

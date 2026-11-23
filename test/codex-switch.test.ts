@@ -68,9 +68,17 @@ function fixture() {
     cswapProcesses: () => [],
     now: () => 1_700_000_000_000,
     attempt: 'attempt-fixture',
+    // Switch tests run with the go-live flag on; the latch tests cover it off (KTD17).
+    flagEnabled: true,
     ...overrides,
   });
   return { root, stashDir, store, db, deps };
+}
+
+/** KTD17: an automatic switch is admitted only while a Stage 2 run is open. */
+function openStage2(store: ReturnType<typeof openStore>, at = 1_699_999_999_000): void {
+  store.appendCodexStageEvent({ kind: 'stage-start', now: at, lifecycleId: null, buildStamp: null, flagEnabled: true, stage: 2,
+    detail: { allow: [], frozenStatus: 'pass' } });
 }
 
 function freshenJwt(payload: Record<string, unknown>): string {
@@ -3459,8 +3467,8 @@ describe('Codex watch tick — C6-21', () => {
   const holderOfA: CodexProcess = { pid: 4401, lstart: 'Mon Nov 13 10:00:00 2023', host: 'codex' };
   /** Commit a real A→B switch and return its watch as C6-22's join will supply it. */
   const committedWatch = async (h: Harness, trigger = 'manual', list: () => Promise<CodexProcess[]> = async () => []): Promise<CodexWatch> => {
-    // An automatic switch needs the S15 receipt.
-    if (trigger !== 'manual') h.store.setConfig('codex.l13VerifiedAt', '1');
+    // An automatic switch needs the S15 receipt and an open Stage 2 run.
+    if (trigger !== 'manual') { h.store.setConfig('codex.l13VerifiedAt', '1'); openStage2(h.store); }
     assert.equal((await h.runWith({ list }, { target: 'b:account', trigger })).outcome, 'ok');
     const row = h.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.until, s.trigger, json_extract(s.steps_json, '$.attempt') AS attempt,
       s.published_at, s.open_sessions_json FROM codex_watch w JOIN switch_log s ON s.id = w.switch_id`).get() as {
@@ -4560,6 +4568,7 @@ describe('scenario 6 end to end and command contract — C6-26', () => {
       const decision = { leftHeadroom: 8, leftRecoveryAt: 1_700_000_360_000, leftTrigger: 'proactive' };
       const input: SwitchCodexInput = { target: 'b:account', trigger: 'proactive', decision };
       h.store.setConfig('codex.l13VerifiedAt', '1');
+      openStage2(h.store);
       const revertStdout: string[] = [];
       const revertStderr: string[] = [];
       const scenarioDeps = () => h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
@@ -4601,6 +4610,16 @@ describe('scenario 6 end to end and command contract — C6-26', () => {
       assert.equal(h.store.getCodexSlot('a:account')?.fingerprint, aPrimeFingerprint);
       assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM codex_slots WHERE account_id = 'a:account' AND dead != 0"), 0);
       assert.equal(scalarCount(h.db, "SELECT COUNT(*) AS count FROM relogin_events WHERE provider = 'openai-codex'"), 0);
+
+      // U7: in a Stage 2 run the revert is a stop, recorded as the switch returns. The next
+      // automatic switch is refused until the owner clears it and starts a new run.
+      const stops = h.store.readCodexStageLog().events.filter((event) => event.kind === 'latch-set');
+      assert.deepEqual(stops.map((stop) => stop.detail), [{ rule: 'unconfirmed-switch' }]);
+      const latchedSwitch = await switchCodex(scenarioDeps(), input);
+      assert.equal(latchedSwitch.reason, 'codex-stop-latched');
+      h.store.appendCodexStageEvent({ kind: 'latch-clear', now: 1_700_000_500_001, lifecycleId: null, buildStamp: null, flagEnabled: true,
+        throughId: stops[0].id, reason: 'pane restarted' });
+      openStage2(h.store, 1_700_000_500_002);
 
       const switchTime = 1_700_000_600_000;
       let clock = switchTime;
