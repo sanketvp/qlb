@@ -9,6 +9,8 @@ export interface HealthCheck {
   name: string;
   level: HealthCheckLevel;
   message: string;
+  /** A stable name for this WARN or FAIL outcome, for allow-lists that must not match on message text. */
+  code?: string;
   detail?: unknown;
 }
 

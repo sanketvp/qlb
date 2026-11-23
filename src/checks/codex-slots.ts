@@ -9,7 +9,7 @@ const SLOT_APPLICABLE_PHASES = new Set(['cutting-over', 'cutover', 'retired']);
 export function codexSlotsCheck(dbPath: string, phase: string): HealthCheck {
   return guardCheck('codex:slots', () => {
     if (phase === 'unknown') {
-      return { name: 'codex:slots', level: 'WARN', message: 'lifecycle phase unavailable; Codex slots cannot be evaluated' };
+      return { name: 'codex:slots', level: 'WARN', code: 'phase-unavailable', message: 'lifecycle phase unavailable; Codex slots cannot be evaluated' };
     }
     if (!SLOT_APPLICABLE_PHASES.has(phase)) {
       return { name: 'codex:slots', level: 'N/A', message: `not applicable in phase=${phase}` };
@@ -22,7 +22,7 @@ export function codexSlotsCheck(dbPath: string, phase: string): HealthCheck {
       `).all() as Array<{ accountId: string; reason: string | null }>;
       return dead.length === 0
         ? { name: 'codex:slots', level: 'PASS', message: 'no dead Codex slots' }
-        : { name: 'codex:slots', level: 'FAIL', message: `${dead.length} dead Codex slot(s) require re-login`, detail: dead };
+        : { name: 'codex:slots', level: 'FAIL', code: 'dead-slots', message: `${dead.length} dead Codex slot(s) require re-login`, detail: dead };
     } finally {
       db.close();
     }
