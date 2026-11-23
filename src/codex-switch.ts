@@ -877,7 +877,7 @@ function freshenDeps(deps: CodexSwitchDeps): {
  */
 export async function freshenCodexTarget(
   deps: CodexSwitchDeps,
-  { target, now }: { target: string; now: number },
+  { target, now, trigger }: { target: string; now: number; trigger: string },
 ): Promise<CodexTargetFreshenResult> {
   const configured = freshenDeps(deps);
   // Same adapter guard as codex refresh: an unreadable slot, or a document
@@ -937,6 +937,7 @@ export async function freshenCodexTarget(
         holders,
         inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
         assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
+        by: trigger === 'manual' ? 'qlb-cli' : 'qlb-auto',
       });
       return fromConsume(outcome, snapshot);
     });
@@ -1759,7 +1760,7 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
   let observeRestarts = 0;
   while (freshenRound < 2) {
     await deps.hooks?.beforeFreshenLock?.();
-    const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now() });
+    const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now(), trigger: input.trigger });
     if (freshen.kind === 'refused') return switchRefusal(deps, input, freshen.reason);
     let journalExists = false; let released = false; let renamed = false; let commitFailed = false;
     let committed: CodexSwitchResult | undefined;

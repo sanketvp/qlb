@@ -579,6 +579,8 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
             holders: holdersFor(deps, active),
             inFlightSlots,
             assertHeld,
+            // Only the auto tick refreshes the active login; the owner's forced refresh goes through codex refresh.
+            by: 'qlb-auto',
           });
           return result;
         })();
