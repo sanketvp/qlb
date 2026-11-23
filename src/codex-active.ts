@@ -11,7 +11,7 @@ const NEAR_EXPIRY_MS = 5 * 60_000;
 
 /** Dependencies for the active Codex renewer. All external effects are injected. */
 export type CodexActiveDeps = Pick<CodexSwitchDeps,
-  'store' | 'readLive' | 'cswapProcesses' | 'now' | 'attempt' | 'authLockOptions'
+  'store' | 'readLive' | 'cswapProcesses' | 'now' | 'attempt' | 'authLockOptions' | 'buildStamp' | 'flagEnabled' | 'lifecycleId'
 > & {
   dbPath: string;
   slots: NonNullable<CodexSwitchDeps['slots']>;
@@ -57,7 +57,8 @@ export type CodexActiveRefusalReason =
   | 'unknown-live-identity'
   | 'stash-unverifiable'
   | 'slot-split'
-  | 'switch-in-flight';
+  | 'switch-in-flight'
+  | 'codex-stop-latched';
 
 export type CodexActiveAction = Extract<CodexPhaseAttribution['action'], 'noop' | 'adopt' | 'republish-slot'>;
 type CodexActiveExternalAction = CodexPhaseAttribution['action'];
@@ -581,6 +582,7 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
             assertHeld,
             // Only the auto tick refreshes the active login; the owner's forced refresh goes through codex refresh.
             by: 'qlb-auto',
+            stopRules: { buildStamp: deps.buildStamp, flagEnabled: deps.flagEnabled, lifecycleId: deps.lifecycleId?.(), autoLog: deps.autoLog },
           });
           return result;
         })();
@@ -616,6 +618,11 @@ export async function refreshActiveCodexLogin(deps: CodexActiveDeps, input: Code
         case 'slot-removed': return finish({ status: 'refused', reason: 'active-slot-missing' });
         case 'slot-split': return finish({ status: 'refused', reason: 'slot-split' });
         case 'switch-in-flight': return finish({ status: 'refused', reason: 'switch-in-flight' });
+        // Not retried: only an owner clear lifts the latch.
+        case 'stop-latched':
+          // A check that failed to run refused fail-closed; say so, since no stop was recorded.
+          if (consumed.latchCheck === 'check-failed') deps.autoLog?.(`codex:latch-check-failed provider=openai-codex account=${active} at=${deps.now()}`);
+          return finish({ status: 'refused', reason: 'codex-stop-latched' });
         case 'codex-won-inactive': {
           const live = await deps.readLive();
           const pids = consumed.holders ?? [];

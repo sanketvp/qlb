@@ -4,9 +4,10 @@ import { accessExpiry, codexAuthFileSha256, codexAuthFileText, codexFingerprint,
 import { codexL13ReceiptAt } from './codex-l13-receipt';
 import { attributeLiveDocument, type AttributeLiveDocumentInput, type CodexAttributionResult, type CodexAttributionStore } from './codex-attribution';
 import { ClaudeCodeLockTimeout, CodexAuthLockCompromised, ProperLockfileCompromised, withCodexAuthLock, type CodexAuthLockOptions, type HeldProperLockfile, withProperLockfile } from './cc-locks';
-import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult } from './codex-consume';
+import { consumeCodexSlot, hasCodexSlotIdentity, withCodexConsumeThenSwitchLocks, withCodexSwitchLock, type CodexConsumeOptions, type CodexConsumeResult, type CodexLatchCheck } from './codex-consume';
 import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
+import { CODEX_SWITCH_COMMAND_ENABLED } from './codex-flag';
 import { admitCodexAction, deriveLatch } from './codex-stage';
 import { readBuildStamp, sweepCodexStops, toStageLog, type CodexStopContext } from './codex-stop';
 import {
@@ -27,8 +28,8 @@ import type { CodexWatchVerdict, Store } from './store';
 
 const PROVIDER = 'openai-codex';
 
-/** Dark-launch gate; C8 flips this only alongside its background watch consumer. */
-export const CODEX_SWITCH_COMMAND_ENABLED = false;
+/** Dark-launch gate, defined in `codex-flag.ts`; C8 flips it only alongside its background watch consumer. */
+export { CODEX_SWITCH_COMMAND_ENABLED };
 
 export type CodexSwitchPreflightResult =
   | { kind: 'go' }
@@ -865,7 +866,7 @@ export function codexRecoveryFenceState(
 
 export type CodexTargetFreshenResult =
   | { kind: 'go' }
-  | { kind: 'refused'; reason: string; pids?: number[] };
+  | { kind: 'refused'; reason: string; pids?: number[]; latchCheck?: CodexLatchCheck };
 
 function freshenDeps(deps: CodexSwitchDeps): {
   dbPath: string;
@@ -889,7 +890,7 @@ function freshenDeps(deps: CodexSwitchDeps): {
  */
 export async function freshenCodexTarget(
   deps: CodexSwitchDeps,
-  { target, now, trigger }: { target: string; now: number; trigger: string },
+  { target, now, trigger, lifecycleId }: { target: string; now: number; trigger: string; lifecycleId?: number | null },
 ): Promise<CodexTargetFreshenResult> {
   const configured = freshenDeps(deps);
   // Same adapter guard as codex refresh: an unreadable slot, or a document
@@ -922,6 +923,8 @@ export async function freshenCodexTarget(
   const fromConsume = (result: CodexConsumeResult, snapshot: CodexAuthDocument): CodexTargetFreshenResult => {
     if (result.status === 'refreshed' || result.status === 'fresh') return { kind: 'go' };
     if (result.status === 'held') return holderResult(snapshot, result.holders ?? []);
+    // The switch returns this without persisting it, as it does its own latch refusals.
+    if (result.status === 'stop-latched') return { kind: 'refused', reason: 'codex-stop-latched', latchCheck: result.latchCheck };
     return { kind: 'refused', reason: `target-freshen-${result.status}` };
   };
   let lockedSnapshot: CodexAuthDocument | undefined;
@@ -950,6 +953,7 @@ export async function freshenCodexTarget(
         inFlightSlots: fence.state === 'fenced' ? fence.accounts : undefined,
         assertHeld: () => { heldConsume.assertNotCompromised(); heldSwitch.assertNotCompromised(); },
         by: trigger === 'manual' ? 'qlb-cli' : 'qlb-auto',
+        stopRules: { buildStamp: deps.buildStamp, flagEnabled: deps.flagEnabled, lifecycleId, autoLog: deps.autoLog },
       });
       return fromConsume(outcome, snapshot);
     });
@@ -1874,7 +1878,16 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
     const beforeFreshen = stopRulesRefusal(deps, input, deps.store.getCodexActiveLogin(), lifecycleId);
     if (beforeFreshen) return beforeFreshen;
     await deps.hooks?.beforeFreshenLock?.();
-    const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now(), trigger: input.trigger });
+    const freshen = await freshenCodexTarget(deps, { target: input.target, now: deps.now(), trigger: input.trigger, lifecycleId });
+    if (freshen.kind === 'refused' && freshen.reason === 'codex-stop-latched') {
+      // The pre-switch refresh found a stop committed after the check above: report it like that check, unpersisted.
+      const latched = stopRulesRefusal(deps, input, deps.store.getCodexActiveLogin(), lifecycleId);
+      if (latched) return latched;
+      // No stop to name: the refresh's own check failed to run (a busy database, say), so it refused fail-closed.
+      const result = switchResult(deps.store.getCodexActiveLogin(), 'codex-stop-latched');
+      result.latch = { state: 'unknown', reason: 'latch-check-failed' };
+      return result;
+    }
     if (freshen.kind === 'refused') return switchRefusal(deps, input, freshen.reason);
     let journalExists = false; let released = false; let renamed = false; let commitFailed = false;
     let committed: CodexSwitchResult | undefined;
