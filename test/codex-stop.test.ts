@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 
@@ -188,6 +188,52 @@ describe('codex stop sweep', () => {
       assert.equal(sweepCodexStops(failing).recorded.length, 1);
       assert.equal(latchSets(store).length, 1);
       assert.equal(readCodexLatch(store).state, 'set');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('appends the line to auto.log beside the store when no writer is given', () => {
+    const path = dbPath();
+    const store = openStore(path);
+    try {
+      startStage(store);
+      const relogin = store.recordRelogin({ ts: T0 + 1, provider: PROVIDER, accountId: 'acct-a', kind: 'wiped' });
+      const { autoLog: _injected, ...ctx } = harness(store).ctx;
+      const [stopId] = sweepCodexStops(ctx).recorded;
+      const logPath = join(dirname(path), 'auto.log');
+      assert.equal(readFileSync(logPath, 'utf8'),
+        `codex:stop-latched stop=${stopId} rule=forced-relogin evidence=relogin_events:${relogin} at=${T0 + 10_000}\n`);
+      assert.equal(statSync(logPath).mode & 0o777, 0o600);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('keeps recording stops once armed when a later event row is unreadable', () => {
+    const path = dbPath();
+    let store = openStore(path);
+    startStage(store);
+    store.close();
+    const raw = new DatabaseSync(path);
+    try {
+      raw.prepare("INSERT INTO codex_stage_events (kind, recorded_at) VALUES ('from-a-newer-build', ?)").run(T0 + 1);
+    } finally {
+      raw.close();
+    }
+    store = openStore(path);
+    try {
+      const relogin = store.recordRelogin({ ts: T0 + 2, provider: PROVIDER, accountId: 'acct-a', kind: 'wiped' });
+      const { ctx } = harness(store);
+      assert.equal(sweepCodexStops(ctx).recorded.length, 1);
+      const raw2 = new DatabaseSync(path, { readOnly: true });
+      try {
+        const rows = raw2.prepare("SELECT evidence FROM codex_stage_events WHERE kind = 'latch-set'").all() as Array<{ evidence: string }>;
+        assert.deepEqual(rows.map((row) => row.evidence), [`relogin_events:${relogin}`]);
+      } finally {
+        raw2.close();
+      }
+      assert.deepEqual(readCodexLatch(store), { state: 'unreadable', reason: 'unreadable-row' });
     } finally {
       store.close();
     }
