@@ -81,6 +81,7 @@ import { claudeVersionDriftCheck } from './checks/version-drift';
 import type { ClaudeVersionRunner } from './claude-version';
 import { codexSlotsCheck } from './checks/codex-slots';
 import { codexFirstSwitchCheck } from './checks/codex-first-switch';
+import { codexStopLatchCheck } from './checks/codex-stop-latch';
 import { undoIncompleteCheck } from './checks/undo-incomplete';
 import { undoLineageMatchCheck } from './checks/undo-lineage-match';
 import { guardCheck } from './checks/_check';
@@ -944,6 +945,7 @@ export async function doctorQlb(
     claudeSlotsCheck(config.dbPath, phase),
     codexSlotsCheck(config.dbPath, phase),
     codexFirstSwitchCheck(config.dbPath, lifecycle, options.now?.() ?? Date.now()),
+    codexStopLatchCheck(config.dbPath),
     undoIncompleteCheck(config.dbPath, lifecycle),
     await undoLineageMatchCheck(config.dbPath, lifecycle, options.keychain ?? platformKeychain, dirname(config.cswapSequencePath)),
     lifecyclePhaseCheck(lifecycle),
