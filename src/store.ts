@@ -3245,7 +3245,8 @@ export class Store {
         stepsJson: JSON.stringify({ attempt: input.attempt, via: 'fence' }), publishedAt: input.fence.publishedAt,
         detail });
       this.clearRecoveryFence();
-      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.fence.switchId);
+      const verdict: CodexWatchVerdict = outcome === 'ok' ? 'confirmed' : outcome === 'reverted-by-codex' ? 'reverted' : 'unresolved';
+      this.endCodexWatchIn(input.fence.switchId, verdict, input.now);
       return switchId;
     });
   }
@@ -3304,7 +3305,7 @@ export class Store {
       const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: input.watch.outgoing,
         toAccount: input.watch.target, trigger: input.watch.trigger, outcome: 'reverted-by-codex',
         stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null });
-      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
+      this.endCodexWatchIn(input.watch.switchId, 'reverted', input.now);
       return switchId;
     });
   }
@@ -3320,7 +3321,7 @@ export class Store {
       const switchId = this.recordSwitch({ ts: input.now, provider: 'openai-codex', fromAccount: input.watch.outgoing,
         toAccount: input.watch.target, trigger: input.watch.trigger, outcome: 'failed', detail: 'unknown-live-identity',
         stepsJson: JSON.stringify({ attempt: input.attempt, via: 'watch' }), publishedAt: null });
-      this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(input.watch.switchId);
+      this.endCodexWatchIn(input.watch.switchId, 'unknown-live-identity', input.now);
       return switchId;
     });
   }
@@ -3386,9 +3387,19 @@ export class Store {
     return this.db.prepare('SELECT 1 FROM codex_watch WHERE switch_id = ?').get(switchId) !== undefined;
   }
 
-  /** A terminal watch outcome that does not itself need a switch-log row. */
-  deleteCodexWatch(switchId: number): void {
-    this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(switchId);
+  /** Ends a watch with its verdict, for a terminal outcome that does not itself need a switch-log row. */
+  endCodexWatch(input: { switchId: number; verdict: CodexWatchVerdict; now: number; detail?: unknown }): void {
+    this.runImmediate(() => this.endCodexWatchIn(input.switchId, input.verdict, input.now, input.detail));
+  }
+
+  /**
+   * The one place a watch row is deleted. The verdict is written in the same
+   * transaction, and only when this call ended the watch, so a watch that
+   * already ended keeps its first verdict. Callers hold a transaction.
+   */
+  private endCodexWatchIn(switchId: number, verdict: CodexWatchVerdict, now: number, detail?: unknown): void {
+    const ended = this.db.prepare('DELETE FROM codex_watch WHERE switch_id = ?').run(switchId).changes > 0;
+    if (ended) this.insertCodexWatchVerdict({ switchId, verdict, now, detail });
   }
 
   /**

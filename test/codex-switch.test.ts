@@ -3609,7 +3609,7 @@ describe('Codex watch tick — C6-21', () => {
       splitSlot(h, 'b:account', 'b-killed');
       assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' });
       const beforeRetry = rows(h);
-      assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' });
+      assert.deepEqual(await tick(h, watch, 5_000), { state: 'fenced' });
       assert.deepEqual(fence(h), { v: 1, switchId: watch.switchId, attempt: watch.attempt, from: 'a:account', to: 'b:account',
         publishedAt: watch.publishedAt, reason: 'slot-split', involvedAccounts: ['a:account', 'b:account'], since: watch.publishedAt + 1_000 });
       assert.deepEqual(rows(h), beforeRetry, 'the unresolved fence writes no effect row');
@@ -3659,7 +3659,7 @@ describe('Codex watch tick — C6-21', () => {
         assert.deepEqual(await tick(h, watch, 1_000), { state: 'unresolved', reason: 'slot-split' }, `${label}: creates the fence`);
         const before = rows(h);
         codexWrites(h, h.a);
-        assert.deepEqual(await tick(h, watch, 5_000), { state: 'quiet' }, label);
+        assert.deepEqual(await tick(h, watch, 5_000), { state: 'fenced' }, label);
         assert.equal((fence(h) as { reason: string }).reason, 'slot-split', label);
         assert.deepEqual(rows(h), before, `${label}: no fence-resolution row`);
         assert.equal(watchRows(h), 1, `${label}: the watch is kept`);
@@ -3840,7 +3840,7 @@ describe('Codex watch tick — C6-21', () => {
     } finally { close(h); }
   });
 
-  it('an overdue watch (now ≥ until + 60 s) is deleted without reading, attributing or writing a row, even under a fence', async () => {
+  it('an overdue watch (now ≥ until + 60 s) ends on one final observation: a write-back is reverted, its own fence unresolved (U5)', async () => {
     for (const fenced of [false, true]) {
       const h = switchHarness();
       try {
@@ -3851,19 +3851,18 @@ describe('Codex watch tick — C6-21', () => {
           assert.deepEqual(await tick(h, watch, 5_000), { state: 'unresolved', reason: 'slot-split' });
         }
         const storedFence = fence(h);
-        const aPrime = observedDocument('a', 'a-late');
-        codexWrites(h, aPrime);
-        const before = { rows: rows(h), a: slotFps(h, 'a:account'), active: activeLogin(h),
-          observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') };
-        let reads = 0;
-        const readLive = () => { reads += 1; return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }); };
+        codexWrites(h, observedDocument('a', 'a-late'));
+        const before = rows(h);
         const overdue = watch.until - watch.publishedAt + 60_000;
-        assert.deepEqual(await tick(h, watch, overdue, { readLive }), { state: 'stopped', reason: 'overdue' }, String(fenced));
-        assert.equal(reads, 0);
-        assert.deepEqual({ rows: rows(h), a: slotFps(h, 'a:account'), active: activeLogin(h),
-          observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') }, before);
-        assert.equal(watchRows(h), 0);
-        assert.deepEqual(fence(h), storedFence, 'a fence is cleared only by recovery');
+        if (fenced) {
+          assert.deepEqual(await tick(h, watch, overdue), { state: 'stopped', reason: 'unresolved' });
+          assert.deepEqual(rows(h), before, 'no revert is attributed under the fence');
+          assert.deepEqual(fence(h), storedFence, 'a fence is cleared only by recovery');
+        } else {
+          assert.deepEqual(await tick(h, watch, overdue), { state: 'reverted' });
+          assert.deepEqual(lastRow(h), viaWatch(watch, 'reverted-by-codex', null, null));
+          assert.equal(watchRows(h), 0);
+        }
       } finally { close(h); }
     }
     // Control: one millisecond earlier the tick still attributes the reversion.
@@ -4270,7 +4269,7 @@ describe('Codex watch tick — C6-21', () => {
       try {
         let clock = 1_700_000_000_000;
         const store = Object.create(h.store) as typeof h.store;
-        store.deleteCodexWatch = () => { throw new CodexAuthLockCompromised(); };
+        store.endCodexWatch = () => { throw new CodexAuthLockCompromised(); };
         const result = await h.runWith({ store, now: () => clock, sleep: async (ms) => {
           clock += ms;
           if (clock === 1_700_000_001_000) {
@@ -4335,7 +4334,6 @@ describe('Codex watch tick — C6-21', () => {
         assert.equal(result.outcome, 'ok');
         const row = h.db.prepare('SELECT until FROM codex_watch').get() as { until: number };
         let clock = row.until + 59_999;
-        codexWrites(h, observedDocument('a', 'overdue-during-lock-wait'));
         const before = switchRows(h.db);
         await runDueCodexWatches(h.deps({
           authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
@@ -4343,8 +4341,10 @@ describe('Codex watch tick — C6-21', () => {
           authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => clock,
           hooks: { afterWatchLock: () => { clock += 1; } },
         }), clock);
-        assert.deepEqual(switchRows(h.db), before, 'the overdue tick writes no retroactive revert');
+        assert.deepEqual(switchRows(h.db), before, 'a quiet ending writes no switch_log row');
         assert.equal(watchRows(h), 0);
+        // The clock read under the lock crossed the overdue line, so the ending is late, not confirmed.
+        assert.equal(h.store.listCodexWatchVerdicts()[0]?.verdict, 'late');
       } finally { close(h); }
     });
 
@@ -4385,15 +4385,15 @@ describe('Codex watch tick — C6-21', () => {
         assert.equal(result.outcome, 'ok');
         const row = h.db.prepare('SELECT until FROM codex_watch').get() as { until: number };
         const started = row.until + 59_999;
-        codexWrites(h, observedDocument('a', 'late-after-lock-wait'));
         const before = switchRows(h.db);
         await runDueCodexWatches(h.deps({
           authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
           slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
           authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => row.until + 60_000,
         }), started);
-        assert.deepEqual(switchRows(h.db), before, 'overdue consumption writes no retroactive verdict');
+        assert.deepEqual(switchRows(h.db), before, 'a quiet ending writes no switch_log row');
         assert.equal(watchRows(h), 0);
+        assert.equal(h.store.listCodexWatchVerdicts()[0]?.verdict, 'late', 'the per-row clock found the row overdue');
       } finally { close(h); }
     });
 
@@ -4412,15 +4412,18 @@ describe('Codex watch tick — C6-21', () => {
       } finally { close(h); }
     });
 
-    it('a watch row first consumed after its until is deleted without attributing', async () => {
+    it('a watch row first consumed after its until ends late with no switch_log row (U5)', async () => {
       const h = switchHarness();
       try {
         const result = await h.runWith({ sleep: async () => undefined });
         assert.equal(result.outcome, 'ok');
         const row = h.db.prepare('SELECT until FROM codex_watch').get() as { until: number };
-        const before = { rows: switchRows(h.db), observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') };
-        await runDueCodexWatches(h.deps({ now: () => row.until + 60_000 }), row.until + 60_000);
-        assert.deepEqual({ rows: switchRows(h.db), observations: scalarCount(h.db, 'SELECT COUNT(*) AS count FROM codex_live_observations') }, before);
+        const before = switchRows(h.db);
+        await runDueCodexWatches(h.deps({ authPath: h.authPath, dbPath: h.store.dbPath, journalDir: join(h.root, 'journal'), keychain: h.keychain,
+          slots: h.slots as never, list: async () => [], readLive: () => readCodexAuthStableWithStat(h.authPath, { delayMs: 0 }),
+          authLockOptions: { home: h.root, timeoutMs: 50, retryMinMs: 1, retryJitterMs: 1 }, now: () => row.until + 60_000 }), row.until + 60_000);
+        assert.deepEqual(switchRows(h.db), before);
+        assert.equal(h.store.listCodexWatchVerdicts()[0]?.verdict, 'late');
         assert.equal(watchRows(h), 0);
       } finally { close(h); }
     });
