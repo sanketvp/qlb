@@ -16,6 +16,7 @@ export type LifecycleOperation =
   | 'cutover-begin' | 'cutover-commit' | 'cutover-abort' | 'keychain-authorize-cswap'
   | 'keychain-check-launchd-live' | 'verify-l13' | 'report-cutover' | 'doctor' | 'status'
   | 'lifecycle-close' | 'lifecycle-drill-done' | 'lifecycle-sentinels-record' | 'claude-journal-resolve'
+  | 'codex-stage-start' | 'codex-stage-close'
   | `${string}:dry-run`;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -82,6 +83,7 @@ export const PHASE_RULES: Record<LifecycleState, Set<LifecycleOperation>> = {
     'import-cswap:reconcile', 'import-cswap:reconcile-preview',
     'codex-import-active', 'codex-add', 'claude-add', 'claude-journal-resolve', 'pi-migrate', 'pi-inventory-record', 'pi-rollback',
     'verify-l13', 'report-cutover', 'undo-cswap', 'undo-cswap:dry-run-record', 'retire-cswap', 'retire-cswap:resume', 'lifecycle-drill-done', 'lifecycle-sentinels-record',
+    'codex-stage-start', 'codex-stage-close',
   ),
   undoing: rules('doctor', 'status', 'lifecycle-sentinels-record', 'undo-cswap:resume', 'pi-rollback'),
   'rolled-back': rules('doctor', 'status', 'lifecycle-sentinels-record', 'report-cutover', 'undo-cswap:resume', 'pi-rollback', 'lifecycle-close'),

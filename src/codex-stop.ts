@@ -9,17 +9,21 @@
 
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 
 import { CODEX_NAMED_REFUSALS } from './codex-refusals';
 import {
   deriveLatch,
   findStops,
   type StageEventRow,
+  type StageInput,
+  type StageLineageRow,
   type StageLog,
+  type StageReloginRow,
   type StageStatus,
   type StageSwitchRow,
 } from './codex-stage';
-import type { CodexStageEvent, CodexStageLog, Store } from './store';
+import { listCodexWatchVerdictsFrom, readCodexStageLogFrom, type CodexStageEvent, type CodexStageLog, type Store } from './store';
 
 export interface CodexStopContext {
   store: Store;
@@ -117,6 +121,27 @@ export function sweepCodexStops(ctx: CodexStopContext): { recorded: number[] } {
     try { (ctx.autoLog ?? ((text) => appendAutoLog(ctx.store, text)))(line); } catch { /* recorded above */ }
   }
   return { recorded };
+}
+
+/**
+ * Everything the stage evaluator reads, from any connection (a read-only one
+ * included). Null when the stage log is not readable, which callers treat as
+ * latched.
+ */
+export function readCodexStageInputFrom(db: DatabaseSync): StageInput | null {
+  const log = toStageLog(readCodexStageLogFrom(db));
+  if (log.status !== 'readable') return null;
+  const rows = <T>(sql: string): T[] => (db.prepare(sql).all() as T[]).map((row) => ({ ...row }));
+  return {
+    events: log.events,
+    switches: rows<StageSwitchRow>(`SELECT id, ts, committed_at AS committedAt, trigger, outcome, detail, to_account AS toAccount
+      FROM switch_log WHERE provider = 'openai-codex' ORDER BY id`),
+    relogins: rows<StageReloginRow>("SELECT id, ts, kind FROM relogin_events WHERE provider = 'openai-codex' ORDER BY id"),
+    verdicts: listCodexWatchVerdictsFrom(db).map(({ switchId, verdict, recordedAt }) => ({ switchId, verdict, recordedAt })),
+    lineage: rows<StageLineageRow>(`SELECT id, ts, account_id AS accountId, by, cause
+      FROM lineage_log WHERE provider = 'openai-codex' ORDER BY id`),
+    rules: { namedRefusals: CODEX_NAMED_REFUSALS },
+  };
 }
 
 function appendAutoLog(store: Pick<Store, 'dbPath'>, line: string): void {
