@@ -1488,7 +1488,9 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       return { state: 'stopped', reason: 'superseded' };
     }
     if (latest.outcome === 'reverted-by-codex') return { state: 'reverted' };
-    return latest.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: latest.detail ?? latest.outcome };
+    // An ok resolution before until leaves the watch open: keep observing the live file.
+    if (latest.outcome === 'ok') return deps.store.hasCodexWatch(watch.switchId) ? undefined : { state: 'quiet' };
+    return { state: 'stopped', reason: latest.detail ?? latest.outcome };
   };
   return withCodexSwitchLocks(deps, async (assertHeld): Promise<CodexWatchTickResult> => {
     await deps.hooks?.afterWatchLock?.();

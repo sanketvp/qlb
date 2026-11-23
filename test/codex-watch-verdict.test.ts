@@ -208,6 +208,37 @@ describe('Codex watch verdicts (U5): one verdict per watch ending', () => {
     } finally { close(h); }
   });
 
+  // Owner decision (2026-11-22): an ok resolution confirms only once the window has ended.
+  it('this switch\'s fence resolving ok before until keeps the watch open, and the at-until check confirms', async () => {
+    const h = harness();
+    try {
+      const watch = await committedWatch(h);
+      const fence = fenceFor(watch);
+      h.store.setRecoveryFence(fence);
+      h.store.commitFenceResolution({ fence, effect: { outcome: 'quiet' }, attempt: watch.attempt, now: watch.until - 1 });
+      assert.equal(watchCount(h), 1);
+      assert.equal(verdictOf(h, watch.switchId), null);
+      await due(h, watch.until);
+      assert.equal(watchCount(h), 0);
+      assert.equal(verdictOf(h, watch.switchId), 'confirmed');
+    } finally { close(h); }
+  });
+
+  it('after an ok resolution before until, a Codex write-back in the window is still reverted', async () => {
+    const h = harness();
+    try {
+      const watch = await committedWatch(h, 'auto', async () => [holderOfA]);
+      const fence = fenceFor(watch);
+      h.store.setRecoveryFence(fence);
+      h.store.commitFenceResolution({ fence, effect: { outcome: 'quiet' }, attempt: watch.attempt, now: watch.publishedAt + 10_000 });
+      codexWrites(h, login('a', 'a-prime'));
+      assert.deepEqual(await codexWatchTick(h.deps({ now: () => watch.publishedAt + 30_000, list: async () => [holderOfA] }), watch),
+        { state: 'reverted' });
+      assert.equal(watchCount(h), 0);
+      assert.equal(verdictOf(h, watch.switchId), 'reverted');
+    } finally { close(h); }
+  });
+
   it('this switch\'s fence still set at until, later resolving failed: unresolved, not confirmed', async () => {
     const h = harness();
     try {

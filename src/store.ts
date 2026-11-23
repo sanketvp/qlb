@@ -3245,8 +3245,13 @@ export class Store {
         stepsJson: JSON.stringify({ attempt: input.attempt, via: 'fence' }), publishedAt: input.fence.publishedAt,
         detail });
       this.clearRecoveryFence();
-      const verdict: CodexWatchVerdict = outcome === 'ok' ? 'confirmed' : outcome === 'reverted-by-codex' ? 'reverted' : 'unresolved';
-      this.endCodexWatchIn(input.fence.switchId, verdict, input.now);
+      // Owner decision (2026-11-22): an ok resolution confirms only once the
+      // window has ended; before that the watch stays open for its at-until check.
+      const watch = this.db.prepare('SELECT until FROM codex_watch WHERE switch_id = ?').get(input.fence.switchId) as { until: number } | undefined;
+      if (outcome !== 'ok' || watch === undefined || input.now >= watch.until) {
+        const verdict: CodexWatchVerdict = outcome === 'ok' ? 'confirmed' : outcome === 'reverted-by-codex' ? 'reverted' : 'unresolved';
+        this.endCodexWatchIn(input.fence.switchId, verdict, input.now);
+      }
       return switchId;
     });
   }

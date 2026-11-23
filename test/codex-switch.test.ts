@@ -3618,7 +3618,8 @@ describe('Codex watch tick — C6-21', () => {
       assert.deepEqual(await tick(h, watch, 30_000), { state: 'quiet' });
       assert.deepEqual(lastRow(h), viaWatch(watch, 'ok', null, watch.publishedAt, 'fence'));
       assert.equal(fence(h), null);
-      assert.equal(watchRows(h), 0);
+      // An ok resolution before until keeps the watch open for its at-until check (owner decision 2026-11-22).
+      assert.equal(watchRows(h), 1);
     } finally { close(h); }
   });
 
@@ -3754,12 +3755,13 @@ describe('Codex watch tick — C6-21', () => {
         return readCodexAuthStableWithStat(h.authPath, { delayMs: 0 });
       } });
       assert.deepEqual(result, { state: 'quiet' });
-      // One locked read, by the tick's recovery; the tick does not read or attribute again.
-      assert.deepEqual(reads, [true]);
+      // The tick's recovery reads once under the lock; the ok resolution is before until, so the
+      // watch stays open (owner decision 2026-11-22) and the tick observes it once more, still locked.
+      assert.deepEqual(reads, [true, true]);
       assert.equal(rows(h).length, 2, 'the switch and one effect row');
       assert.deepEqual(lastRow(h), viaWatch(watch, 'ok', null, watch.publishedAt, 'fence'));
       assert.equal(fence(h), null);
-      assert.equal(watchRows(h), 0);
+      assert.equal(watchRows(h), 1);
       assert.deepEqual(codexRecoveryFenceState(join(h.root, 'journal'), h.store), { state: 'none' });
     } finally { close(h); }
   });
