@@ -21,7 +21,7 @@ import type { CswapProcess } from './cswap-processes';
 import { CodexStashUnverifiable, isMalformedCodexSlot, type CodexSlots } from './codex-slots';
 import { isCredentialNotFound } from './credential-backends';
 import type { KeychainBackend } from './keychain';
-import type { Store } from './store';
+import type { CodexWatchVerdict, Store } from './store';
 
 const PROVIDER = 'openai-codex';
 
@@ -69,7 +69,7 @@ export interface CodexSwitchDeps {
     | 'recordCodexObservation' | 'setActiveLogin' | 'commitCodexSwitch' | 'findCommittedSwitchByAttempt'
     | 'setRecoveryFence' | 'clearRecoveryFence' | 'commitFenceResolution'
     | 'codexPublishingRowsAfter' | 'commitCodexWatchRevert' | 'commitCodexWatchStop'
-    | 'listDueCodexWatches' | 'advanceCodexWatch' | 'deleteCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
+    | 'listDueCodexWatches' | 'advanceCodexWatch' | 'endCodexWatch' | 'hasCodexWatch' | 'findCodexWatchCompletion'
     | 'readCodexWatchDurableResult'> & CodexAttributionStore;
   readLive: () => Promise<CodexAuthStableWithStatResult>;
   cswapProcesses: () => CswapProcess[];
@@ -1441,7 +1441,7 @@ export async function reconcileCodexRecovery(deps: CodexSwitchDeps): Promise<Awa
   return withCodexSwitchLocks(deps, (assertHeld) => reconcileCodexRecoveryLocked(deps, assertHeld));
 }
 
-/** X10b: a watch row consumed this long after its until is deleted without a verdict (C6 plan, C6-22 row). */
+/** X10b: a watch row consumed this long after its until ends on one final observation (C6-22 row; U5 verdicts). */
 export const CODEX_WATCH_OVERDUE_MS = 60_000;
 
 export interface CodexWatch {
@@ -1458,6 +1458,8 @@ export interface CodexWatch {
 
 export type CodexWatchTickResult =
   | { state: 'quiet' }
+  /** A recovery fence is set: the watch keeps its row until the fence resolves or the watch goes overdue. */
+  | { state: 'fenced' }
   | { state: 'reverted' }
   | { state: 'stopped'; reason: string }
   | { state: 'unresolved'; reason: string }
@@ -1486,20 +1488,25 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       return { state: 'stopped', reason: 'superseded' };
     }
     if (latest.outcome === 'reverted-by-codex') return { state: 'reverted' };
-    return latest.outcome === 'ok' ? { state: 'quiet' } : { state: 'stopped', reason: latest.detail ?? latest.outcome };
+    // An ok resolution before until leaves the watch open: keep observing the live file.
+    if (latest.outcome === 'ok') return deps.store.hasCodexWatch(watch.switchId) ? undefined : { state: 'quiet' };
+    return { state: 'stopped', reason: latest.detail ?? latest.outcome };
   };
   return withCodexSwitchLocks(deps, async (assertHeld): Promise<CodexWatchTickResult> => {
     await deps.hooks?.afterWatchLock?.();
-    // X10b: an overdue row is consumed without a verdict, even under a fence (the fence keeps its own context).
-    if (deps.now() >= watch.until + CODEX_WATCH_OVERDUE_MS) {
-      assertHeld(); deps.store.deleteCodexWatch(watch.switchId);
-      return { state: 'stopped', reason: 'overdue' };
-    }
+    // X10b: an overdue watch ends on this tick. It still makes one final live
+    // observation under the lock, so a write-back after until records reverted.
+    const overdue = deps.now() >= watch.until + CODEX_WATCH_OVERDUE_MS;
     const before = settledByRows();
     if (before) return before;
     // The locked form: this tick already holds switch → auth (no re-entry).
     const recovery = await reconcileCodexRecoveryLocked(deps, assertHeld);
-    if (recovery.state === 'fenced') return { state: 'quiet' };
+    if (recovery.state === 'fenced') {
+      if (!overdue) return { state: 'fenced' };
+      // Only this switch's own fence makes the ending unresolved; any other fence leaves it unobserved.
+      const ownFence = parseCodexRecoveryFence(deps.store.getConfig('codex.recoveryFence'))?.switchId === watch.switchId;
+      return { state: 'stopped', reason: ownFence ? 'unresolved' : 'fenced' };
+    }
     // A fence this recovery resolved already wrote its effect row: report it, never attribute again.
     // A later switch's orphaned journal it committed supersedes the watch.
     const after = settledByRows();
@@ -1507,13 +1514,16 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     // A caller that loaded the same watch already consumed it (its stop row is unpublished, so the rows miss it).
     if (!deps.store.hasCodexWatch(watch.switchId)) return { state: 'stopped', reason: 'superseded' };
     const observed = await deps.readLive();
-    if (observed.status === 'missing') { assertHeld(); deps.store.deleteCodexWatch(watch.switchId); return { state: 'stopped', reason: 'logged-out' }; }
+    if (observed.status === 'missing') {
+      assertHeld(); deps.store.endCodexWatch({ switchId: watch.switchId, verdict: 'inconclusive', now: deps.now() });
+      return { state: 'stopped', reason: 'logged-out' };
+    }
     if (observed.status === 'unstable' || observed.status === 'unreadable') {
       return deps.now() >= watch.until ? { state: 'inconclusive' } : { state: 'quiet' };
     }
     if (observed.status === 'wiped') {
       assertHeld(); deps.store.recordCodexObservation({ identity: null, lineageFp: null, by: 'qlb-watch', now: deps.now() });
-      deps.store.deleteCodexWatch(watch.switchId);
+      deps.store.endCodexWatch({ switchId: watch.switchId, verdict: 'wiped', now: deps.now() });
       return { state: 'stopped', reason: 'wiped' };
     }
     const live = observed.doc;
@@ -1537,7 +1547,7 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
       const reason = 'slot-split';
       assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
         publishedAt: watch.publishedAt, reason, involvedAccounts, since: deps.now() });
-      return { state: 'unresolved', reason };
+      return overdue ? { state: 'stopped', reason: 'unresolved' } : { state: 'unresolved', reason };
     };
     const targetValidation = readValidatedTargetSlot(slots, watch.target, targetFp);
     // C6-21-R1 (from C6-20d): a missing, corrupt, or wrong-identity B is a split.
@@ -1582,10 +1592,10 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     if (verdict.class === 'unresolved') {
       assertHeld(); deps.store.setRecoveryFence({ v: 1, switchId: watch.switchId, attempt: watch.attempt, from: watch.outgoing, to: watch.target,
         publishedAt: watch.publishedAt, reason: verdict.reason, involvedAccounts: verdict.involvedAccounts, since: deps.now() });
-      return { state: 'unresolved', reason: verdict.reason };
+      return overdue ? { state: 'stopped', reason: 'unresolved' } : { state: 'unresolved', reason: verdict.reason };
     }
     const effect = verdict.effect;
-    if (effect.outcome === 'quiet') return { state: 'quiet' };
+    if (effect.outcome === 'quiet') return overdue ? { state: 'stopped', reason: 'late' } : { state: 'quiet' };
     if (effect.outcome === 'reverted-by-codex') {
       deps.crashAt?.('watch-before-revert-commit');
       assertHeld(); deps.store.commitCodexWatchRevert({ watch, setActive: effect.accountId, attempt: watch.attempt, now: deps.now() });
@@ -1598,6 +1608,39 @@ export async function codexWatchTick(deps: CodexSwitchDeps, watch: CodexWatch): 
     // Missing and wiped returned above; failed/ok are post/recovery effects only.
     throw new Error(`Codex watch cannot apply the ${effect.outcome} effect`);
   });
+}
+
+/** Verdicts for the reasons a tick reports `stopped`; any other reason is this switch's fence ending failed. */
+const STOPPED_WATCH_VERDICTS: Readonly<Record<string, CodexWatchVerdict>> = {
+  'not-admitted': 'not-admitted',
+  superseded: 'superseded',
+  'logged-out': 'inconclusive',
+  wiped: 'wiped',
+  'unknown-live-identity': 'unknown-live-identity',
+  late: 'late',
+  // Overdue under a fence that is not this switch's: the target was never observed.
+  fenced: 'inconclusive',
+};
+
+/**
+ * The verdict a tick result ends its watch with, or null while the watch goes
+ * on. `observedAtOrAfterUntil` is whether the tick began at or after `until`,
+ * so a quiet tick that started earlier is never confirmed.
+ */
+export function codexWatchVerdict(tick: CodexWatchTickResult, observedAtOrAfterUntil: boolean): CodexWatchVerdict | null {
+  switch (tick.state) {
+    case 'quiet':
+      return observedAtOrAfterUntil ? 'confirmed' : null;
+    case 'fenced':
+    case 'unresolved':
+      return null;
+    case 'reverted':
+      return 'reverted';
+    case 'inconclusive':
+      return 'inconclusive';
+    case 'stopped':
+      return STOPPED_WATCH_VERDICTS[tick.reason] ?? 'unresolved';
+  }
 }
 
 const foregroundWatchDelays = [1_000, 5_000, 30_000] as const;
@@ -1646,15 +1689,11 @@ async function runForegroundCodexWatches(deps: CodexSwitchDeps, result: CodexSwi
     // Consume foreground terminal results exactly as C8's durable consumer does.
     // In particular, admission can change before C8 wakes, so a reported stop
     // must never be resumed from its retained row.
-    if (tick.state === 'stopped') {
-      deps.store.deleteCodexWatch(watch.switchId);
-      return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: tick.reason } }, result.from);
+    if (tick.state === 'stopped' || tick.state === 'inconclusive') {
+      deps.store.endCodexWatch({ switchId: watch.switchId, verdict: codexWatchVerdict(tick, true)!, now: deps.now() });
+      return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: tick.state === 'stopped' ? tick.reason : 'inconclusive' } }, result.from);
     }
     if (tick.state === 'unresolved') return withRecordedFrom({ ...result, watch: { state: 'unresolved', reason: tick.reason } }, result.from);
-    if (tick.state === 'inconclusive') {
-      deps.store.deleteCodexWatch(watch.switchId);
-      return withRecordedFrom({ ...result, watch: { state: 'stopped', reason: 'inconclusive' } }, result.from);
-    }
   }
   return result;
 }
@@ -1664,20 +1703,26 @@ export async function runDueCodexWatches(deps: CodexSwitchDeps, now: number): Pr
   for (const watch of deps.store.listDueCodexWatches(now)) {
     // The due query is intentionally one batch, but time-sensitive X10b
     // decisions use the live clock for each row: lock waits can span a minute.
+    // An overdue watch is ended by the tick itself, after one final observation.
     const tickNow = deps.now();
-    if (tickNow >= watch.until + CODEX_WATCH_OVERDUE_MS) {
-      deps.store.deleteCodexWatch(watch.switchId);
+    let tick: CodexWatchTickResult;
+    try { tick = await codexWatchTick(deps, watch); }
+    catch (error) {
+      // An overdue watch that cannot be observed ends inconclusive rather than
+      // failing every later pass; lock contention is transient and is retried.
+      if (error instanceof ClaudeCodeLockTimeout || deps.now() < watch.until + CODEX_WATCH_OVERDUE_MS) throw error;
+      deps.store.endCodexWatch({ switchId: watch.switchId, verdict: 'inconclusive', now: deps.now(),
+        detail: { error: error instanceof Error ? error.message : String(error) } });
       continue;
     }
-    const tick = await codexWatchTick(deps, watch);
+    const verdict = codexWatchVerdict(tick, tickNow >= watch.until);
+    if (verdict !== null) {
+      deps.store.endCodexWatch({ switchId: watch.switchId, verdict, now: deps.now() });
+      continue;
+    }
     const afterTickNow = deps.now();
-    if (tick.state === 'reverted' || tick.state === 'stopped' || tick.state === 'inconclusive'
-      || (afterTickNow >= watch.until && tick.state !== 'unresolved')) {
-      deps.store.deleteCodexWatch(watch.switchId);
-      continue;
-    }
     const nextAt = [watch.publishedAt + 120_000, watch.until].find((at) => at > afterTickNow);
-    // An unresolved final tick remains due: it is retried in the grace period until X10b deletes it.
+    // A fenced or unresolved tick, or a quiet one begun before until, remains due: it is retried until it ends or goes overdue.
     if (nextAt !== undefined) deps.store.advanceCodexWatch(watch.switchId, nextAt);
   }
 }
