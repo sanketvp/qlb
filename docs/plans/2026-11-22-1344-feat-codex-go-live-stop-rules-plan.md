@@ -276,7 +276,8 @@ Watch ending to verdict:
 |---|---|---|---|
 | Quiet at or after `until` with the target still live and no recovery fence set (for this or any switch) | `advanceCodexWatch` terminal path | confirmed | counts |
 | Tick at or after `until` while any recovery fence is set | today the tick reports quiet (`src/codex-switch.ts:1501`) and the row is deleted (`:1670-1673`) | none yet: the tick reports a new `fenced` state and the row stays until the fence resolves (rows above) or goes overdue (below) | none until resolved |
-| Recovery fence for this switch resolves ok | `src/codex-switch.ts:1477-1489` | confirmed | counts |
+| Recovery fence for this switch resolves ok at or after `until` | `src/codex-switch.ts:1477-1489` | confirmed | counts |
+| Recovery fence for this switch resolves ok before `until` | `src/store.ts` `commitFenceResolution` | none yet: the watch stays open and the at-until check decides (owner decision, 2026-11-22) | — |
 | Recovery fence for this switch resolves failed | `src/codex-switch.ts:1477-1489` | unresolved | stop (R8) |
 | Codex wrote back its own login | revert commit, `src/store.ts:3084` | reverted | stop (R9) |
 | Login file unstable or unreadable at or after `until` | `src/codex-switch.ts:1510-1512`, `:1654` | inconclusive | stop (R9) |
@@ -289,6 +290,8 @@ Watch ending to verdict:
 | Lifecycle no longer admits the watch | `src/codex-switch.ts:1467-1468` | not-admitted | neutral |
 
 Today a fenced tick at or after `until` deletes the watch row with no verdict. U5 changes that: the tick reports `fenced`, `runDueCodexWatches` keeps the row, and the verdict is written when the fence resolves or the row goes overdue. The recovery fence is one global row, so a fence set by any switch holds the watch open. A fenced watch is never confirmed by the quiet path; it can be confirmed only when its own switch's fence resolves ok (row above).
+
+*Owner decision (2026-11-22):* an ok resolution of this switch's fence confirms only once the window has ended. Before `until` the watch stays open, the tick keeps observing the live login file, and the regular at-until check gives the verdict, so a Codex write-back later in the window still records reverted. Raised by the U5 code review: an early ok resolution would otherwise confirm a watch with most of its window left.
 
 ### Assumptions
 
@@ -459,6 +462,7 @@ This is separate because it changes the watch path, which must be reviewed again
   - A second ending for the same switch leaves the first verdict.
   - A watch whose fence is still set at `until` keeps its row; when the fence later resolves failed, the verdict is unresolved, not confirmed.
   - A watch at `until` while a different switch's fence is set keeps its row and records no confirmed verdict.
+  - This switch's fence resolving ok before `until` keeps the watch open with no verdict; the at-until check confirms it, and a Codex write-back inside the window after the resolution records reverted (owner decision, 2026-11-22).
   - No call to the bare watch delete remains outside the store method.
 - **Verification:** `node --test dist-test/test/codex-watch-verdict.test.js` and `dist-test/test/codex-switch.test.js` pass.
 
