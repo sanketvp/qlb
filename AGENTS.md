@@ -23,6 +23,7 @@ Check every proposed change against `STRATEGY.md`, QLB's product vision and stra
 - `src/store.ts`: the SQLite store. `src/lifecycle.ts`: the cutover lifecycle row and `PHASE_RULES`, the admission table for every lifecycle-governed command (including `qlb gate`).
 - `src/migration.ts`: the generic `qlb migrate` state machine (NATIVE → MIRRORED → VALIDATED → QLB_OWNED, plus rollback and resume). `src/pi-migrate.ts`: the separate `qlb pi migrate` path; the two refuse each other.
 - `src/pi-gate.ts` and `src/gate/`: `qlb gate <provider>`, the only path that hands a credential to the Pi extension. `src/token/`, `src/oauth/` and `src/single-consume.ts`: reading and the fenced refresh of QLB-owned grants.
+- `src/codex-flag.ts`: `CODEX_SWITCH_COMMAND_ENABLED`, the Codex switch dark-launch flag (re-exported by `src/codex-switch.ts`). `src/codex-consume.ts` holds the one Codex refresh step every caller goes through, including its stop-latch check.
 - `src/keychain.ts`: Keychain access and the QLB item names (`qlb:<provider>:<account>`).
 - `src/diagnostics.ts`: `qlb doctor`. `src/release.ts`: `qlb release install`. `src/pi-deploy.ts`: `qlb pi deploy`.
 - `extensions/qlb-pi/`: the Pi extension. Deployed, it sits in `~/.pi/agent/extensions/qlb-pi` beside a shared `~/.pi/agent/src/` holding `src/redact.ts` and `src/pi-owner-document.ts`.

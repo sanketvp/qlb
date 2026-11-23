@@ -97,6 +97,12 @@ export async function runCodexRefreshCommand(args: string[], deps: CodexRefreshC
     error(result.message ?? 'codex refresh refused: switch-in-flight');
     return 3;
   }
+  if (result.status === 'stop-latched') {
+    // No request was sent. Not retried: only an owner clear lifts the latch.
+    const why = result.latchCheck === 'unknown' ? ' (latch state unknown)' : result.latchCheck === 'check-failed' ? ' (latch check failed; retry)' : '';
+    error(`codex refresh refused: codex-stop-latched${why}; see qlb codex stage report`);
+    return 3;
+  }
   if (result.stashId) error(`codex refresh successor stash: ${result.stashId}`);
   if (result.status === 'successor-unpersisted') {
     error('codex refresh failed: successor-unpersisted');

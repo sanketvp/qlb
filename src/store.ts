@@ -1371,6 +1371,30 @@ export function readCodexStageLogFrom(db: DatabaseSync): CodexStageLog {
     : { status: 'readable', events };
 }
 
+/**
+ * Appends a stage event on any writable connection and returns its id, or null
+ * when a latch-set for the same evidence already exists. Any other constraint
+ * failure throws.
+ */
+export function appendCodexStageEventTo(db: DatabaseSync, input: CodexStageEventInput): number | null {
+  const result = db.prepare(`INSERT INTO codex_stage_events
+    (kind, recorded_at, lifecycle_id, build_stamp, flag_enabled, stage, evidence, through_id, reason, detail_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (evidence) WHERE kind = 'latch-set' DO NOTHING`).run(
+    input.kind,
+    input.now,
+    input.lifecycleId,
+    input.buildStamp,
+    input.flagEnabled ? 1 : 0,
+    input.stage ?? null,
+    input.evidence ?? null,
+    input.throughId ?? null,
+    input.reason == null ? null : redactSecrets(input.reason, []),
+    input.detail == null ? null : redactJsonText(JSON.stringify(input.detail)),
+  );
+  return result.changes === 0 ? null : Number(result.lastInsertRowid);
+}
+
 /** Reads every recorded watch verdict; empty when the table is missing. */
 export function listCodexWatchVerdictsFrom(db: DatabaseSync): CodexWatchVerdictRow[] {
   if (!hasTable(db, 'codex_watch_verdicts')) return [];
@@ -3412,23 +3436,7 @@ export class Store {
    * latch-set for the same evidence pointer is already recorded.
    */
   appendCodexStageEvent(input: CodexStageEventInput): number | null {
-    // Only the latch-set evidence conflict is ignored; any other constraint failure throws.
-    const result = this.db.prepare(`INSERT INTO codex_stage_events
-      (kind, recorded_at, lifecycle_id, build_stamp, flag_enabled, stage, evidence, through_id, reason, detail_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (evidence) WHERE kind = 'latch-set' DO NOTHING`).run(
-      input.kind,
-      input.now,
-      input.lifecycleId,
-      input.buildStamp,
-      input.flagEnabled ? 1 : 0,
-      input.stage ?? null,
-      input.evidence ?? null,
-      input.throughId ?? null,
-      input.reason == null ? null : redactSecrets(input.reason, []),
-      input.detail == null ? null : redactJsonText(JSON.stringify(input.detail)),
-    );
-    return result.changes === 0 ? null : Number(result.lastInsertRowid);
+    return appendCodexStageEventTo(this.db, input);
   }
 
   readCodexStageLog(): CodexStageLog {
