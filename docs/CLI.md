@@ -290,6 +290,34 @@ Do not use `qlb usage probe` as a diagnostic substitute: it directly probes and 
 
 Flags: `[--json]`.
 
+## `qlb codex stage`
+
+Record the owner's markers for taking Codex switching live in stages. **Live state:** both subcommands write `~/.qlb/qlb.db`; run them only on the owner's machine, never from an agent session.
+
+```console
+$ qlb codex stage start --stage 1
+codex stage 1 started (event 4)
+$ qlb codex stage close
+codex stage 1 closed: pass (event 9)
+```
+
+`start --stage <1|2>` appends a stage-start row with the build stamp, the flag value and the doctor allow-list. Stage 1 takes the allow-list from `--allow <check>:<code>` (repeatable; only the WARN codes of `codex:slots` and `codex:first-switch` are accepted, never a FAIL). The list mostly matters for the pre-switch doctor gate during the run: at start, a current `codex:first-switch` WARN already fails the `codex-first-switch-pass` precondition. Stage 2 takes no `--allow`: it inherits Stage 1's list, and its row also holds Stage 1's frozen result. A start is refused, with the reason after `refused:`, when:
+
+- `flag-off`: `CODEX_SWITCH_COMMAND_ENABLED` is false in this build (checked before anything else);
+- `phase=<state>`: the lifecycle phase is not `cutover`;
+- `latched` / `latch-unknown`: the stop latch is set, or its log cannot be read (the stop sweep runs first);
+- `run-open`: the current run of this stage or a later one is still open (not closed, not stopped); run `close` first, which freezes its result. Stage 2 over an open Stage 1 run is the normal promotion and is allowed;
+- `open-watch` / `recovery-fence`: a Codex switch watch is open or a recovery fence is set;
+- `precondition-failing: <names>`: `codex-first-switch-pass`, `l13-receipt`, `auto-tick-wired`, or (Stage 2) `decide-and-switch-tick`;
+- `check-fail: <check>:<code>`: a Codex check FAILs (an allow-list never admits a FAIL);
+- `check-not-allowed: <check>:<code>`: a Codex check WARNs with a code not on the allow-list;
+- `stage-1-not-passed`: (Stage 2) the latest Stage 1 run is not a pass;
+- `codex-lock-busy`: a Codex switch, refresh or `codex add` holds a lock; nothing was recorded, so retry.
+
+`close` freezes the current stage's result (pass, not yet, or stop) in a stage-close row; a stop recorded later does not change it. It is refused with `phase=<state>`, `latch-unknown`, `open-watch`, `recovery-fence`, `codex-lock-busy`, or `no-open-run` (no stage started, or the current stage is already closed).
+
+Both run under the Codex switch and auth locks and take their timestamp only once they are held, so no switch, refresh or `codex add` is in flight across a marker. Exit `0` on a recorded marker, `3` on a refusal, `2` on a usage error. Flags: `[--json]` (prints the outcome object).
+
 ## `qlb export`
 
 Emit the last persisted usage readings as JSON without loading provider adapters or credential stores, making network requests, or migrating the database. The SQLite database is opened read-only and is never created when absent. This is the cache-only interface for status consumers; unlike `qlb status`, it does not refresh readings.
