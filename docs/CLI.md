@@ -290,6 +290,47 @@ Do not use `qlb usage probe` as a diagnostic substitute: it directly probes and 
 
 Flags: `[--json]`.
 
+## `qlb codex stage report`
+
+Show each Codex go-live stage's state and the rows behind it, without changing anything. It opens the store read-only, never records a stop, and never flips a flag; attach its output to each flag-flip PR.
+
+```console
+$ qlb codex stage report
+codex stage report (build abc1234, flag off, phase cutover)
+Preconditions:
+  PASS lifecycle-cutover (stage 1, 2): phase=cutover
+  FAIL codex-first-switch-pass (stage 1, 2): WARN receipt-overdue
+  FAIL l13-receipt (stage 1, 2): absent
+  FAIL auto-tick-wired (stage 1, 2): not built
+  FAIL decide-and-switch-tick (stage 2): not built
+  FAIL l13-receipt-writer (informational): not built
+Latch: armed
+  not yet recorded by the sweep:
+    relogin_events:1 forced-relogin — relogin 1 at 2026-11-20T17:16:40.000Z: wiped
+Stage 1 start 1 at 2026-11-20T17:00:00.000Z: build abc1234, flag on
+Stage 1: STOP — 3 confirmed switches on 1 days
+...
+```
+
+It prints:
+
+- the six preconditions, each marked with the stage it gates. The lifecycle phase, the `codex:first-switch` check, the `codex.l13VerifiedAt` receipt and the auto-tick wiring gate both stages; the automatic decide-and-switch tick gates Stage 2; the receipt writer is informational, because the receipt precondition already needs one;
+- the latch: `unarmed`, `armed`, `latched`, or `latch state unknown (<why>)`. It lists each recorded stop with its evidence row (marked `(cleared)` once a later clear covers it), each clear (its reason shows only as `recorded`), and every stop the next sweep would record but has not yet, judged exactly as the sweep judges it, even when the stage log is unreadable;
+- the build stamp (the commit sha, with `-dirty` for a dirty tree) and flag value of each stage start;
+- each stage's result (`PASS`, `NOT YET`, `STOP`, `NOT STARTED`, or `UNKNOWN` when the stage log cannot be read), whether it is frozen, the confirmed switch ids and their local dates, Stage 2's counted `qlb-auto` refreshes, and the stops that ended the run.
+
+The latch, the stops and the stages are read in one read transaction, so they reflect one moment of the store; the lifecycle phase and the `codex:first-switch` check read it separately.
+
+The output is meant to be shared on a public PR. Accounts show as report-local aliases (`account-01`, ...). Evidence rows show only their table, id, time, trigger, kind or outcome, a known detail code, and verdict; any value that is not a known code shows as `unrecognized`, and so does a build stamp that is not a commit sha. The whole report is also redacted against known secrets.
+
+It refuses, writing nothing, with:
+- `no-store` when there is no database (it never creates one);
+- `schema-migration-required` when the database needs a migration;
+- `schema-newer` when a newer qlb wrote it;
+- `store-unreadable` when the file cannot be opened as a database. The refusal never prints the path.
+
+Exit `0` with a report, whatever the stages show; `3` on a refusal; `2` on a usage error. Flags: `[--json]` prints the report object, or `{"ok":false,"reason":...}` on a refusal.
+
 ## `qlb codex stage`
 
 Record the owner's markers for taking Codex switching live in stages. **Live state:** both subcommands write `~/.qlb/qlb.db`; run them only on the owner's machine, never from an agent session.

@@ -22,8 +22,18 @@ import {
   type StageReloginRow,
   type StageStatus,
   type StageSwitchRow,
+  type StopFinding,
 } from './codex-stage';
-import { listCodexWatchVerdictsFrom, readCodexStageLogFrom, type CodexStageEvent, type CodexStageLog, type Store } from './store';
+import {
+  listCodexStopEvidenceFrom,
+  listCodexWatchVerdictsFrom,
+  readCodexStageLogFrom,
+  type CodexStageEvent,
+  type CodexStageLog,
+  type CodexStopEvidence,
+  type CodexWatchVerdictRow,
+  type Store,
+} from './store';
 
 export interface CodexStopContext {
   store: Store;
@@ -81,26 +91,43 @@ export function readCodexLatch(store: Pick<Store, 'readCodexStageLog'>): CodexLa
   }
 }
 
+/** Where the sweep reads its evidence: the store, or any connection (the read-only stage report). */
+export interface CodexStopEvidenceSource {
+  listCodexStopEvidence(sinceTs: number): CodexStopEvidence;
+  listCodexWatchVerdicts(): CodexWatchVerdictRow[];
+}
+
+export function codexStopEvidenceFrom(db: DatabaseSync): CodexStopEvidenceSource {
+  return { listCodexStopEvidence: (sinceTs) => listCodexStopEvidenceFrom(db, sinceTs), listCodexWatchVerdicts: () => listCodexWatchVerdictsFrom(db) };
+}
+
+/**
+ * The stops the sweep would record: every stop in the evidence rows from the
+ * first stage start on, or none before one. Recorded or not; the sweep and the
+ * stage report both use it, so they judge the same rows the same way.
+ */
+export function findSweepStops(log: CodexStageLog, source: CodexStopEvidenceSource): StopFinding[] {
+  // A store without the tables is a read-only open; there is nothing to judge.
+  if (log.status === 'unknown' && log.reason === 'tables-missing') return [];
+  const firstStart = log.events.find((event) => event.kind === 'stage-start');
+  if (!firstStart) return [];
+  const since = firstStart.recordedAt;
+  const evidence = source.listCodexStopEvidence(since);
+  return findStops({
+    // The classifier reads only id, ts, outcome and detail from a switch row.
+    switches: evidence.switches.map((row): StageSwitchRow => ({ ...row, committedAt: null, toAccount: '' })),
+    relogins: evidence.relogins,
+    verdicts: source.listCodexWatchVerdicts().filter((row) => row.recordedAt >= since),
+  }, { namedRefusals: CODEX_NAMED_REFUSALS });
+}
+
 /**
  * Records a latch-set for every stop not yet recorded and returns the new row
  * ids. Before the first stage start the sweep is unarmed and records nothing;
  * once armed it never disarms.
  */
 export function sweepCodexStops(ctx: CodexStopContext): { recorded: number[] } {
-  const log = ctx.store.readCodexStageLog();
-  // A store without the tables is a read-only open; nothing can be recorded there.
-  if (log.status === 'unknown' && log.reason === 'tables-missing') return { recorded: [] };
-  const firstStart = log.events.find((event) => event.kind === 'stage-start');
-  if (!firstStart) return { recorded: [] };
-
-  const since = firstStart.recordedAt;
-  const evidence = ctx.store.listCodexStopEvidence(since);
-  const findings = findStops({
-    // The classifier reads only id, ts, outcome and detail from a switch row.
-    switches: evidence.switches.map((row): StageSwitchRow => ({ ...row, committedAt: null, toAccount: '' })),
-    relogins: evidence.relogins,
-    verdicts: ctx.store.listCodexWatchVerdicts().filter((row) => row.recordedAt >= since),
-  }, { namedRefusals: CODEX_NAMED_REFUSALS });
+  const findings = findSweepStops(ctx.store.readCodexStageLog(), ctx.store);
 
   const recorded: number[] = [];
   for (const finding of findings) {
