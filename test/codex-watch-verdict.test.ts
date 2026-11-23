@@ -79,6 +79,8 @@ function harness() {
     sleep: async () => undefined,
     journalOwner: { pid: process.pid, lstart: 'fixture-owner' },
     attempt: 'verdict-attempt',
+    // Switch tests run with the go-live flag on; the latch tests cover it off (KTD17).
+    flagEnabled: true,
     ...overrides,
   });
   return { root, store, db, keychain, authPath, a, b, slots, deps };
@@ -93,7 +95,12 @@ function close(h: Harness): void {
 
 /** Commit a real A→B switch, skipping its foreground checks, and return its durable watch. */
 async function committedWatch(h: Harness, trigger = 'manual', list: () => Promise<CodexProcess[]> = async () => []): Promise<CodexWatch> {
-  if (trigger !== 'manual') h.store.setConfig('codex.l13VerifiedAt', '1');
+  if (trigger !== 'manual') {
+    // An automatic switch needs the S15 receipt and an open Stage 2 run (KTD17).
+    h.store.setConfig('codex.l13VerifiedAt', '1');
+    h.store.appendCodexStageEvent({ kind: 'stage-start', now: NOW - 1_000, lifecycleId: null, buildStamp: null, flagEnabled: true, stage: 2,
+      detail: { allow: [], frozenStatus: 'pass' } });
+  }
   const result = await switchCodex(h.deps({ list, sleep: async () => { throw new Error('skip foreground checks'); } }), { target: 'b:account', trigger });
   assert.equal(result.outcome, 'ok');
   const row = h.db.prepare(`SELECT w.switch_id, w.outgoing, w.target, w.until, s.trigger, json_extract(s.steps_json, '$.attempt') AS attempt,

@@ -83,6 +83,8 @@ function harness(phase = 'cutover') {
     sleep: async () => undefined,
     journalOwner: { pid: process.pid, lstart: 'fixture-owner' },
     attempt: 'latch-attempt',
+    // Switch tests run with the go-live flag on; the latch tests cover it off (KTD17).
+    flagEnabled: true,
     ...overrides,
   });
   return { root, store, db, keychain, authPath, deps };
@@ -145,9 +147,8 @@ function fenceFor(watch: CodexWatch): CodexRecoveryFence {
     reason: 'slot-split', involvedAccounts: [watch.outgoing, watch.target], since: watch.publishedAt + 1 };
 }
 
-/** A fence whose watch already ended: no open watch, as after a stop with qlb-auto stopped. */
-async function fenceWithoutWatch(h: Harness): Promise<CodexWatch> {
-  const watch = await committedWatch(h);
+/** Ends a committed switch's watch and sets its fence: no open watch, as after a stop with qlb-auto stopped. */
+function fenceWithoutWatch(h: Harness, watch: CodexWatch): CodexWatch {
   h.store.endCodexWatch({ switchId: watch.switchId, verdict: 'superseded', now: watch.publishedAt + 1 });
   h.store.setRecoveryFence(fenceFor(watch));
   return watch;
@@ -229,8 +230,9 @@ describe('qlb codex latch clear', () => {
   it('a clear with an open watch is refused and names its until; between the 120-second tick and until it only advances the watch', async () => {
     const h = harness();
     try {
-      const stop = await latched(h);
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
       const watch = await committedWatch(h);
+      const stop = await latched(h);
       const until = new Date(watch.until).toISOString();
       const request: CodexLatchRequest = { kind: 'clear', throughId: stop, reason: 'ok' };
       assert.deepEqual(await clear(h, watch.publishedAt + 10_000, request), { ok: false, reason: 'open-watch', detail: until });
@@ -244,8 +246,9 @@ describe('qlb codex latch clear', () => {
   it('a clear after until consumes the watch through the runner, records its verdict, and succeeds when no new stop results', async () => {
     const h = harness();
     try {
-      const stop = await latched(h);
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
       const watch = await committedWatch(h);
+      const stop = await latched(h);
       const result = await clear(h, watch.until, { kind: 'clear', throughId: stop, reason: 'ok' });
       assert.ok(result.ok && result.kind === 'clear', JSON.stringify(result));
       assert.deepEqual(h.store.listCodexWatchVerdicts().map((row) => [row.switchId, row.verdict]), [[watch.switchId, 'confirmed']]);
@@ -283,8 +286,10 @@ describe('qlb codex latch clear', () => {
   it('latch set, fence set, no open watch: the clear\'s reconciliation resolves the fence and the clear succeeds', async () => {
     const h = harness();
     try {
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
+      const committed = await committedWatch(h);
       const stop = await latched(h);
-      const watch = await fenceWithoutWatch(h);
+      const watch = fenceWithoutWatch(h, committed);
       const result = await clear(h, watch.until + 1_000, { kind: 'clear', throughId: stop, reason: 'ok' });
       assert.ok(result.ok && result.kind === 'clear', JSON.stringify(result));
       assert.equal(h.store.getConfig('codex.recoveryFence'), null);
@@ -294,8 +299,10 @@ describe('qlb codex latch clear', () => {
   it('a fence that resolves failed records a new stop; a clear through that newer stop then succeeds', async () => {
     const h = harness();
     try {
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
+      const committed = await committedWatch(h);
       const stop = await latched(h);
-      const watch = await fenceWithoutWatch(h);
+      const watch = fenceWithoutWatch(h, committed);
       const fence = fenceFor(watch);
       const at = watch.until + 1_000;
       // Recovery finds the live login wiped and resolves the fence failed, as reconciliation commits it.
@@ -316,8 +323,10 @@ describe('qlb codex latch clear', () => {
   it('a fence that reconciliation cannot resolve still refuses the clear and names the fence', async () => {
     const h = harness();
     try {
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
+      const committed = await committedWatch(h);
       const stop = await latched(h);
-      await fenceWithoutWatch(h);
+      fenceWithoutWatch(h, committed);
       // B's Keychain copy no longer matches its recorded head: a slot split recovery cannot settle.
       h.keychain.setSync(qlbKeychainService(PROVIDER, 'b:account'), QLB_KEYCHAIN_ACCOUNT, JSON.stringify(login('b', 'split-b')));
       assert.deepEqual(await clear(h, NOW + 900_000, { kind: 'clear', throughId: stop, reason: 'ok' }),
@@ -348,14 +357,18 @@ describe('qlb codex latch clear', () => {
   it('a watch the clear\'s runner ends reverted records a new stop, and the clear is refused naming it', async () => {
     const h = harness();
     try {
-      const stop = await latched(h);
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
       const watch = await committedWatch(h);
+      const stop = await latched(h);
       // Codex wrote its own login back over B: new bytes at a new inode.
       writeFileSync(`${h.authPath}.codex-save`, JSON.stringify(login('a', 'a-prime')));
       renameSync(`${h.authPath}.codex-save`, h.authPath);
       const result = await clear(h, watch.publishedAt + 150_000, { kind: 'clear', throughId: stop, reason: 'ok' });
       assert.ok(!result.ok && result.reason === 'newer-stop' && Number(result.detail) > stop, JSON.stringify(result));
       assert.deepEqual(h.store.listCodexWatchVerdicts().map((row) => row.verdict), ['reverted']);
+      // The runner's own sweep records the stop, stamped like the clear's rows.
+      const newer = events(h).find((event) => event.id === Number(result.ok ? 0 : result.detail));
+      assert.deepEqual([newer?.buildStamp, newer?.flagEnabled], ['build-abc', true]);
     } finally { close(h); }
   });
 
@@ -399,8 +412,9 @@ describe('qlb codex latch clear', () => {
   it('the probe form appends no clear row and reports the newest stop and what blocks a clear', async () => {
     const h = harness();
     try {
-      const stop = await latched(h);
+      // A latched qlb refuses every switch (U7), so the switch commits before the stop.
       const watch = await committedWatch(h);
+      const stop = await latched(h);
       const result = await clear(h, watch.publishedAt + 10_000, { kind: 'probe' });
       assert.deepEqual(result, {
         ok: true, kind: 'probe', latch: 'latched', newestStopId: stop, blockers: [`open-watch:${new Date(watch.until).toISOString()}`],

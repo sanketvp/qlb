@@ -26,7 +26,7 @@ import {
 import { listCodexWatchVerdictsFrom, readCodexStageLogFrom, type CodexStageEvent, type CodexStageLog, type Store } from './store';
 
 export interface CodexStopContext {
-  store: Store;
+  store: Pick<Store, 'readCodexStageLog' | 'listCodexStopEvidence' | 'listCodexWatchVerdicts' | 'appendCodexStageEvent' | 'dbPath'>;
   now: () => number;
   /** The running build's stamp; see `readBuildStamp`. */
   buildStamp: string | null;
