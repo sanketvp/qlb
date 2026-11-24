@@ -17,8 +17,11 @@ import {
   type CodexAuthDocument as OAuthCodexAuthDocument,
 } from './codex-oauth';
 import { codexFingerprint, codexIdentity, needsRefresh, type CodexAuthDocument } from './codex-auth';
+import { CODEX_SWITCH_COMMAND_ENABLED } from './codex-flag';
 import type { CodexProcess } from './codex-sessions';
 import type { CodexSlots } from './codex-slots';
+import { codexStopStoreOn, readBuildStamp, readCodexLatch, sweepCodexStops, type CodexStopContext } from './codex-stop';
+import { phaseForConnection } from './lifecycle';
 import type { Store } from './store';
 
 const PROVIDER = 'openai-codex';
@@ -109,7 +112,12 @@ export type CodexConsumeStatus =
   | 'successor-unpersisted'
   | 'slot-removed'
   | 'slot-split'
-  | 'switch-in-flight';
+  | 'switch-in-flight'
+  /** The Codex stop latch is set or cannot be read, and no refresh request was sent (KTD7). */
+  | 'stop-latched';
+
+/** Why a consume returned `stop-latched`: a recorded stop, an unreadable stage log, or a check that failed to run. */
+export type CodexLatchCheck = 'set' | 'unknown' | 'check-failed';
 
 export interface CodexRefreshResponse {
   status: number;
@@ -135,6 +143,8 @@ export interface CodexConsumeResult {
   holders?: number[];
   stashId?: string;
   successorFailure?: { kind: 'successor-unpersisted'; stashFailure: string };
+  /** Set with `stop-latched` only. */
+  latchCheck?: CodexLatchCheck;
 }
 
 /** A caller's consume/switch owner token is no longer authoritative. */
@@ -170,6 +180,11 @@ export interface CodexConsumeOptions {
   inFlightSlots?: ReadonlySet<string> | '*';
   /** Who started this refresh, as recorded in lineage: qlb on its own (`qlb-auto`) or the owner (`qlb-cli`, the default). */
   by?: 'qlb-auto' | 'qlb-cli';
+  /**
+   * Stamps for a stop the latch check's sweep records. Omitted fields default to the
+   * build stamp, `CODEX_SWITCH_COMMAND_ENABLED` and the open lifecycle row.
+   */
+  stopRules?: Partial<Pick<CodexStopContext, 'buildStamp' | 'flagEnabled' | 'lifecycleId' | 'autoLog'>>;
 }
 
 interface CurrentSlot {
@@ -528,6 +543,43 @@ async function adoptSuccessor(options: CodexConsumeOptions, current: CurrentSlot
   }
 }
 
+/** The open lifecycle row, for stamping only: a failed read stamps null rather than refusing. */
+function openLifecycleId(db: DatabaseSync): number | null {
+  try { return phaseForConnection(db).id || null; } catch { return null; }
+}
+
+/**
+ * KTD7: with a store, record any stop not yet recorded, then read the latch.
+ * Null admits the refresh. Fail-closed: a latch that cannot be read, or a sweep
+ * or read that throws, refuses. Without a store (pure tests) there is no latch
+ * to read; every production caller passes one (`test/codex-consume-latch.test.ts`
+ * checks the call sites).
+ */
+function latchRefusal(options: CodexConsumeOptions): CodexLatchCheck | null {
+  if (!options.store) return null;
+  let connection: { db: DatabaseSync; close: boolean } | undefined;
+  try {
+    connection = openDatabase(options.store);
+    const db = connection.db;
+    const store = codexStopStoreOn(db, options.store.dbPath);
+    const stamps = options.stopRules ?? {};
+    sweepCodexStops({
+      store,
+      now: () => options.now?.() ?? Date.now(),
+      buildStamp: stamps.buildStamp === undefined ? readBuildStamp() : stamps.buildStamp,
+      flagEnabled: stamps.flagEnabled ?? CODEX_SWITCH_COMMAND_ENABLED,
+      lifecycleId: stamps.lifecycleId === undefined ? openLifecycleId(db) : stamps.lifecycleId,
+      autoLog: stamps.autoLog,
+    });
+    const latch = readCodexLatch(store).state;
+    return latch === 'clear' ? null : latch === 'set' ? 'set' : 'unknown';
+  } catch {
+    return 'check-failed';
+  } finally {
+    if (connection?.close) connection.db.close();
+  }
+}
+
 /** C10's inactive-slot consume gate. The caller holds the provider locks. */
 async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<CodexConsumeResult> {
   if (options.inFlightSlots === '*' || options.inFlightSlots?.has(options.accountId)) {
@@ -559,6 +611,10 @@ async function consumeCodexSlotLocked(options: CodexConsumeOptions): Promise<Cod
     emit(options, { kind: 'dead', accountId: options.accountId, fromFingerprint: current.fingerprint, reason: 'no_refresh_token' }, now);
     return { status: 'dead' };
   }
+
+  // KTD7: the one check every refresh request passes; adoption above never sends one.
+  const latchCheck = latchRefusal(options);
+  if (latchCheck) return { status: 'stop-latched', latchCheck };
 
   let response: CodexRefreshResponse;
   assertHeld(options);

@@ -35,6 +35,7 @@ const CONSUME_STATUSES: Record<CodexConsumeStatus, true> = {
   'slot-removed': true,
   'slot-split': true,
   'switch-in-flight': true,
+  'stop-latched': true,
 };
 
 type UnresolvedFenceReason = Extract<CodexRecoveryVerdict, { class: 'unresolved' }>['reason'];

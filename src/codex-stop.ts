@@ -25,6 +25,7 @@ import {
   type StopFinding,
 } from './codex-stage';
 import {
+  appendCodexStageEventTo,
   listCodexStopEvidenceFrom,
   listCodexWatchVerdictsFrom,
   readCodexStageLogFrom,
@@ -77,6 +78,17 @@ export function toStageLog(log: CodexStageLog): StageLog {
   return log.status === 'readable'
     ? { status: 'readable', events: log.events.map(toStageEventRow) }
     : { status: 'unknown', reason: log.reason };
+}
+
+/** The sweep's store methods over one connection, for a caller that holds a connection rather than a `Store`. */
+export function codexStopStoreOn(db: DatabaseSync, dbPath: string): CodexStopContext['store'] {
+  return {
+    dbPath,
+    readCodexStageLog: () => readCodexStageLogFrom(db),
+    listCodexStopEvidence: (sinceTs) => listCodexStopEvidenceFrom(db, sinceTs),
+    listCodexWatchVerdicts: () => listCodexWatchVerdictsFrom(db),
+    appendCodexStageEvent: (input) => appendCodexStageEventTo(db, input),
+  };
 }
 
 export function readCodexLatch(store: Pick<Store, 'readCodexStageLog'>): CodexLatchRead {
