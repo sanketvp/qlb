@@ -196,6 +196,14 @@ Pi RPC is a separate verifier. Pi v1.5.2 sets `process.title` to `pi-rpc` in `di
 - `pi:extension` (`piIntegrationChecks` in `src/pi-integration.ts`), when a QLB checkout is on disk, compares `~/.pi/agent/extensions/qlb-pi` with that checkout's `extensions/qlb-pi` plus the two shared sources. A difference is `WARN` and the recorded fix is `qlb pi deploy`.
 - `pi:extension-drift` (`src/checks/pi-extension-drift.ts`) hashes the installed extension and the two shared sources and compares that digest, and the recorded `pi.extensionHash`, with the extension inside `~/.qlb/app/current`. A mismatch is `FAIL` (`installed qlb-pi deployment hash differs from the current release`). No deployment record is `WARN` (`not deployed`).
 
+## Codex go-live stages and the stop latch
+
+Codex multi-account switching ships dark: `CODEX_SWITCH_COMMAND_ENABLED` (`src/codex-flag.ts`) is `false`, and the switch engine (`src/codex-switch.ts`) refuses every switch. It goes live in two stages, manual switches then automatic ones, each opened by an owner marker (`qlb codex stage start`) and judged from rows qlb already keeps: `switch_log`, `relogin_events` and the per-switch watch verdict.
+
+The rules live in one pure module, `src/codex-stage.ts`: which rows are stops, what the latch admits, and whether a stage passed. The stop sweep (`src/codex-stop.ts`) runs those rules over the evidence and records each new stop once as a `latch-set` row. A recorded stop latches qlb: every new Codex switch and every refresh qlb starts of an owned Codex token is refused with `codex-stop-latched`, while the owner's recovery commands stay admitted. A latch log that cannot be read counts as set. Only the owner clears it, through the newest stop they reviewed (`qlb codex latch clear --through`). `qlb codex stage report` reads the same rules read-only. The Lean model in `proofs/codex-stop-latch/` states the latch properties, and its replayed cases run against `src/codex-stage.ts`.
+
+The owner's steps, including the return to dark after a stop, are [CODEX-GO-LIVE-RUNBOOK.md](CODEX-GO-LIVE-RUNBOOK.md).
+
 ## Storage
 
 `src/store.ts` uses Node's built-in `node:sqlite` (synchronous, so a `BEGIN IMMEDIATE` transaction is a straight-line code block with no awaits). The database (default `~/.qlb/qlb.db`) runs in WAL mode with `busy_timeout` and holds:
@@ -208,6 +216,8 @@ Pi RPC is a separate verifier. Pi v1.5.2 sets `process.title` to `pi-rpc` in `di
 - `poll_claims` / `leases` — the two single-flight mechanisms above
 - `migrations` — the credential-ownership journal
 - `policies` — virtual-model → real-model mappings for the proxy
+- `codex_stage_events` — the Codex go-live log: stage starts and closes, stops (`latch-set`, one per evidence pointer), clears and initializations; the stop latch is derived from it
+- `codex_watch_verdicts` — one verdict per committed Codex switch (such as `confirmed`, `reverted` or `inconclusive`), written when its watch ends
 - `overrides` — pin/reserve/drain-first rows, written and managed by `qlb override pin|reserve|drain-first|clear|list`; `qlb status` displays any active row, and `resolve` honors them (pin beats any strategy, reserved accounts are excluded, drain-first accounts are tried first)
 
 Snapshot caching is *politeness*, not correctness: a caller reuses its last observation rather than re-fetching. Direct provider readings are authoritative over QLB-derived readings, so QLB keeps the provider value when the two disagree and records the conflict for `qlb doctor`; QLB-derived values remain display/cross-check data. Routing relies only on fresh direct provider readings; it never depends on data QLB generated itself.
