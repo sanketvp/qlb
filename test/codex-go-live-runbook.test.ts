@@ -194,6 +194,17 @@ describe('Codex go-live runbook (U15)', () => {
     assert.match(restart, /restarts at Stage 2 only if the fix left the Codex switch, watch or refresh code alone/);
   });
 
+  it('names the doctor-gate stop with the rule, evidence and refusal the switch writes', () => {
+    const stops = section(text, 'How a stop reaches you');
+    const source = readFileSync(join(__dirname, '..', '..', 'src', 'codex-switch.ts'), 'utf8');
+    assert.match(source, /rule: 'doctor-not-allowed'/);
+    assert.match(source, /'codex-doctor-gate-unavailable'/);
+    assert.match(stops, /`doctor-not-allowed`/);
+    assert.match(stops, /`doctor:<check>:<code>@<stage-start id>`/);
+    assert.match(stops, /`codex-doctor-gate-unavailable`/);
+    assert.match(stops, /`codex:slots` and `codex:first-switch`/);
+  });
+
   it('cutover: the back-to-dark commands succeed while latched, and only the owner\'s clear lifts the latch', () => {
     const home = latchedHome('cutover');
     try {

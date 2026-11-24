@@ -66,7 +66,7 @@ The report opens the store read-only and never records anything, so it is safe t
 
 ## How a stop reaches you
 
-A stop is recorded when the sweep finds a forced relogin (an `identity-replaced`, `wiped` or `dead` relogin row), a half-finished switch (one that ended neither committed nor cleanly rolled back), an unconfirmed switch (a watch verdict of `reverted` or `inconclusive`), an unexplained refusal (a persisted refusal outside qlb's named refusal set), or an evidence row it cannot read. The report and the stop's `auto.log` line name the rule. It reaches you three ways:
+A stop is recorded when the sweep finds a forced relogin (an `identity-replaced`, `wiped` or `dead` relogin row), a half-finished switch (one that ended neither committed nor cleanly rolled back), an unconfirmed switch (a watch verdict of `reverted` or `inconclusive`), an unexplained refusal (a persisted refusal outside qlb's named refusal set), or an evidence row it cannot read. While a stage run is open, every switch also runs the `codex:slots` and `codex:first-switch` doctor checks before it switches, and a FAIL or a WARN not on the run's `--allow` list records a `doctor-not-allowed` stop with evidence `doctor:<check>:<code>@<stage-start id>`; a check that cannot evaluate refuses the switch with `codex-doctor-gate-unavailable` and records no stop. The report and the stop's `auto.log` line name the rule. It reaches you three ways:
 
 - `qlb switch openai-codex` exits `3` with `codex-stop-latched`, printing `latched by stop <id> (evidence <table>:<id>)`;
 - `~/.qlb/auto.log` gains one `codex:stop-latched stop=<id> rule=<rule> evidence=<pointer> at=<ms>` line per recorded stop;
