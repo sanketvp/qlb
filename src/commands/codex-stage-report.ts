@@ -19,7 +19,7 @@ import { codexFirstSwitchCheck } from '../checks/codex-first-switch';
 import { codexL13ReceiptAt } from '../codex-l13-receipt';
 import { CODEX_NAMED_REFUSALS } from '../codex-refusals';
 import { deriveLatch, evaluateStages, type StageResult, type StopFinding } from '../codex-stage';
-import { codexStopEvidenceFrom, findSweepStops, readBuildStamp, readCodexStageInputFrom, toStageLog } from '../codex-stop';
+import { CODEX_DOCTOR_STOP_POINTER, CODEX_SWEEP_STOP_POINTER, codexStopEvidenceFrom, findSweepStops, isCodexStopPointer, readBuildStamp, readCodexStageInputFrom, toStageLog } from '../codex-stop';
 import { CODEX_SWITCH_COMMAND_ENABLED } from '../codex-switch';
 import { lifecyclePhase } from '../lifecycle-read';
 import { redactJson } from '../redact';
@@ -34,6 +34,8 @@ export type EvidenceRow =
   | { table: 'relogin_events'; id: number; at: string; kind: string }
   | { table: 'codex_watch_verdicts'; switchId: number; at: string; verdict: string }
   | { table: 'codex_stage_events'; id: number; at: string; rule: string; evidence: string }
+  /** A doctor-gate stop: the check as the gate saw it, from the stop's own row (the checks are not re-run). */
+  | { table: 'doctor'; check: string; code: string; level: string; stageStartId: number }
   | { table: string; missing: true };
 
 export interface ReportStop {
@@ -86,7 +88,6 @@ const KNOWN_DETAILS: ReadonlySet<string> = new Set([
 const CODE = /^[a-z][a-z0-9-]{0,63}$/;
 const LEVELS: ReadonlySet<string> = new Set(['PASS', 'WARN', 'FAIL', 'INFO', 'N/A']);
 const SHA = /^[0-9a-f]{7,64}$/;
-const POINTER = /^([a-z_]+):(\d+)$/;
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
@@ -121,7 +122,9 @@ class Aliases {
 }
 
 function evidenceRow(db: DatabaseSync, pointer: string, events: CodexStageEvent[]): EvidenceRow {
-  const match = POINTER.exec(pointer);
+  const doctor = CODEX_DOCTOR_STOP_POINTER.exec(pointer);
+  if (doctor) return doctorRow(doctor, events.find((event) => event.kind === 'latch-set' && event.evidence === pointer));
+  const match = CODEX_SWEEP_STOP_POINTER.exec(pointer);
   if (!match) return { table: 'unrecognized', missing: true };
   const [, table, rawId] = match;
   const id = Number(rawId);
@@ -155,7 +158,14 @@ function evidenceRow(db: DatabaseSync, pointer: string, events: CodexStageEvent[
   return { table, missing: true };
 }
 
-const safePointer = (pointer: string | null): string => (pointer !== null && POINTER.test(pointer) ? pointer : 'unrecognized');
+const safePointer = (pointer: string | null): string => (pointer !== null && isCodexStopPointer(pointer) ? pointer : 'unrecognized');
+
+/** The check name and code come from the pointer, which matched a strict pattern; the level from the row, if it is a level. */
+function doctorRow([, check, checkCode, startId]: RegExpExecArray, event: CodexStageEvent | undefined): EvidenceRow {
+  if (!event) return { table: 'doctor', missing: true };
+  const level = (event.detail as { level?: unknown } | null)?.level;
+  return { table: 'doctor', check, code: checkCode, level: typeof level === 'string' && LEVELS.has(level) ? level : 'unrecognized', stageStartId: Number(startId) };
+}
 const ruleOf = (event: CodexStageEvent): string => code((event.detail as { rule?: unknown } | null)?.rule);
 
 function preconditions(
@@ -298,6 +308,7 @@ function rowText(row: EvidenceRow): string {
     case 'relogin_events': return `relogin ${row.id} at ${row.at}: ${row.kind}`;
     case 'codex_watch_verdicts': return `watch verdict for switch ${row.switchId} at ${row.at}: ${row.verdict}`;
     case 'codex_stage_events': return `recorded stop ${row.id} at ${row.at}: ${row.rule}, ${row.evidence}`;
+    case 'doctor': return `doctor check ${row.check} ${row.level} ${row.code} in the run started by event ${row.stageStartId}`;
   }
 }
 

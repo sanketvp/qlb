@@ -9,7 +9,10 @@ import { fsyncDirSync, atomicWriteText, publishTarget } from './fsutil';
 import { qlbHomeDir } from './home';
 import { CODEX_SWITCH_COMMAND_ENABLED } from './codex-flag';
 import { admitCodexAction, deriveLatch } from './codex-stage';
-import { readBuildStamp, sweepCodexStops, toStageLog, type CodexStopContext } from './codex-stop';
+import { readBuildStamp, recordCodexStop, sweepCodexStops, toStageLog, type CodexStopContext } from './codex-stop';
+import { codexFirstSwitchCheck } from './checks/codex-first-switch';
+import { codexSlotsCheck } from './checks/codex-slots';
+import { lifecyclePhase } from './lifecycle-read';
 import {
   codexIdentityParts,
   holderSets,
@@ -24,7 +27,7 @@ import type { CswapProcess } from './cswap-processes';
 import { CodexStashUnverifiable, isMalformedCodexSlot, type CodexSlots } from './codex-slots';
 import { isCredentialNotFound } from './credential-backends';
 import type { KeychainBackend } from './keychain';
-import type { CodexWatchVerdict, Store } from './store';
+import type { CodexStageEvent, CodexWatchVerdict, Store } from './store';
 
 const PROVIDER = 'openai-codex';
 
@@ -110,6 +113,8 @@ export interface CodexSwitchDeps {
   autoLog?: (line: string) => void;
   /** Test seams for ordered switch phases; production leaves them unset. */
   hooks?: {
+    /** Test-only seam between the first latch check and the doctor gate. */
+    beforeDoctorGate?: () => void | Promise<void>;
     afterPost?: () => void | Promise<void>;
     /** Test-only seam after CAS and journalling, immediately before QLB renames the target. */
     beforeRename?: () => void | Promise<void>;
@@ -1180,6 +1185,57 @@ function stopRulesRefusal(deps: CodexSwitchDeps, input: SwitchCodexInput, from: 
   }
   return result;
 }
+const CHECK_CODE = /^[a-z][a-z0-9-]{0,63}$/;
+/** Codes meaning a check could not evaluate (an unreadable lifecycle phase, a check that threw), not that it found a problem. */
+const GATE_UNAVAILABLE_CODES: ReadonlySet<string> = new Set(['phase-unavailable', 'check-threw']);
+/** The latest stage start, while its run is open: neither its stage's close nor any stop has been recorded since. */
+function openStageRun(events: CodexStageEvent[]): CodexStageEvent | null {
+  let index = events.length - 1;
+  while (index >= 0 && events[index].kind !== 'stage-start') index -= 1;
+  const start = events[index];
+  if (!start) return null;
+  const ended = events.slice(index + 1).some((event) => event.kind === 'latch-set' || (event.kind === 'stage-close' && event.stage === start.stage));
+  return ended ? null : start;
+}
+/**
+ * U9 and KTD13: while a stage run is open, run the two Codex doctor checks. A
+ * FAIL, or a WARN whose `<check>:<code>` is not on the run's allow-list (its
+ * start row's), records a stop keyed on the check, the code and that start row,
+ * so a repeat in the run is not recorded twice but a restarted run stops anew.
+ * The switch is then refused as latched. A check that could not evaluate
+ * refuses this switch without recording a stop. No other doctor check runs
+ * here: `relogin:7d` would stop a Codex stage on Anthropic evidence.
+ */
+function doctorGateRefusal(deps: CodexSwitchDeps, input: SwitchCodexInput, from: string | null, lifecycleId: number | null): CodexSwitchResult | null {
+  const log = deps.store.readCodexStageLog();
+  // An unreadable log was refused by the latch check before this one, and is refused again before the pre-switch refresh.
+  if (log.status !== 'readable') return null;
+  const start = openStageRun(log.events);
+  if (!start) return null;
+  const rawAllow = (start.detail as { allow?: unknown } | null)?.allow;
+  const allow = Array.isArray(rawAllow) ? rawAllow.filter((pair): pair is string => typeof pair === 'string') : [];
+  const dbPath = deps.dbPath ?? deps.store.dbPath;
+  const lifecycle = lifecyclePhase(dbPath);
+  const checks = [codexSlotsCheck(dbPath, lifecycle.phase), codexFirstSwitchCheck(dbPath, lifecycle, deps.now())]
+    .map((check) => ({ check, code: check.code !== undefined && CHECK_CODE.test(check.code) ? check.code : 'uncoded' }));
+  const offending = checks.filter(({ check, code }) => check.level === 'FAIL'
+    || (check.level === 'WARN' && !allow.includes(`${check.name}:${code}`)));
+  if (offending.length === 0) return null;
+  // A check that could not run is not evidence: refuse this switch, unpersisted, rather than end the run on a busy read.
+  if (offending.some(({ code }) => GATE_UNAVAILABLE_CODES.has(code))) return switchResult(from, 'codex-doctor-gate-unavailable');
+  const [{ check: stop, code }] = offending;
+  recordCodexStop(stopContext(deps, lifecycleId), {
+    pointer: `doctor:${stop.name}:${code}@${start.id}`,
+    detail: { rule: 'doctor-not-allowed', check: stop.name, code, level: stop.level, message: stop.message,
+      offending: offending.map(({ check, code: pairCode }) => `${check.name}:${pairCode}`) },
+  });
+  const latched = stopRulesRefusal(deps, input, from, lifecycleId);
+  if (latched) return latched;
+  // The stop is recorded but the latch does not read as set: refuse fail-closed rather than switch past it.
+  const result = switchResult(from, 'codex-stop-latched');
+  result.latch = { state: 'unknown', reason: 'doctor-gate' };
+  return result;
+}
 function journalDecision(decision: SwitchCodexInput['decision']): CodexSwitchJournal['decision'] {
   return decision ? { leftHeadroom: decision.leftHeadroom ?? null, leftRecoveryAtMs: decision.leftRecoveryAt ?? null,
     leftTrigger: decision.leftTrigger ?? null } : null;
@@ -1855,9 +1911,13 @@ export async function switchCodex(deps: CodexSwitchDeps, input: SwitchCodexInput
   if (!admitted.ok) return switchResult(recordedFrom, admitted.reason ?? admitted.code ?? 'not-admitted');
   // Read once, so no later check opens another connection under the switch lock.
   const lifecycleId = deps.lifecycleId?.() ?? null;
-  // Before recovery, preflight and the pre-switch refresh: a latched qlb starts none of them (KTD16).
+  // Before recovery, preflight and the pre-switch refresh: a latched qlb starts none of them (KTD16). The doctor gate
+  // runs only after this first check, so it never records a stop beside one that already latched qlb.
   const stopRefusal = stopRulesRefusal(deps, input, recordedFrom, lifecycleId);
   if (stopRefusal) return stopRefusal;
+  await deps.hooks?.beforeDoctorGate?.();
+  const doctorRefusal = doctorGateRefusal(deps, input, recordedFrom, lifecycleId);
+  if (doctorRefusal) return doctorRefusal;
   const recovery = await reconcileCodexRecovery(deps);
   // Recovery may have committed an earlier journal and changed the active
   // source. All results below must report that engine-observed value.
