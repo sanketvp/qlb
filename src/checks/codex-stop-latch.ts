@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 
 import { deriveLatch } from '../codex-stage';
-import { toStageLog } from '../codex-stop';
+import { isCodexStopPointer, toStageLog } from '../codex-stop';
 import { redactError } from '../redact';
 import { openStoreConnection, readCodexStageLogFrom } from '../store';
 import { check, guardCheck } from './_check';
@@ -11,9 +11,9 @@ export default check('codex:stop-latch');
 
 const NAME = 'codex:stop-latch';
 
-/** Only a sweep-shaped pointer (`<table>:<id>`) is printed; anything else is not ours to echo. */
+/** Only a pointer the sweep or the doctor gate writes is printed; anything else is not ours to echo. */
 function printablePointer(evidence: string | null | undefined): string {
-  return evidence && /^[a-z_]+:[0-9]+$/.test(evidence) ? evidence : 'unrecognized';
+  return evidence && isCodexStopPointer(evidence) ? evidence : 'unrecognized';
 }
 
 function unknownLatch(reason: string, clear = ''): HealthCheck {
