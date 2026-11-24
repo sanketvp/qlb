@@ -3,8 +3,9 @@
  * latch-set rows from evidence: it classifies `switch_log`, `relogin_events`
  * and `codex_watch_verdicts` rows newer than the first stage start with the
  * pure classifier in `codex-stage.ts`, and records each new stop once (the
- * evidence pointer is unique). The latch read is fail-closed: callers treat
- * `unreadable` as set.
+ * evidence pointer is unique). The pre-switch doctor gate in `codex-switch.ts`
+ * is the other stop source; both record through `recordCodexStop`. The latch
+ * read is fail-closed: callers treat `unreadable` as set.
  */
 
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
@@ -143,23 +144,43 @@ export function sweepCodexStops(ctx: CodexStopContext): { recorded: number[] } {
 
   const recorded: number[] = [];
   for (const finding of findings) {
-    const now = ctx.now();
-    const id = ctx.store.appendCodexStageEvent({
-      kind: 'latch-set',
-      now,
-      lifecycleId: ctx.lifecycleId,
-      buildStamp: ctx.buildStamp,
-      flagEnabled: ctx.flagEnabled,
-      evidence: finding.pointer,
-      detail: { rule: finding.rule },
-    });
-    if (id === null) continue;
-    recorded.push(id);
-    const line = `codex:stop-latched stop=${id} rule=${finding.rule} evidence=${finding.pointer} at=${now}`;
-    // The stop is already recorded; a failed audit line must not undo or repeat it.
-    try { (ctx.autoLog ?? ((text) => appendAutoLog(ctx.store, text)))(line); } catch { /* recorded above */ }
+    const id = recordCodexStop(ctx, { pointer: finding.pointer, detail: { rule: finding.rule } });
+    if (id !== null) recorded.push(id);
   }
   return { recorded };
+}
+
+/** A sweep stop's evidence pointer: `<table>:<id>`. */
+export const CODEX_SWEEP_STOP_POINTER = /^([a-z_]+):(\d+)$/;
+/** A doctor-gate stop's evidence pointer: `doctor:<check>:<code>@<stage-start id>`. */
+export const CODEX_DOCTOR_STOP_POINTER = /^doctor:(codex:[a-z0-9-]+):([a-z][a-z0-9-]{0,63})@(\d+)$/;
+
+/** Whether a latch-set's evidence is a pointer qlb writes, and so safe to print. */
+export function isCodexStopPointer(pointer: string): boolean {
+  return CODEX_SWEEP_STOP_POINTER.test(pointer) || CODEX_DOCTOR_STOP_POINTER.test(pointer);
+}
+
+/**
+ * Records one latch-set, stamped from the context, and its `auto.log` line.
+ * Returns null when a stop with this evidence pointer is already recorded.
+ * The sweep and the pre-switch doctor gate both record through this.
+ */
+export function recordCodexStop(ctx: CodexStopContext, stop: { pointer: string; detail: { rule: string } & Record<string, unknown> }): number | null {
+  const now = ctx.now();
+  const id = ctx.store.appendCodexStageEvent({
+    kind: 'latch-set',
+    now,
+    lifecycleId: ctx.lifecycleId,
+    buildStamp: ctx.buildStamp,
+    flagEnabled: ctx.flagEnabled,
+    evidence: stop.pointer,
+    detail: stop.detail,
+  });
+  if (id === null) return null;
+  const line = `codex:stop-latched stop=${id} rule=${stop.detail.rule} evidence=${stop.pointer} at=${now}`;
+  // The stop is already recorded; a failed audit line must not undo or repeat it.
+  try { (ctx.autoLog ?? ((text) => appendAutoLog(ctx.store, text)))(line); } catch { /* recorded above */ }
+  return id;
 }
 
 /**

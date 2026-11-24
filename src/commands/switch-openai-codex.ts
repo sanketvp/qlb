@@ -16,7 +16,7 @@ import {
 import { list as listCodexSessions, processLstart } from '../codex-sessions';
 import { listCswapProcesses } from '../cswap-processes';
 import { platformKeychain } from '../keychain';
-import { readBuildStamp } from '../codex-stop';
+import { isCodexStopPointer, readBuildStamp } from '../codex-stop';
 import { assertAdmitted, phase } from '../lifecycle';
 import { openStore, type Store } from '../store';
 import { resolveCodexAuthPath } from './codex-import-active';
@@ -75,9 +75,9 @@ function safeMessage(message: string | undefined): string | undefined {
   return safeReason(message.slice(prefix.length, -suffix.length)) === undefined ? undefined : message;
 }
 
-/** A stop's evidence pointer as the sweep writes it (`<table>:<id>`); anything else is not printed. */
+/** A stop's evidence pointer as the sweep (`<table>:<id>`) or the doctor gate writes it; anything else is not printed. */
 function safePointer(pointer: string | null): string | null {
-  return pointer !== null && /^[a-z_]+:[0-9]+$/.test(pointer) ? pointer : null;
+  return pointer !== null && isCodexStopPointer(pointer) ? pointer : null;
 }
 
 function safeLatch(latch: CodexSwitchLatch | undefined): CodexSwitchLatch | undefined {
