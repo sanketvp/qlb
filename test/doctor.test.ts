@@ -726,6 +726,12 @@ describe('qlb doctor', () => {
     assert.notEqual(prefixMismatch.status, 0);
     assert.match(prefixMismatch.stderr, /missing hermes:seam \(prefix hermes:seam\)/);
     assert.match(prefixMismatch.stderr, /unexpected hermes:seam/);
+    const windows = spawnSync(process.execPath, ['-e', `Object.defineProperty(process, 'platform', { value: 'win32' }); require(${JSON.stringify(script)});`], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    assert.equal(windows.status, 0, windows.stderr);
+    assert.match(windows.stderr, /doctor registry manifest check skipped on Windows/);
   });
 
   it('keeps runtime rows and appends one registry FAIL when doctor:registry is not defined', () => {

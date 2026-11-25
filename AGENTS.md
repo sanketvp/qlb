@@ -5,7 +5,7 @@ Guide for coding agents working in this repo. Start with `README.md` (what QLB i
 ## Build and test
 
 - Node.js 22 or newer. `npm ci`, then:
-  - `npm run build`: cleans the registry output, compiles `src/` to `dist/`, verifies discovered doctor checks against `test/wiring/checks.d`, then writes the build stamp. Keep that manifest in sync when adding, renaming, or removing a doctor check; a non-empty file contains its accepted dynamic-result prefix.
+  - `npm run build`: cleans the registry output, compiles `src/` to `dist/`, verifies discovered doctor checks against `test/wiring/checks.d` on macOS and Linux, then writes the build stamp. Keep that manifest in sync when adding, renaming, or removing a doctor check; a non-empty file contains its accepted dynamic-result prefix. Windows skips this check because NTFS cannot store its colon-named entries.
   - `npm run typecheck:pi`: typechecks this package, then `extensions/qlb-pi` against the installed Pi.
   - `npm test`: rebuilds, compiles `tsconfig.test.json` to `dist-test/`, and runs every `dist-test/test/*.test.js` with `QLB_TEST_MODE=1` and a temporary `QLB_HOME`.
   - `npm run build:helper`: builds the signed macOS Keychain helper in `native/keychain-helper/` (needed for `release install`, not for tests; requires exact owner approval).

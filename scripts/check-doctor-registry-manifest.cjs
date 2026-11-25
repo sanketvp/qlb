@@ -2,6 +2,9 @@ const { readdirSync, readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { discoverChecks } = require('../dist/registry');
 
+if (process.platform === 'win32') {
+  console.warn('doctor registry manifest check skipped on Windows: test/wiring/checks.d uses POSIX-only colon names');
+} else {
 const manifestDir = join(__dirname, '..', 'test', 'wiring', 'checks.d');
 
 function signature(definition) {
@@ -45,4 +48,5 @@ const problems = [
 ].sort();
 if (problems.length > 0) {
   throw new Error(`doctor registry manifest mismatch: ${problems.join('; ')}`);
+}
 }
