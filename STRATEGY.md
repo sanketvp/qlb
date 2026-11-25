@@ -106,7 +106,7 @@ _Why it serves the approach:_ it brings fresh-reading routing and safe custody t
 
 ### Visible cross-provider fallback
 
-When no account of the requested provider has room, an opt-in switch to another provider or model that the operator always sees.
+When no account of the requested provider has room, a switch to another provider or model that the operator always sees.
 
 _Why it serves the approach:_ work keeps moving without a silent switch or a guess.
 
