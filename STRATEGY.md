@@ -2,7 +2,7 @@
 
 ## Vision
 
-<!-- vision: author-approved 2026-11-22 -->
+<!-- vision: author-approved 2026-11-25 -->
 
 `qlb` exists so that one person with several AI provider accounts never has to babysit which login is about to hit its limit, and their work never stops because one account ran out.
 It serves a single operator on the machines they run, from a laptop to a Linux VPS, and it turns that operator's existing logins into one pool per provider that picks the account with the most real headroom for every request.
@@ -58,7 +58,7 @@ QLB is not a hosted service, a team account-sharing tool, or a way to pool other
 It is not a billing or cost-accounting system.
 It is not a harness: Pi, Claude Code, Codex CLI, and shell runners integrate through small, opt-in, fail-open adapters, and `qlb setup` prints snippets instead of editing files outside the repo.
 macOS and Linux are first-class platforms; Windows support is not a priority and is kept only where it costs little.
-Coding agents may run QLB's read-only commands (status, why, doctor, export) on the live machine, but anything that writes live state (release install, deploy, migrate, switch, gate, token, Keychain, LaunchAgents) needs the owner's approval of that exact run.
+Coding agents may run the cache export and `qlb why`, in the exact forms `AGENTS.md` lists, on the live machine, even though `why` may migrate the database; every other command, including status and doctor (which call providers, read Keychain items or write the database), and anything that writes live state (release install, deploy, migrate, switch, gate, token, Keychain, LaunchAgents) needs the owner's approval of that exact run.
 
 A change aligns when it keeps the operator's work moving on the headroom they already have, decides from fresh provider readings, tells the operator whenever it switches provider or model, keeps every crash point recoverable to a working login, and arrives as one tested, proven, reviewed slice.
 A change should be resisted when it lets a non-provider number declare capacity, adds a ledger or reservation that must settle, introduces a second refresher or an unproven credential writer, switches provider silently, turns an unknown into a permission, leaks a secret into any output, or widens QLB beyond one operator's own accounts.
@@ -106,7 +106,7 @@ _Why it serves the approach:_ it brings fresh-reading routing and safe custody t
 
 ### Visible cross-provider fallback
 
-When no account of the requested provider has room, an opt-in switch to another provider or model that the operator always sees.
+When no account of the requested provider has room, a switch to another provider or model that the operator always sees.
 
 _Why it serves the approach:_ work keeps moving without a silent switch or a guess.
 
