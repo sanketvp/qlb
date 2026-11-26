@@ -294,7 +294,8 @@ async function resolveOpenRouterSourceDeps(): Promise<OpenRouterSourceDeps> {
 type StreamSimple = (
   model: Model<Api>,
   context: Context,
-  options?: SimpleStreamOptions,
+  // Pi 1.4.0's SimpleStreamOptions has no disableContinuation; 1.6 does.
+  options?: SimpleStreamOptions & { disableContinuation?: boolean },
 ) => AsyncIterable<unknown>;
 
 interface BuiltinAnthropicCatalog {
@@ -644,6 +645,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
                   ...options,
                   apiKey: token,
                   onPayload,
+                  // SAN-211: a message-thread continue drops `system`, where
+                  // onPayload puts the billing marker. Always send in full.
+                  disableContinuation: true,
                 }),
               // QLB owns token renewal; on one failed request, re-run its
               // gate with the rejected access generation's non-secret hash.

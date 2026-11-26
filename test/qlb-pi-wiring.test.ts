@@ -121,6 +121,15 @@ if (process.env.CALL_ANTHROPIC === '1') {
   );
   for await (const event of stream) events.push(event);
 }
+if (process.env.CALL_ANTHROPIC_TWICE === '1') {
+  // Two same-session turns, the second extending the first, as Pi sends them.
+  const model = { id: 'claude-sonnet-5', api: 'anthropic-messages', provider: 'anthropic' };
+  const first = [{ role: 'user', content: 'hello from turn one', timestamp: 1 }];
+  const second = [...first, { role: 'assistant', content: [{ type: 'text', text: 'hi' }], timestamp: 2 }, { role: 'user', content: 'turn two', timestamp: 3 }];
+  for (const [messages, options] of [[first, { sessionId: 'thread-session' }], [second, { sessionId: 'thread-session', disableContinuation: false }]]) {
+    for await (const event of providers.get('anthropic').streamSimple(model, { messages }, options)) events.push(event);
+  }
+}
 if (process.env.CALL_CODEX === '1') {
   const codex = providers.get('openai-codex');
   if (codex.auth?.oauth) {
@@ -135,7 +144,7 @@ if (process.env.CALL_CODEX === '1') {
   );
   for await (const event of stream) events.push(event);
 }
-console.log(JSON.stringify({ calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), codexModelCount: providers.get('openai-codex')?.getModels?.().length ?? 0, oauth, authJson, runtimeApiKeys, events }));
+console.log(JSON.stringify({ continuation: globalThis.__qlbContinuationProbe ?? [], calls, replaced: Object.fromEntries(names.map((name) => [name, providers.get(name) !== native.get(name)])), codexModelCount: providers.get('openai-codex')?.getModels?.().length ?? 0, oauth, authJson, runtimeApiKeys, events }));
 `;
 
 const fakeQlb = String.raw`
@@ -164,6 +173,30 @@ if (Number.isFinite(delayMs) && delayMs > 0) setTimeout(finishGate, delayMs);
 else finishGate();
 `;
 
+// Models pi-ai 1.6's message-thread continuation (anthropic-messages.js
+// prepareThreadRequest): a later same-session request, unless the caller set
+// `disableContinuation: true`, goes out without `system` and with
+// `thread: { type: "continue" }`. The body is what onPayload returns, as in Pi.
+const CONTINUATION_PROBE_COMPAT = String.raw`
+const response = () => ({ role: 'assistant', content: [], api: 'anthropic-messages', provider: 'anthropic', model: 'claude-sonnet-5', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: 'stop', timestamp: Date.now() });
+const replies = new Map();
+globalThis.__qlbContinuationProbe = [];
+export function anthropicMessagesApi() { return { streamSimple(model, context, options) { return (async function* () {
+  const params = { model: model.id, stream: true, system: [{ type: 'text', text: 'You are Pi.' }], messages: context.messages.map(({ role, content }) => ({ role, content })) };
+  const body = (await options?.onPayload?.(params, model)) ?? params;
+  const sessionId = options?.sessionId;
+  const threads = sessionId !== undefined && options?.disableContinuation !== true;
+  let sent = threads ? { ...body, thread: { type: 'create' } } : body;
+  if (threads && replies.has(sessionId)) {
+    const { system: _system, tools: _tools, ...rest } = body;
+    sent = { ...rest, thread: { type: 'continue', previous_message_id: replies.get(sessionId) } };
+  }
+  if (threads) replies.set(sessionId, 'msg_' + globalThis.__qlbContinuationProbe.length);
+  globalThis.__qlbContinuationProbe.push({ disableContinuation: options?.disableContinuation, sessionId, body: sent });
+  yield { type: 'done', reason: 'stop', message: response() };
+})(); } }; }
+`;
+
 function load(owner?: string, gateFail = false, callCodex = false, perProviderOwner?: string, ownerIsDirectory = false, deployedLayout = false, callAnthropic = false, gateCause?: string, rehearsal = false, gateDelayMs = 0, options: {
   preexistingAnthropicKey?: string;
   consumeMode?: boolean;
@@ -172,7 +205,9 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
   reloadInert?: boolean;
   auth401?: boolean;
   retryAccount?: string;
+  continuationProbe?: boolean;
 } = {}): {
+  continuation: Array<{ disableContinuation?: unknown; sessionId?: unknown; body: Record<string, unknown> }>;
   calls: string[];
   replaced: Record<string, boolean>;
   oauth: { resolve: number; refresh: number };
@@ -213,9 +248,12 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
     mkdirSync(dirname(dbPath), { recursive: true });
     writeFileSync(dbPath, '');
   }
-  if (options.streamSimpleOnly || options.auth401) {
+  const fakeCompat = options.streamSimpleOnly || options.auth401 || options.continuationProbe;
+  if (fakeCompat) {
     const compat = join(PI_GLOBAL_ROOT, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'compat.js');
-    const fakeAnthropicApi = options.auth401
+    const fakeAnthropicApi = options.continuationProbe
+      ? CONTINUATION_PROBE_COMPAT
+      : options.auth401
       ? `const response = (stopReason, errorMessage) => ({ role: 'assistant', content: [], api: 'anthropic-messages', provider: 'anthropic', model: 'claude-sonnet-5', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason, ...(errorMessage ? { errorMessage } : {}), timestamp: Date.now() });\nexport function anthropicMessagesApi() { return { streamSimple(_model, _context, options) { return (async function* () { if (options?.apiKey === 'fixture-anthropic-access') yield { type: 'error', reason: 'error', error: response('error', '401 unauthorized') }; else yield { type: 'done', reason: 'stop', message: response('stop') }; })(); } }; }\n`
       : `export function anthropicMessagesApi() { return { streamSimple: actual.anthropicMessagesApi().streamSimple }; }\n`;
     // The extension obtains its builtin transport from Pi compat, not the
@@ -250,7 +288,8 @@ function load(owner?: string, gateFail = false, callCodex = false, perProviderOw
       ...(options.preexistingAnthropicKey ? { PREEXISTING_ANTHROPIC_KEY: options.preexistingAnthropicKey } : {}),
       ...(options.consumeMode ? { CONSUME_MODE: '1', QLB_DB_PATH: join(home, 'qlb', 'qlb.db') } : {}),
       ...(options.runtimeKeyCallsVoid ? { RUNTIME_KEY_CALLS_VOID: '1' } : {}),
-      ...(options.streamSimpleOnly || options.auth401 ? { PI_COMPAT_OVERRIDE: compatOverride } : {}),
+      ...(fakeCompat ? { PI_COMPAT_OVERRIDE: compatOverride } : {}),
+      ...(options.continuationProbe ? { CALL_ANTHROPIC_TWICE: '1' } : {}),
       ...(options.reloadInert ? { RELOAD_INERT: '1' } : {}),
       ...(callCodex ? { CALL_CODEX: '1' } : {}),
       ...(callAnthropic ? { CALL_ANTHROPIC: '1' } : {}),
@@ -315,6 +354,22 @@ describe('qlb-pi provider wiring', { skip: piAvailable ? false : 'global Pi inst
       consumeMode: true, reloadInert: true, runtimeKeyCallsVoid: true,
     });
     assert.equal('anthropic' in result.runtimeApiKeys, false);
+  });
+
+  it('owned Anthropic opts every send out of message-thread continuation, so system[0] keeps the billing marker (SAN-211)', () => {
+    const result = load(JSON.stringify({ providers: { anthropic: { mode: 'qlb', since: 1 } } }), false, false, undefined, false, false, false, undefined, false, 0, {
+      continuationProbe: true,
+    });
+    assert.equal(result.continuation.length, 2, result.stderr);
+    for (const [index, send] of result.continuation.entries()) {
+      // Request two's caller asked for `disableContinuation: false`; QLB's value must win.
+      assert.equal(send.disableContinuation, true, `request ${index + 1} option`);
+      assert.equal(send.sessionId, 'thread-session', `request ${index + 1} keeps the caller's sessionId`);
+      assert.equal('thread' in send.body, false, `request ${index + 1} must not use a message thread`);
+      const system = send.body.system as Array<{ text?: string }> | undefined;
+      assert.ok(Array.isArray(system), `request ${index + 1} must carry system`);
+      assert.match(system[0]?.text ?? '', /^x-anthropic-billing-header:/, `request ${index + 1} system[0]`);
+    }
   });
 
   it('registers owned Anthropic with streamSimple when Pi has no stream', () => {

@@ -192,7 +192,9 @@ export function registerConsumeProvider(
           const result = await streamWithAuthRetry({
             readAccess: source.readAccess,
             startStream: (access) =>
-              transport(model, context, { ...options, apiKey: access, onPayload }),
+              // SAN-211: never a message-thread continue, which drops the
+              // shaped `system` and its billing marker.
+              transport(model, context, { ...options, apiKey: access, onPayload, disableContinuation: true }),
             resync: source.resync,
             onEvent: (event) => {
               pushed += 1;

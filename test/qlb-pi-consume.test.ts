@@ -502,6 +502,26 @@ describe('qlb-pi consume provider', () => {
     }
   });
 
+  it('opts out of message-thread continuation on both consume transports, overriding the caller', async () => {
+    // SAN-211: Pi 1.6's continuation drops `system`, which holds the billing
+    // marker the consume shaping adds. Every consume send must be a full send.
+    const seen: Array<{ via: string; options: Record<string, unknown> }> = [];
+    const recording = (via: string): Builtin => (_model, _context, options) => {
+      seen.push({ via, options });
+      return (async function* () { yield { type: 'done', reason: 'stop' }; })();
+    };
+    const pi = fakePi();
+    registerConsumeProvider(pi, recording('streamSimple'), providerDeps({ read: () => access('access-a') }).deps, recording('stream'));
+    const provider = pi.providers.get('anthropic')!;
+    for (const call of [provider.streamSimple, provider.stream]) {
+      await finish(call(model, {}, { sessionId: 'session-1', disableContinuation: false }) as Sink);
+    }
+    assert.deepEqual(seen.map((entry) => [entry.via, entry.options.disableContinuation, entry.options.sessionId, entry.options.apiKey]), [
+      ['streamSimple', true, 'session-1', 'access-a'],
+      ['stream', true, 'session-1', 'access-a'],
+    ]);
+  });
+
   it('re-reads the Keychain once after a 401 and does not read a third time', async () => {
     const rotated = fakePi();
     const rotatedSeq = sequence(['access-a', 'access-b', 'access-c']);
