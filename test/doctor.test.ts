@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -697,6 +697,49 @@ describe('qlb doctor', () => {
     assert.equal(report[0]?.name, 'doctor:registry');
     assert.equal(report[0]?.level, 'FAIL');
     assert.match(report[0]?.message ?? '', /no check definitions/);
+  });
+
+  it('fails the build gate closed for doctor registry manifest drift', () => {
+    const root = mkdtempSync(join(tmpdir(), 'qlb-doctor-registry-gate-'));
+    const manifest = join(__dirname, '..', '..', 'test', 'wiring', 'checks.d');
+    const checks = join(root, 'dist', 'checks');
+    const script = join(root, 'scripts', 'check-doctor-registry-manifest.cjs');
+    mkdirSync(checks, { recursive: true });
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    mkdirSync(join(root, 'test', 'wiring'), { recursive: true });
+    cpSync(manifest, join(root, 'test', 'wiring', 'checks.d'), { recursive: true });
+    cpSync(join(__dirname, '..', '..', 'scripts', 'check-doctor-registry-manifest.cjs'), script);
+    cpSync(join(__dirname, '..', '..', 'dist', 'registry.js'), join(root, 'dist', 'registry.js'));
+
+    const writeChecks = (omit: string[] = [], extra?: { name: string; prefix?: string }, wrongPrefix = false) => {
+      rmSync(checks, { recursive: true, force: true });
+      mkdirSync(checks);
+      for (const name of readdirSync(manifest)) {
+        if (omit.includes(name)) continue;
+        const prefix = wrongPrefix && name === 'hermes:seam' ? '' : readFileSync(join(manifest, name), 'utf8').trim();
+        writeFileSync(join(checks, `${name}.js`), `module.exports.default = ${JSON.stringify(prefix === '' ? { name } : { name, prefix })};\n`);
+      }
+      if (extra) writeFileSync(join(checks, `${extra.name}.js`), `module.exports.default = ${JSON.stringify(extra)};\n`);
+      return spawnSync(process.execPath, [script], { cwd: root, encoding: 'utf8' });
+    };
+
+    assert.equal(writeChecks().status, 0);
+    const missing = writeChecks(['recovery']);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /missing recovery/);
+    const unexpected = writeChecks([], { name: 'fixture:extra' });
+    assert.notEqual(unexpected.status, 0);
+    assert.match(unexpected.stderr, /unexpected fixture:extra/);
+    const prefixMismatch = writeChecks([], undefined, true);
+    assert.notEqual(prefixMismatch.status, 0);
+    assert.match(prefixMismatch.stderr, /missing hermes:seam \(prefix hermes:seam\)/);
+    assert.match(prefixMismatch.stderr, /unexpected hermes:seam/);
+    const windows = spawnSync(process.execPath, ['-e', `Object.defineProperty(process, 'platform', { value: 'win32' }); require(${JSON.stringify(script)});`], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    assert.equal(windows.status, 0, windows.stderr);
+    assert.match(windows.stderr, /doctor registry manifest check skipped on Windows/);
   });
 
   it('keeps runtime rows and appends one registry FAIL when doctor:registry is not defined', () => {

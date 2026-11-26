@@ -18,7 +18,7 @@
     "qlb": "./dist/cli.js"
   },
   "scripts": {
-    "build": "node scripts/clean-registry-output.cjs && tsc && node scripts/write-build-stamp.cjs",
+    "build": "node scripts/clean-registry-output.cjs && tsc && node scripts/check-doctor-registry-manifest.cjs && node scripts/write-build-stamp.cjs",
     "start": "node dist/cli.js",
     "dev": "ts-node src/cli.ts",
     "test": "export QLB_TEST_MODE=1 QLB_HOME=\"$(mktemp -d)\"; npm run build && node scripts/clean-registry-output.cjs dist-test/src && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
