@@ -4,13 +4,25 @@ on:
   push:
   pull_request:
 
-env:
-  # Pinned to the version the local suites run against; bump deliberately.
-  PI_VERSION: 1.4.0
-
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned to the version the local suites run against; bump deliberately.
+          # Pi 1.4.0 has no Anthropic message threads, so the real-transport
+          # continuation test (SAN-211) is excluded there by file name, never skipped.
+          - pi_version: 1.4.0
+            exclude_tests: qlb-pi-continuation-real.test.js
+          # A Pi with message-thread continuation (>= 1.6); runs every test.
+          - pi_version: 1.6.1
+            exclude_tests: ''
+    name: test (Pi ${{ matrix.pi_version }})
+    env:
+      PI_VERSION: ${{ matrix.pi_version }}
+      EXCLUDE_TESTS: ${{ matrix.exclude_tests }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,7 +42,20 @@ jobs:
           echo "QLB_PI_PACKAGE_ROOT=$pi_root" >> "$GITHUB_ENV"
       - run: npm run build
       - run: npm run typecheck:pi
-      - run: npm test
+      - name: Test
+        shell: bash
+        run: |
+          if [ -z "$EXCLUDE_TESTS" ]; then npm test; exit; fi
+          # npm test, minus the files this Pi cannot run.
+          export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"
+          npm run build
+          node scripts/clean-registry-output.cjs dist-test/src
+          npx tsc -p tsconfig.test.json
+          files=()
+          for f in dist-test/test/*.test.js; do
+            case " $EXCLUDE_TESTS " in *" ${f##*/} "*) echo "excluded on Pi $PI_VERSION: $f" ;; *) files+=("$f") ;; esac
+          done
+          node --test "${files[@]}"
       - name: Keychain-client suite must run, not skip
         shell: bash
         run: |
@@ -42,6 +67,10 @@ jobs:
         shell: bash
         run: |
           export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"
-          node --test dist-test/test/qlb-pi-*.test.js | tee pi-suites.log
+          files=()
+          for f in dist-test/test/qlb-pi-*.test.js; do
+            case " $EXCLUDE_TESTS " in *" ${f##*/} "*) ;; *) files+=("$f") ;; esac
+          done
+          node --test "${files[@]}" | tee pi-suites.log
           # Node 22 prints TAP totals ("# skipped 0"); newer Node prints "ℹ skipped 0".
           grep -Eq '^(ℹ|#) skipped 0$' pi-suites.log

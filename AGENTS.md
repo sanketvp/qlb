@@ -12,7 +12,7 @@ Check every proposed change against `STRATEGY.md`, QLB's product vision and stra
   - `npm run build:helper`: builds the signed macOS Keychain helper in `native/keychain-helper/` (needed for `release install`, not for tests; requires exact owner approval).
 - One file: `export QLB_TEST_MODE=1 QLB_HOME="$(mktemp -d)"`, `npm run build && node scripts/clean-registry-output.cjs dist-test/src && npx tsc -p tsconfig.test.json`, then `node --test dist-test/test/<name>.test.js`.
 - `QLB_TEST_MODE=1` swaps in the in-process credential backend (`src/credential-backends.ts`) and points `qlbHomeDir()` (`src/home.ts`) at `QLB_HOME`. Tests must never touch the live `~/.qlb`, `~/.pi/agent` or the Keychain.
-- CI (`.github/workflows/ci.yml`) pins the Pi it installs (`PI_VERSION`) and requires `skipped 0` for `dist-test/test/qlb-pi-*.test.js` and `dist-test/test/keychain-client.test.js`. Keep those files runnable on that Pi.
+- CI (`.github/workflows/ci.yml`) runs one leg per pinned Pi (`PI_VERSION` 1.4.0 and 1.6.1) and requires `skipped 0` for `dist-test/test/qlb-pi-*.test.js` and `dist-test/test/keychain-client.test.js`. Keep those files runnable on both. A test that cannot run on an older Pi is listed in that leg's `exclude_tests` by file name, never skipped; `test/qlb-pi-continuation-real.test.ts` needs Pi >= 1.6 and is excluded on 1.4.0.
 - Known local-only failures: in a git worktree (where `.git` is a file), the two T-SCEN head checks in `test/accounts-prune.test.ts` fail. The Python oracle tests need Python 3.12+, which they find through `uv` under your real `HOME`.
 - Lean models live in `proofs/`; check them with `scripts/check-lean-model.sh`.
 

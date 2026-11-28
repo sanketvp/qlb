@@ -108,7 +108,9 @@ This registers the extension file with Pi — **it is a separate step from insta
 
 `qlb pi deploy` (`[--dry-run] [--json]`) is the release deployment. It refuses until `qlb release install` has published a `current` tree that contains `qlb-pi`. A successful deploy is what makes doctor checks `pi:extension` and `pi:extension-drift` pass against that release.
 
-Even fully installed this way, the extension is **inert by default**: it only activates when `~/.pi/agent/qlb-owner.json` exists, which is created solely by QLB's own `qlb migrate ... --confirm-real-cutover` flow — never automatically by `pi install`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before running that migration.
+Installing the extension leaves Pi's native Anthropic provider active by default. To enable owned mode, the `qlb migrate ... --confirm-real-cutover` flow creates `~/.pi/agent/qlb-owner.json`. See [Credential Safety](docs/CREDENTIAL-SAFETY.md) before migrating.
+
+In both owned and consume modes, the Pi extension disables server-side Anthropic message threads. Each turn sends the full conversation context, including the system prompt and any tool definitions.
 
 Owned Anthropic follows Claude Code's active account. Pool adoption binds each Pi pool member to an existing Claude slot and does not write `active_login`. Commit moves `extensions/anthropic-pool` to `extensions-disabled-by-qlb` so the owned gate can serve. Bounded smoke (`qlb gate anthropic --no-refresh`, or `QLB_PI_OWNED_SMOKE=1`) does not refresh or retry.
 
